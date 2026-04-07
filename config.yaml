@@ -1,0 +1,36 @@
+# 全局模型配置
+models:
+  brain_model: "deepseek-reasoner"
+  deepseek_model_url: "http://api.deepseek.com/v1"
+  deepseek_token: ""
+  ollama_model_url: "http://192.168.21.21:11434"
+  embedding_model: "qwen3.5:9b"  # 本地向量模型
+  llm_model: "qwen3.5:9b"               # 本地大模型
+  device: "cpu"
+
+# 多知识库配置（新增知识库只需在这里加配置）
+knowledge_bases:
+  kb_product:
+    name: "产品文档知识库"
+    data_path: "./data/kb_product"
+    chroma_path: "./storage/chroma/kb_product"
+    chunk_size: 500
+    chunk_overlap: 50
+  kb_technical:
+    name: "技术文档知识库"
+    data_path: "./data/kb_technical"
+    chroma_path: "./storage/chroma/kb_technical"
+    chunk_size: 600
+    chunk_overlap: 60
+
+# 多Agent配置
+agents:
+  qa_agent:
+    name: "问答智能体"
+    description: "基于知识库回答问题"
+  summary_agent:
+    name: "总结智能体"
+    description: "总结文档内容"
+  router_agent:
+    name: "路由智能体"
+    description: "自动分配问题到对应知识库"
