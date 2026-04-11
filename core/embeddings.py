@@ -1,6 +1,7 @@
 # core/embeddings.py （远程Ollama嵌入模型）
 # 替换为LangChain官方远程Ollama嵌入
 from langchain_ollama import OllamaEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from utils.config import get_model_config
 
 
@@ -13,6 +14,17 @@ def get_embeddings():
     # 初始化远程嵌入模型
     embeddings = OllamaEmbeddings(
         model=model_cfg["embedding_model"],  # 可用：nomic-embed-text （Ollama专用嵌入模型）
-        base_url=model_cfg["ollama_url"],  # 核心：指定远程地址
+        base_url=model_cfg["embedding_url"],  # 核心：指定远程地址
     )
     return embeddings
+
+def get_openai_embeddings():
+    """
+    OpenAI嵌入模型
+    """
+    model_cfg = get_model_config()
+
+    # 获取OpenAI嵌入模型
+    embeddings = OpenAIEmbeddings(
+        model=model_cfg["embedding_model"],
+    )

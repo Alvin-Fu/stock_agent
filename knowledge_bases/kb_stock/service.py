@@ -63,7 +63,7 @@ class StockKnowledge(BaseKnowledge):
         )
         return self.vector_store
 
-    def get_retriever(self):
+    def get_retriever(self, **kwargs):
         """
         实现基类方法：获取检索器（Agent问答使用）
         """
@@ -75,4 +75,4 @@ class StockKnowledge(BaseKnowledge):
                 embeddings
             )
         # 返回检索器（取最相关的3条）
-        return self.vector_store.as_retriever(search_kwargs={"k": 3})
+        return self.vector_store.as_retriever(** kwargs)

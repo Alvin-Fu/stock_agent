@@ -10,7 +10,7 @@ from .base_knowledge import BaseKnowledge
 # --------------------- 2. 导出向量模型工具 ---------------------
 from .embeddings import get_embeddings
 # --------------------- 4. 导出LLM大模型（后续问答Agent必备）---------------------
-from .llm import get_llm
+from .llm import get_llm, get_ds
 # --------------------- 3. 导出远程 Chroma 向量库核心函数 ---------------------
 from .vector_store import (
     get_remote_chroma_client,
@@ -28,5 +28,6 @@ __all__ = [
     "get_remote_chroma_client",
     "create_remote_chroma",
     # 大模型
-    "get_llm"
+    "get_llm",
+    "get_ds"
 ]

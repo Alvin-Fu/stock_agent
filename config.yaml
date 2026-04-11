@@ -34,3 +34,12 @@ agents:
   router_agent:
     name: "路由智能体"
     description: "自动分配问题到对应知识库"
+
+# 末尾添加
+tushare:
+  token: "你的tushare token"  # 去 tushare.pro 官网申请
+
+# 工具配置
+tools:
+  enable_akshare: true
+  enable_tushare: true

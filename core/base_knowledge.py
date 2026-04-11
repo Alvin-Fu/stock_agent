@@ -21,6 +21,6 @@ class BaseKnowledge(ABC):
         pass
 
     @abstractmethod
-    def get_retriever(self):
+    def get_retriever(self, **kwargs):
         """获取检索器"""
         pass
