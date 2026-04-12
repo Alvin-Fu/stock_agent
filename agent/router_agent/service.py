@@ -6,8 +6,11 @@
 from core import BaseAgent, get_ds
 from langchain_classic.chains import RetrievalQA,create_retrieval_chain
 from langchain_core.prompts import PromptTemplate
+from langchain_classic.agents import create_react_agent, AgentExecutor
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from utils.logger import logger
+from tools import all_stock_tools
+import re
 
 
 class RouterBrainAgent(BaseAgent):
@@ -15,6 +18,25 @@ class RouterBrainAgent(BaseAgent):
         super().__init__(config, knowledge_registry)
         self.llm = get_ds()  # 远程Ollama大模型
         self.kb_map = knowledge_registry.get_all_knowledge()
+
+        self.tools = all_stock_tools
+        self.tool_agent = self._init_tool_agent()
+
+    def _init_tool_agent(self):
+        from langchain_classic.agents import hub
+        prompt = hub.pull("hwchase17/react")
+        agent = create_react_agent(llm=self.llm, tools=self.tools, prompt = prompt)
+        return AgentExecutor(agent=agent, tools=self.tools, verbose=True, handle_parsing_errors=True)
+
+    def _is_realtime_finance_query(self, query: str):
+        """判断是否需要调用实时股票工具"""
+        keywords = ["日线", "周线", "月线"]
+        return any(k in query for k in keywords)
+
+    def _route_kb(self, query: str):
+        prompt = PromptTemplate.from_template("只返回一个词：股票/产品/技术\n问题：{query}")
+        category = self.llm.invoke(prompt.format(query=query)).strip()
+        return self.kb_map.get(category, "kb_stock")
 
     def _route_to_knowledge_base(self, query: str) -> str:
         """
@@ -35,40 +57,7 @@ class RouterBrainAgent(BaseAgent):
         logger.info(f"🧠 大脑路由判断：问题 → {category} → 知识库：{kb_id}")
         return kb_id
 
-    def _get_qa_chain(self, kb_id: str):
-        """绑定对应知识库的问答链"""
-        kb = self.kb_map[kb_id]
-        prompt = PromptTemplate(
-            template="""
-            你是专业助手，**仅根据上下文回答**，不编造内容。
-            回答简洁、专业、准确。
-            上下文：{context}
-            问题：{question}
-            答案：
-            """,
-            input_variables=["context", "question"]
-        )
-        from langchain_core.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
-
-        # 在你的 _get_qa_chain 方法中修改
-        streaming_llm = self.llm.bind(
-            streaming=True,
-            callbacks=[StreamingStdOutCallbackHandler()]  # 强制将流输出到标准输出
-        )
-        retriever = kb.get_retriever(search_kwargs={"k": 3})
-
-        logger.info(f"🧠 中央大脑获取检索器：{retriever}")
-        return RetrievalQA.from_chain_type(
-            llm=streaming_llm,
-            chain_type="stuff",
-            retriever=retriever,
-            chain_type_kwargs={"prompt": prompt},
-            return_source_documents=True
-        )
-
-
-
-    def _get_qa_chain2(self, kb_id, query: str):
+    def _get_qa_chain(self, kb_id):
         # 1. 获取 retriever
         kb = self.kb_map[kb_id]
         retriever = kb.get_retriever(search_kwargs={"k": 3})
@@ -89,19 +78,64 @@ class RouterBrainAgent(BaseAgent):
         logger.info(f"🧠 中央大脑获取检索链：{rag_chain}")
         return rag_chain
 
+    # ===================== 核心：分析股票（工具+知识库）=====================
+    def analyze_stock(self, stock_code: str, period: str, kb_chain: RetrievalQA):
+        """
+        统一分析入口：
+        1. 拉取K线数据
+        2. 拉取分析知识
+        3. AI合并分析
+        """
+        logger.info(f"📊 开始分析 {stock_code} {period}")
+        daily = self.tool_agent.invoke({"input": f"获取{stock_code}日线数据"})["output"]
+        weekly = self.tool_agent.invoke({"input": f"获取{stock_code}周线数据"})["output"]
+        monthly = self.tool_agent.invoke({"input": f"获取{stock_code}月线数据"})["output"]
+        all_kline = f"{daily}\n\n{weekly}\n\n{monthly}"
+
+        # 2. 从知识库获取分析规则
+        analysis_rule = kb_chain.invoke({
+            "query": f"股票{period}走势分析方法、技术指标判断规则"
+        })["result"]
+
+        # 3. 大模型整合分析
+        final_prompt = f"""
+        你是专业股票分析师，请根据【分析规则】和【K线数据】给出专业分析。
+        对股票 {stock_code} 做**日线+周线+月线综合技术分析**。
+
+        输出结构：
+        1. 趋势判断（短/中/长）
+        2. 支撑位 & 压力位
+        3. 多周期共振情况
+        4. 风险提示
+        5. 综合结论
+
+        【分析规则】
+        {analysis_rule}
+
+        【真实K线数据】
+        {all_kline}
+
+        请输出专业分析：
+        """
+        return self.llm.invoke(final_prompt)
+
+    def extract_stock_code(self, query: str) -> str:
+        """从问题里提取6位股票代码"""
+        match = re.search(r'\d{6}', query)
+        return match.group(0) if match else "002594"
+
     def run(self, query: str):
         """
         大脑统一入口：接收问题 → 路由 → 检索 → 回答
         """
+        code = self.extract_stock_code(query)
+        if not code:
+            return "请输入6位股票代码，例如：分析000001"
         logger.info(f"🧠 中央大脑收到问题：{query}")
         query = query.encode('utf-8', 'ignore').decode('utf-8')
         # 1. 自动路由到对应知识库
         kb_id = self._route_to_knowledge_base(query)
         logger.info(f"🧠 中央大脑路由结果：{kb_id}")
         # 2. 获取对应问答链
-        qa_chain = self._get_qa_chain2(kb_id, query)
-
-        # 3. 执行问答
-        result = qa_chain.invoke({"input": query})
-        logger.info(f"🧠 中央大脑问答结果：{result}")
-        return result
+        qa_chain = self._get_qa_chain(kb_id)
+        return self.analyze_stock(code, "日线", qa_chain)

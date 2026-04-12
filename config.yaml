@@ -43,3 +43,10 @@ tushare:
 tools:
   enable_akshare: true
   enable_tushare: true
+
+database:
+  sqlite_path: "./data/sqlite/stock.db"
+
+search:
+  tavily_api_key: ""
+  serpapi_api_key: ""

@@ -71,3 +71,18 @@ def get_agent_config(agent_id: str) -> Dict[str, Any]:
     if not agent_config:
         raise ValueError(f"不存在该Agent配置：{agent_id}")
     return agent_config
+
+def get_db_config() -> Dict[str, Any]:
+    """获取数据库配置"""
+    config = load_config()
+    return config.get("database", {})
+
+def get_stock_tools_config() -> Dict[str, Any]:
+    """获取股票工具配置"""
+    config = load_config()
+    return config.get("tools", {}).get("stock", {})
+
+def get_search_config() -> Dict[str, Any]:
+    """获取搜索配置"""
+    config = load_config()
+    return config.get("search", {})

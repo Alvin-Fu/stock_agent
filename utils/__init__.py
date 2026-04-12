@@ -11,7 +11,10 @@ from .config import (
     get_all_kb_config,
     get_kb_config,
     get_all_agent_config,
-    get_agent_config
+    get_agent_config,
+    get_db_config,
+    get_stock_tools_config,
+    get_search_config,
 )
 # 从文件工具模块导出函数（后续扩展用）
 from .file_tools import load_documents_from_dir, split_documents
@@ -27,6 +30,10 @@ __all__ = [
     "get_kb_config",
     "get_all_agent_config",
     "get_agent_config",
+    # 工具相关
+    "get_db_config",
+    "get_stock_tools_config",
+    "get_search_config",
     # 日志相关
     "setup_logger",
     # 文件工具相关
