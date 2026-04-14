@@ -32,10 +32,7 @@ from tenacity import (
 )
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS
-
-logger = logging.getLogger(__name__)
-
-
+from utils.logger import logger
 
 class TushareFetcher(BaseFetcher):
     """
@@ -197,26 +194,7 @@ class TushareFetcher(BaseFetcher):
         if freq != "daily":
             return self.fetch_raw_weekly_month_data(stock_code, start_date, end_date, freq)
 
-        ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
-        
-        logger.info(f"调用 Tushare daily[{ts_code}, {ts_start}, {ts_end}]")
-        
-        try:
-            return self._api.daily(
-                ts_code=ts_code,
-                start_date=ts_start,
-                end_date=ts_end,
-            )
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            
-            # 检测配额超限
-            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
-                logger.warning(f"Tushare 配额可能超限: {e}")
-                raise RateLimitError(f"Tushare 配额超限: {e}") from e
-            logger.error(f"tushare 获取数据失败[{e}] {traceback.format_exc()}")
-            raise DataFetchError(f"Tushare 获取数据失败: {e}") from e
+        return self.pro_bar(stock_code, start_date, end_date)
     
     def _normalize_data(self, freq: str, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
@@ -245,7 +223,9 @@ class TushareFetcher(BaseFetcher):
         # 转换日期格式（YYYYMMDD -> YYYY-MM-DD）
         if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'], format='%Y%m%d')
-        
+
+
+
         # 成交量单位转换（Tushare 的 vol 单位是手，需要转换为股）
         if 'volume' in df.columns:
             df['volume'] = df['volume'] * 100
@@ -263,6 +243,29 @@ class TushareFetcher(BaseFetcher):
         df = df[existing_cols]
         logger.info(f"thshare _normalize_data")
         return df
+
+    def pro_bar(
+            self,  stock_code: str, start_date: str, end_date: str,
+            adj: str = "qfq",
+            freq: str = "D"
+    ) -> pd.DataFrame:
+        """
+        获取复权行情数据
+        """
+        ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
+        try:
+            df = ts.pro_bar(ts_code=ts_code, adj=adj, start_date=ts_start, end_date=ts_end,
+                            freq=freq)
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+
+            # 检测配额超限
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare 配额可能超限: {e}")
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            logger.error(f"tushare 获取数据失败[{e}] {traceback.format_exc()}")
+
 
     def get_stock_basic(self) -> pd.DataFrame:
         """获取股票基础信息"""
@@ -342,7 +345,12 @@ class TushareFetcher(BaseFetcher):
             'trade_date': 'date',
             'vol': 'volume',
             'ts_code': 'code',
+            'close_qfq': 'close',
+            'open_qfq': 'open',
+            'high_qfq': 'high',
+            'low_qfq': 'low',
         }
+        df = df.drop(columns = ['close', 'high', 'low', 'open'])
 
         df = df.rename(columns=column_mapping)
         # 2. 清理date字段

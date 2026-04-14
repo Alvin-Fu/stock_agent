@@ -3,11 +3,12 @@
 🔥 中央路由大脑 Agent
 系统核心：自动识别问题 → 路由到对应知识库 → 生成答案
 """
-from core import BaseAgent, get_ds
+from core import BaseAgent, get_ds, get_llm
 from langchain_classic.chains import RetrievalQA,create_retrieval_chain
 from langchain_core.prompts import PromptTemplate
-from langchain_classic.agents import create_react_agent, AgentExecutor
+from langchain_classic.agents import create_structured_chat_agent, AgentExecutor
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_classic import hub
 from utils.logger import logger
 from tools import all_stock_tools
 import re
@@ -23,9 +24,9 @@ class RouterBrainAgent(BaseAgent):
         self.tool_agent = self._init_tool_agent()
 
     def _init_tool_agent(self):
-        from langchain_classic.agents import hub
-        prompt = hub.pull("hwchase17/react")
-        agent = create_react_agent(llm=self.llm, tools=self.tools, prompt = prompt)
+
+        prompt = hub.pull("hwchase17/structured-chat-agent")
+        agent = create_structured_chat_agent(llm=self.llm, tools=self.tools, prompt = prompt)
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True, handle_parsing_errors=True)
 
     def _is_realtime_finance_query(self, query: str):
@@ -94,8 +95,8 @@ class RouterBrainAgent(BaseAgent):
 
         # 2. 从知识库获取分析规则
         analysis_rule = kb_chain.invoke({
-            "query": f"股票{period}走势分析方法、技术指标判断规则"
-        })["result"]
+            "input": f"股票{period}走势分析方法、技术指标判断规则"
+        })["answer"]
 
         # 3. 大模型整合分析
         final_prompt = f"""

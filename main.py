@@ -31,10 +31,8 @@ if __name__ == "__main__":
         try:
             # 🔥 只用大脑，全自动处理！
             result = brain_agent.run(query)
-            # 输出参考来源
-            logger.info(f"📄 参考资料：{result['context']}")
             # 输出答案
-            logger.info(f"💡 智能回答：\n{result['answer']}")
+            logger.info(f"💡 智能回答：\n{result}")
 
         except Exception as e:
             logger.error(f"大脑处理失败：{str(e)}  {traceback.format_exc()}")

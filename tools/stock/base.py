@@ -14,13 +14,13 @@
 3. 指数退避重试机制
 """
 
-import logging
 import random
 import time
 import sqlite3
 import traceback
-import utils.logger as logger
 
+from utils import load_documents_from_dir
+from utils.logger import logger
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
@@ -145,7 +145,7 @@ class BaseFetcher(ABC):
                 raise DataFetchError(f"[{self.name}] 未获取到 {stock_code} 的数据")
 
             # Step 2: 标准化列名
-            df = self._normalize_data(raw_df, stock_code)
+            df = self._normalize_data("daily", raw_df, stock_code)
 
             df = merge_and_clean_data("date", df_db, df)
 
@@ -195,7 +195,7 @@ class BaseFetcher(ABC):
                 raise DataFetchError(f"[{self.name}] 未获取到 {stock_code} 的数据")
 
             # Step 2: 标准化列名
-            df = self._normalize_data(raw_df, stock_code)
+            df = self._normalize_data(freq, raw_df, stock_code)
 
             df = merge_and_clean_data("date", df_db, df)
 
@@ -254,8 +254,6 @@ class BaseFetcher(ABC):
         df = df.copy()
         df = self._calculate_macd_signal(df)
         df = self.calculate_ma_ema(df, "close")
-        logging.warning(f"{df['ma200'][-10:]}200天线")
-        logging.warning(f"{df['ma5'][-10:]}均线")
 
         # 量比：当日成交量 / 5日平均成交量
         avg_volume_5 = df['volume'].rolling(window=5, min_periods=1).mean()
@@ -282,20 +280,22 @@ class BaseFetcher(ABC):
         if df.empty or price_col not in df.columns:
             return df
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
+        logger.info(f"calculate ma and ema {price_col}")
+        logger.info(f"open {df.tail(10)}")
+        logger.info(f"close {df.tail(10).get(price_col)}")
         # ---------------------- 1. 计算MA（简单移动平均） ----------------------
         for period in ma_periods:
             # rolling(window=period)：固定周期窗口；min_periods=1：数据不足时也计算
-            ma = df[price_col].rolling(window=period, min_periods=1).mean().round(2)
+            ma = df[price_col].rolling(window=period, min_periods= period).mean().round(2)
             key = f'ma{period}'
-            logger.warning(f"ma key: [{key}]")
+            logger.info(f"ma {key} {ma.tail(10)}")
             df[key] = ma
 
         # ---------------------- 2. 计算EMA（指数移动平均） ----------------------
         for period in ema_periods:
             # ewm(span=period)：指数加权窗口；adjust=False：使用递归公式（行业标准）
-            ema = df[price_col].ewm(span=period, adjust=False, min_periods=1).mean().round(2)
+            ema = df[price_col].ewm(span=period, adjust=False).mean().round(2)
             key = f'ema{period}'
-            logger.warning(f"ma key: [{key}]")
             df[key] = ema
         df = df.sort_values(by='date', ascending=False).reset_index(drop=True)
         return df
@@ -326,7 +326,7 @@ class BaseFetcher(ABC):
         在请求之间加入不规则的等待时间
         """
         sleep_time = random.uniform(min_seconds, max_seconds)
-        logger.debug(f"随机休眠 {sleep_time:.2f} 秒...")
+        logger.info(f"随机休眠 {sleep_time:.2f} 秒...")
         time.sleep(sleep_time)
 
 
@@ -352,7 +352,6 @@ class DataFetcherManager:
         Args:
             fetchers: 数据源列表（可选，默认按优先级自动创建）
         """
-        self.fetcher_map = None
         self._fetchers: List[BaseFetcher] = []
 
         if fetchers:
@@ -361,9 +360,6 @@ class DataFetcherManager:
         else:
             # 默认数据源将在首次使用时延迟加载
             self._init_default_fetchers()
-
-        for fetcher in self._fetchers:
-            self.fetcher_map[fetcher.name] = fetcher
 
     def _init_default_fetchers(self) -> None:
         """
@@ -394,13 +390,6 @@ class DataFetcherManager:
         """添加数据源并重新排序"""
         self._fetchers.append(fetcher)
         self._fetchers.sort(key=lambda f: f.priority)
-
-    def get_fetcher(self, name: str) -> BaseFetcher:
-        """根据名称获取数据源"""
-        if name in self.fetcher_map:
-            return self.fetcher_map[name]
-        else:
-            raise ValueError(f"未找到数据源: {name}")
 
     def get_daily_data(
             self,
@@ -449,7 +438,7 @@ class DataFetcherManager:
 
             except Exception as e:
                 error_msg = f"[{fetcher.name}] 失败: {str(e)} 开始时间{start_date} 结束时间{end_date}"
-                logger.warning(error_msg)
+                logger.error(error_msg)
                 errors.append(error_msg)
                 # 继续尝试下一个数据源
                 continue
@@ -489,7 +478,7 @@ class DataFetcherManager:
 
             except Exception as e:
                 error_msg = f"[{fetcher.name}] 失败: {str(e)} 开始时间{start_date} 结束时间{end_date}"
-                logger.warning(error_msg)
+                logger.error(error_msg)
                 errors.append(error_msg)
                 # 继续尝试下一个数据源
                 continue
@@ -546,7 +535,7 @@ def merge_and_clean_data(date_field: str, df_db, df_new):
         1. 合并存量+增量数据
         2. 按日期去重（保留增量数据，即最后一条）
         3. 按日期升序排序
-        """
+    """
     # 步骤1：合并数据
     df_merged = pd.concat([df_db, df_new], ignore_index=True)
 
@@ -562,7 +551,6 @@ def merge_and_clean_data(date_field: str, df_db, df_new):
         by=date_field,
         ascending=True  # 升序=从早到晚排序
     ).reset_index(drop=True)  # 重置索引，避免混乱
-
     return df_sorted
 
 

@@ -40,8 +40,8 @@ AkshareFetcher - 主数据源 (Priority 1)
     ↓
   返回DataFrame
 """
-
 import logging
+from utils.logger import logger
 import random
 import time
 from dataclasses import dataclass
@@ -192,7 +192,6 @@ class ChipDistribution:
         
         return "，".join(status_parts)
 
-logger = logging.getLogger(__name__)
 
 
 # User-Agent 池，用于随机轮换
@@ -932,7 +931,7 @@ class AkshareFetcher(BaseFetcher):
             # 如果启用了PDF链接分解功能
             if '报告PDF链接' in df.columns:
                 df['pdf_name'] = df['报告PDF链接'].apply(extract_last_segment_standard)
-                logging.info(f"[数据处理] 已提取PDF链接的最后一段内容，新增'PDF文件名'列")
+                logger.info(f"[数据处理] 已提取PDF链接的最后一段内容，新增'PDF文件名'列")
 
             logger.info(f"[API返回] ak.stock_research_report_em 成功: 返回 {len(df)} 条数据, 耗时 {api_elapsed:.2f}s")
             df = self._normalize_research_report_data(df, stock_code)

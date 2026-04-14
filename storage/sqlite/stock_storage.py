@@ -890,7 +890,7 @@ class DatabaseManager:
         # 步骤1：获取数据库连接URL
         if db_url is None:
             config = get_db_config()
-            db_url = config.get_db_url()
+            db_url = config.get("sqlite_path", "sqlite:///./data/sqlite/stock.db")
 
         # 步骤2：创建SQLAlchemy引擎（连接池管理器）
         # 参数说明：
@@ -1653,7 +1653,7 @@ class DatabaseManager:
             return 0  # 无数据可保存
 
         saved_count = 0  # 计数器：记录新增（非更新）的记录数
-
+        start_date_str = parse_row_date(start_date)
         # 使用数据库会话（工作单元模式）
         with self.get_session() as session:
             try:
@@ -1678,7 +1678,7 @@ class DatabaseManager:
                     elif isinstance(row_date, pd.Timestamp):
                         row_date = row_date.date()
 
-                    if  row_date < start_date:
+                    if  row_date < start_date_str:
                         continue
 
                     # === 步骤2：检查记录是否已存在（UPSERT核心）===
@@ -1803,7 +1803,7 @@ class DatabaseManager:
             return 0  # 无数据可保存
 
         saved_count = 0  # 计数器：记录新增（非更新）的记录数
-
+        start_date_str = parse_row_date(start_date)
         # 使用数据库会话（工作单元模式）
         with self.get_session() as session:
             try:
@@ -1814,8 +1814,7 @@ class DatabaseManager:
                     # 数据可能来自不同来源，日期格式不统一，需要标准化
                     row_date = parse_row_date(row.get('date'))
                     end_date = parse_row_date(row.get('end_date'))
-
-                    if end_date < start_date:
+                    if end_date < start_date_str:
                         continue
 
                     # === 步骤2：检查记录是否已存在（UPSERT核心）===
@@ -1944,7 +1943,7 @@ class DatabaseManager:
             return 0  # 无数据可保存
 
         saved_count = 0  # 计数器：记录新增（非更新）的记录数
-
+        start_date_str = parse_row_date(start_date)
         # 使用数据库会话（工作单元模式）
         with self.get_session() as session:
             try:
@@ -1956,7 +1955,8 @@ class DatabaseManager:
                     row_date = parse_row_date(row.get('date'))
                     e_date = parse_row_date(row.get('end_date'))
 
-                    if row_date < start_date:
+
+                    if e_date < start_date_str:
                         continue
 
                     # === 步骤2：检查记录是否已存在（UPSERT核心）===
