@@ -1,9 +1,18 @@
 # 全局模型配置
 models:
+  deepseek:
+    api_key: ""
+    url: ""
+  ollama:
+    api_key: ""
+    url: ""
+  embedding:
+    api_key: ""
+    url: ""
   brain_model: "deepseek-reasoner"
   deepseek_model_url: "http://api.deepseek.com/v1"
   deepseek_token: ""
-  ollama_model_url: "http://192.168.21.21:11434"
+  ollama_model_url: "http://ip:port"
   embedding_model: "qwen3.5:9b"  # 本地向量模型
   llm_model: "qwen3.5:9b"               # 本地大模型
   device: "cpu"
