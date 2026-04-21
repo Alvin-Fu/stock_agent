@@ -4,12 +4,15 @@ from .stock.base import DataFetcherManager
 from storage.sqlite import get_db
 import pandas as pd
 from utils.logger import logger
+from utils.common import TASK_NAME_DAILY_TASK, parse_row_date
 from datetime import date
 from .stock.tushare_fetcher import TushareFetcher
 from .stock.akshare_fetcher import AkshareFetcher
 from langchain_core.tools import StructuredTool
 import traceback
 from pydantic import BaseModel, Field
+from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime, date, timezone, timedelta
 
 
 
@@ -228,6 +231,88 @@ class StockTools:
         except Exception as e:
             logger.error(f"获取数据错误[{e}] {traceback.format_exc()}")
 
+    def fetch_and_save_stock_research_report(
+        self,
+        code: str,
+    ) -> pd.DataFrame | None:
+        """获取和保存股票研究报告数据"""
+        try:
+            today = date.today()
+            task_m = self.db.get_stock_daily_task(code)
+            task_date = task_m.get(TASK_NAME_DAILY_TASK)
+            if task_date == today:
+                logger.debug(f"[{code}] 今日研报数据已存在，跳过获取（断点续传）")
+                return None
+
+            df = self.akshare.stock_research_report_em( code)
+            if df is None or df.empty:
+                logger.error(f"akshare get stock research report err[{code}]")
+                return None
+            return self.handle_research_report(code, df)
+        except Exception as e:
+            logger.error(f"akshare get stock research report err[{code}], {traceback.format_exc()}")
+            return None
+
+    def handle_research_report(self, code: str, df: pd.DataFrame)->pd.DataFrame:
+        """处理股票研究报告数据"""
+        if df is None or df.empty:
+            logger.error(f"股票研究报告数据为空")
+            return  df
+        logger.warning(f"获取的数据[{df.head(1)}]")
+        try:
+            pdf_name_m, analyze_list = self.db.get_financial_analyze(code)
+
+            logger.warning(f"已存在的研报[{pdf_name_m}]")
+            need_analyze_list = pd.DataFrame(columns=["pdf_name", "pdf_url", "content", "code", "report_date"])
+            for _, row in df.iterrows():
+                report_date = row.get("date")
+                if report_date is None:
+                    logger.error(f"[{code}] 研报[{report_date}]无日期")
+                    continue
+                report_date = parse_row_date(report_date)
+
+                half_year_ago = date.today() - timedelta(days=2)
+
+                # 如果研报日期早于半年前，跳过
+                if report_date < half_year_ago:
+                    logger.debug(f"[{code}] 研报 {pdf_name} 日期 ({report_date}) 早于 ({half_year_ago})，已忽略")
+                    continue
+
+                if report_date in pdf_name_m:
+                    continue
+
+                pdf_url = row.get("report_pdf_link")
+                if pdf_url is None:
+                    logger.error(f"[{code}] 研报[{report_date}]无pdf链接")
+                    continue
+                pdf_name = row.get("pdf_name")
+                if pdf_name in pdf_name_m:
+                     continue
+                res = self.db.download_research_report(pdf_url, pdf_name, code)
+                if res.get("error") is not None:
+                    logger.error(f"[{code}] 下载股票研报失败[{res.get('error')}]")
+                    continue
+                content = res.get("file_content")
+                if content is None:
+                    logger.error(f"[{code}] 获取股票研报内容失败")
+                    continue
+                need_analyze_list.append(
+                    {
+                        "pdf_name": pdf_name,
+                        "pdf_url": pdf_url,
+                        "content": content,
+                        "code": code,
+                        "report_date": report_date
+                    }
+                )
+
+
+            return need_analyze_list
+        except Exception as e:
+            logger.error(f"处理股票研报数据错误[{e}] {traceback.format_exc()}")
+            return  df
+
+
 stock_tool_instance = StockTools()  # 传入你的数据库连接
 
 # ===================== 1. 注册：日线数据工具 =====================
@@ -280,6 +365,21 @@ def call_fetch_monthly_data(stock_code: str) -> str:
         logger.error(f"调用月线工具失败: {e} {traceback.format_exc()}")
         return "❌ 获取月线数据失败"
 
+def call_fetch_stock_research_report(stock_code: str) -> str:
+    """
+    获取股票研报
+    :param stock_code: 股票代码
+    :return: 研报数据
+    """
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_research_report(stock_code)
+        if df is None or df.empty:
+            return f"❌ 未获取到 {stock_code} 的股票研报"
+        return f"✅ 【{stock_code} 股票研报】\n{df.head(20).to_string()}"
+    except Exception as e:
+        logger.error(f"调用股票研报工具失败: {e} {traceback.format_exc()}")
+        return "❌ 获取股票研报数据失败"
+
 # 1. 定义单参数的Pydantic模型（必须正确，否则schema缺properties）
 class StockCodeInput(BaseModel):
     stock_code: str = Field(description="A股股票代码，例如：002594、600036")
@@ -316,6 +416,20 @@ stock_fetcher_tools = [
         输入参数：股票代码（字符串）。
         例如：000001
         作用：拉取K线数据，保存到数据库，并返回最近200条数据。
+        """
+    )
+]
+
+stock_analyst_tools = [
+    StructuredTool(
+        name="stock_research_report_fetcher",
+        func=call_fetch_stock_research_report,
+        args_schema=StockCodeInput,
+        description="""
+        获取A股股票的股票研报。
+        输入参数：股票代码（字符串）。
+        例如：000001
+        作用：拉取股票研报，保存到数据库，并返回最近20条数据。
         """
     )
 ]

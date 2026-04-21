@@ -1,6 +1,8 @@
 from datetime import datetime
 import pandas as pd
 
+TASK_NAME_DAILY_TASK = "daily_task"
+
 def parse_row_date(row_date):
     if isinstance(row_date, str):
         date_str = row_date.strip()

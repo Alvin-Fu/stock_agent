@@ -3,9 +3,10 @@
 🔥 中央路由大脑 Agent
 系统核心：自动识别问题 → 路由到对应知识库 → 生成答案
 """
-from core import BaseAgent, get_ds, get_llm
-from langchain_classic.chains import RetrievalQA,create_retrieval_chain
+from core import BaseAgent, get_llm
+from langchain_classic.chains import create_retrieval_chain
 from langchain_core.prompts import PromptTemplate
+from langchain_classic.memory import ConversationBufferMemory
 from langchain_classic.agents import create_structured_chat_agent, AgentExecutor
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_classic import hub
@@ -17,27 +18,22 @@ import re
 class RouterBrainAgent(BaseAgent):
     def __init__(self, config, knowledge_registry):
         super().__init__(config, knowledge_registry)
-        self.llm = get_ds()  # 远程Ollama大模型
+        self.llm = get_llm()  # 远程Ollama大模型
         self.kb_map = knowledge_registry.get_all_knowledge()
 
         self.tools = all_stock_tools
         self.tool_agent = self._init_tool_agent()
+        self.memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True
+        )
+        # 记录当前分析的股票代码（多轮复用）
+        self.current_stock = None
 
     def _init_tool_agent(self):
-
-        prompt = hub.pull("hwchase17/structured-chat-agent")
-        agent = create_structured_chat_agent(llm=self.llm, tools=self.tools, prompt = prompt)
+        prompt = hub.pull("hwchase17/structured-chat-agents")
+        agent = create_structured_chat_agent(llm=self.llm, tools=self.tools, prompt=prompt)
         return AgentExecutor(agent=agent, tools=self.tools, verbose=True, handle_parsing_errors=True)
-
-    def _is_realtime_finance_query(self, query: str):
-        """判断是否需要调用实时股票工具"""
-        keywords = ["日线", "周线", "月线"]
-        return any(k in query for k in keywords)
-
-    def _route_kb(self, query: str):
-        prompt = PromptTemplate.from_template("只返回一个词：股票/产品/技术\n问题：{query}")
-        category = self.llm.invoke(prompt.format(query=query)).strip()
-        return self.kb_map.get(category, "kb_stock")
 
     def _route_to_knowledge_base(self, query: str) -> str:
         """
@@ -52,7 +48,8 @@ class RouterBrainAgent(BaseAgent):
             input_variables=["query"]
         )
         # LLM判断分类
-        category = self.llm.invoke(route_prompt.format(query=query)).content.strip()
+        response = self.llm.invoke(route_prompt.format(query=query))
+        category = response.content.strip() if hasattr(response, 'content') else response.strip()
         logger.info(f"🧠 大脑路由判断：问题：{query} → 分类：{category}")
         kb_id = self.kb_map.get(category, "kb_stock")
         logger.info(f"🧠 大脑路由判断：问题 → {category} → 知识库：{kb_id}")
@@ -66,12 +63,12 @@ class RouterBrainAgent(BaseAgent):
         # 2. 定义 Prompt (注意：这里需要包含 {context} 和 {input} 变量)
         prompt = PromptTemplate(
             template="""
-                            你是专业助手，**仅根据上下文回答**，不编造内容。
-                            回答简洁、专业、准确。
-                            上下文：{context}
-                            问题：{input}
-                            答案：
-                            """,
+                        你是专业助手，**仅根据上下文回答**，不编造内容。
+                        回答简洁、专业、准确。
+                        上下文：{context}
+                        问题：{input}
+                        答案：
+                    """,
             input_variables=["context", "input"]
         )
         question_answer_chain = create_stuff_documents_chain(self.llm, prompt)
@@ -80,7 +77,7 @@ class RouterBrainAgent(BaseAgent):
         return rag_chain
 
     # ===================== 核心：分析股票（工具+知识库）=====================
-    def analyze_stock(self, stock_code: str, period: str, kb_chain: RetrievalQA):
+    def analyze_stock(self, stock_code: str, period: str, kb_chain):
         """
         统一分析入口：
         1. 拉取K线数据
@@ -94,9 +91,10 @@ class RouterBrainAgent(BaseAgent):
         all_kline = f"{daily}\n\n{weekly}\n\n{monthly}"
 
         # 2. 从知识库获取分析规则
-        analysis_rule = kb_chain.invoke({
-            "input": f"股票{period}走势分析方法、技术指标判断规则"
-        })["answer"]
+        analysis_result = kb_chain.invoke({
+            "input": f"股票K线走势分析方法、技术指标判断规则、估值方法，MACD等"
+        })
+        analysis_rule = analysis_result.get("answer", analysis_result.get("result", ""))
 
         # 3. 大模型整合分析
         final_prompt = f"""

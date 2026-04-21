@@ -17,6 +17,17 @@ models:
   llm_model: "qwen3.5:9b"               # 本地大模型
   device: "cpu"
 
+embedding:
+  model: "bge-m3:latest"
+  url: "http://ip:port"
+
+retriever:
+  top_k: 3
+  model: "deepseek-r1:14b"
+  url: "http://ip:port"
+  use_reranker: true
+  reranker_model: "deepseek-r1:14b"
+
 # 多知识库配置（新增知识库只需在这里加配置）
 knowledge_bases:
   kb_product:

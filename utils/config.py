@@ -40,6 +40,26 @@ def get_model_config() -> Dict[str, Any]:
     config = load_config()
     return config.get("models", {})
 
+def get_openai_model_config() -> Dict[str, Any]:
+    """获取OpenAI模型配置"""
+    config = load_config()
+    return config.get("models", {}).get("openai", {})
+
+def get_deepseek_model_config() -> Dict[str, Any]:
+    """获取Deepseek模型配置"""
+    config = load_config()
+    return config.get("models", {}).get("deepseek", {})
+
+def get_embedding_model_config() -> Dict[str, Any]:
+    """获取嵌入模型配置"""
+    config = load_config()
+    return config.get("embedding", {})
+
+def get_llm_model_config() -> Dict[str, Any]:
+    """获取LLM模型配置"""
+    config = load_config()
+    return config.get("models", {}).get("ollama", {})
+
 def get_all_kb_config() -> Dict[str, Any]:
     """获取所有知识库配置"""
     config = load_config()
@@ -86,3 +106,8 @@ def get_search_config() -> Dict[str, Any]:
     """获取搜索配置"""
     config = load_config()
     return config.get("search", {})
+
+def get_retriever_config() -> Dict[str, Any]:
+    """获取检索配置"""
+    config = load_config()
+    return config.get("retriever", {"top_k": 3, "use_reranker": False})

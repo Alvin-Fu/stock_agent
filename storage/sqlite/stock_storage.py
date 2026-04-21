@@ -808,6 +808,42 @@ class StockResearchReportAnalyze(Base):
             'analyze_content': self.analyze_content,
         }
 
+
+class FinancialReportAnalyze(Base):
+    """
+    财务报表分析模型 - ORM映射类
+    """
+    __tablename__ = 'financial_report_analyze'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)  # 日期
+    pdf_name = Column(String(100), nullable=False, index=True)  # PDF文件名
+    report_type = Column(String(20), nullable=False)  # 报告类型：机构研报、年报、季报
+    analyze_content = Column(Text)  # 分析内容
+    ratios = Column(JSON)  # 财务比率
+    confidence = Column(String(10))  # 可信度
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+    __table_args__ = (
+        UniqueConstraint('code', 'pdf_name', name='uix_financial_report_analyze_code_pdf'),
+        Index('ix_financial_report_analyze_code_date_pdf', 'code', 'date', 'pdf_name'),
+        Index('ix_financial_report_analyze_type', 'report_type'),
+    )
+
+    def __repr__(self):
+        return f"<FinancialReportAnalyze(code={self.code}, date={self.date}, pdf_name={self.pdf_name}, report_type={self.report_type})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式，便于数据交互"""
+        return {
+            'code': self.code,
+            'date': self.date,
+            'pdf_name': self.pdf_name,
+            'report_type': self.report_type,
+            'analyze_content': self.analyze_content,
+            'ratios': self.ratios,
+            'confidence': self.confidence,
+        }
+
 class DailyTask(Base):
     """
     每日任务状态状态模型 - ORM映射类
@@ -1254,6 +1290,108 @@ class DatabaseManager:
                 .limit(days)
             ).scalars().all()
             return list(results)
+
+    def is_pdf_analyzed(self, code: str, pdf_name: str) -> bool:
+        """
+        检查PDF文件是否已经分析过
+        
+        Args:
+            code: 股票代码
+            pdf_name: PDF文件名
+            
+        Returns:
+            bool: True表示已经分析过，False表示未分析过
+        """
+        with self.get_session() as session:
+            result = session.execute(
+                select(FinancialReportAnalyze)
+                .where(
+                    and_(
+                        FinancialReportAnalyze.code == code,
+                        FinancialReportAnalyze.pdf_name == pdf_name
+                    )
+                )
+            ).scalar_one_or_none()
+            return result is not None
+
+    def save_financial_analyze(self, code: str, date: date, pdf_name: str, report_type: str, 
+                             analyze_content: str, ratios: Dict[str, Any], confidence: str = "high") -> bool:
+        """
+        保存财务分析结果
+        
+        Args:
+            code: 股票代码
+            date: 分析日期
+            pdf_name: PDF文件名
+            report_type: 报告类型：机构研报、年报、季报
+            analyze_content: 分析内容
+            ratios: 财务比率
+            confidence: 可信度
+            
+        Returns:
+            bool: True表示保存成功，False表示保存失败
+        """
+        try:
+            with self.get_session() as session:
+                # 检查是否已经存在
+                existing = session.execute(
+                    select(FinancialReportAnalyze)
+                    .where(
+                        and_(
+                            FinancialReportAnalyze.code == code,
+                            FinancialReportAnalyze.pdf_name == pdf_name
+                        )
+                    )
+                ).scalar_one_or_none()
+                
+                if existing:
+                    # 更新现有记录
+                    existing.analyze_content = analyze_content
+                    existing.ratios = ratios
+                    existing.confidence = confidence
+                    existing.updated_at = datetime.now()
+                else:
+                    # 创建新记录
+                    new_analyze = FinancialReportAnalyze(
+                        code=code,
+                        date=date,
+                        pdf_name=pdf_name,
+                        report_type=report_type,
+                        analyze_content=analyze_content,
+                        ratios=ratios,
+                        confidence=confidence
+                    )
+                    session.add(new_analyze)
+                
+                session.commit()
+                return True
+        except Exception as e:
+            logger.error(f"保存财务分析结果失败: {e}")
+            return False
+
+    def get_financial_analyze(self, code: str) -> (List[FinancialReportAnalyze], Mapping[str, bool]):
+        """
+        获取财务分析结果
+        
+        Args:
+            code: 股票代码
+
+        Returns:
+            List[FinancialReportAnalyze]: 分析结果列表
+            Mapping[str, bool]: 所有PDF文件的映射，键为PDF文件名，值为True表示已分析
+        """
+        with self.get_session() as session:
+            query = select(FinancialReportAnalyze).where(FinancialReportAnalyze.code == code)
+
+            results = session.execute(
+                query.order_by(desc(FinancialReportAnalyze.date))
+            ).scalars().all()
+            data_list = list(results)
+            return data_list, self.get_all_financial_analyze_map(data_list)
+
+    def get_all_financial_analyze_map(self, res: List[FinancialReportAnalyze]) -> Mapping[str, bool]:
+        """获取所有财务分析结果"""
+        return {obj.pdf_name: True for obj in res}
 
     def get_daily_forecast_range(self, code: str, start_date, end_date: str) -> List[DailyForecast]:
         """获取每日预测数据"""

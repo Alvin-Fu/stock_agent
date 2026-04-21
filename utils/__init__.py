@@ -16,6 +16,7 @@ from .config import (
     get_stock_tools_config,
     get_search_config,
 )
+from .common import TASK_NAME_DAILY_TASK, parse_row_date
 # 从文件工具模块导出函数（后续扩展用）
 from .file_tools import load_documents_from_dir, split_documents
 # 从日志模块导出核心函数
@@ -38,7 +39,8 @@ __all__ = [
     "setup_logger",
     # 文件工具相关
     "load_documents_from_dir",
-    "split_documents"
+    "split_documents",
+    "parse_row_date"
 ]
 
 # 包元信息（可选）

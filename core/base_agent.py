@@ -10,7 +10,6 @@ class BaseAgent(ABC):
     def run(self, query: str):
         """执行Agent任务"""
         pass
-
 class BaseAgent(ABC):
     """Agent抽象基类：所有智能体必须实现run方法"""
     def __init__(self, config, knowledge_registry):

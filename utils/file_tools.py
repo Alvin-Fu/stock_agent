@@ -1,7 +1,6 @@
-#from langchain_community.document_loaders import DirectoryLoader, TextLoader, PyPDFLoader, UnstructuredWordDocumentLoader
 import os
-
-from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader  # 核心：导入 PyPDFLoader
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_community.document_loaders.pdf import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 

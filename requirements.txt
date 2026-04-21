@@ -1,0 +1,19 @@
+# 核心依赖
+langchain
+langchain-core
+langgraph
+
+# 数据库
+sqlalchemy
+pandas
+
+# 工具
+schedule
+requests
+python-dateutil
+
+# 模型
+transformers
+
+# 其他
+pyyaml

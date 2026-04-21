@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-from agent.registry import AgentRegistry
+from agents.registry import AgentRegistry
 from knowledge_bases.registry import KnowledgeRegistry
 from utils.logger import logger
 import traceback
