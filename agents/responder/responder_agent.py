@@ -31,12 +31,13 @@ class ResponderAgent:
         documents = state.get("documents", [])
         analysis = state.get("analysis_result", {})
         research = state.get("research_result", {})
+        technical = state.get("technical_result", {})
         compliance = state.get("compliance_result", {})
 
         logger.info("开始生成最终回答")
 
         # 构建综合上下文
-        context = self._format_context(documents, analysis, research)
+        context = self._format_context(documents, analysis, research, technical)
 
         system_prompt = """你是一位专业的财经顾问，请根据提供的资料回答用户问题。
 
@@ -67,13 +68,14 @@ class ResponderAgent:
             SystemMessage(content=system_prompt.format(compliance_note=compliance_note)),
             HumanMessage(content=user_message),
         ]
+        logger.info(f"context {context[:500]}")
 
         response = self.llm.invoke(messages)
         final_answer = response.content
-
+        logger.info(f"compliance item {compliance}")
         # 自动追加免责声明（如果合规要求且未包含）
-        if compliance.get("required_disclaimer") and "不构成投资建议" not in final_answer:
-            final_answer += "\n\n---\n*免责声明：以上内容基于公开信息整理，不构成投资建议。*"
+        #if compliance.get("required_disclaimer") and "不构成投资建议" not in final_answer:
+        #    final_answer += "\n\n---\n*免责声明：以上内容基于公开信息整理，不构成投资建议。*"
 
         logger.info("回答生成完成")
 
@@ -82,7 +84,7 @@ class ResponderAgent:
             "intermediate_steps": state.get("intermediate_steps", []) + [("responder", final_answer[:200])],
         }
 
-    def _format_context(self, documents, analysis, research) -> str:
+    def _format_context(self, documents, analysis, research, technical) -> str:
         parts = []
         if documents:
             parts.append("【知识库检索结果】")
@@ -95,6 +97,8 @@ class ResponderAgent:
                 parts.append(f"关键比率：{analysis['ratios']}")
         if research:
             parts.append(f"【实时信息补充】\n{research.get('summary', '')}")
+        if technical:
+            parts.append(f"【技术分析结果】\n{technical.get('summary', '')}")
         return "\n\n".join(parts) if parts else "无参考资料"
 
     def invoke(self, state: AgentState) -> AgentState:

@@ -55,12 +55,17 @@ class WorkflowExecutor:
         config = {"configurable": {"thread_id": self.thread_id}}
 
         logger.info(f"开始执行工作流，问题: {question[:50]}...")
+        logger.info(f"初始状态: {initial_state}")
         try:
             final_state = self.graph.invoke(initial_state, config)
             logger.info("工作流执行完成")
+
+            # 3. 强制兜底：如果invoke返回None，用初始状态代替
+            final_state = final_state or initial_state
+            logger.debug(f"最终状态: {final_state}")
             return final_state
         except Exception as e:
-            logger.error(f"工作流执行失败: {e}")
+            logger.error(f"工作流执行失败: {type(e).__name__}: {e}", exc_info=True)
             initial_state["error"] = str(e)
             initial_state["final_answer"] = f"系统处理出错：{e}"
             return initial_state

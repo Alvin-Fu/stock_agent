@@ -3,9 +3,10 @@ from utils.config import get_all_agent_config
 from .qa_agent.service import QAAgent
 from .router.service import RouterBrainAgent
 from .retriever.retriever_agent import RetrieverAgent
-from .financial_analyst.service import AnalystAgent
+from .financial_analyst.analyst import AnalystAgent
 from .researcher.researcher_agent import ResearcherAgent
 from .compliance.compliance_agent import ComplianceAgent
+from .technical_agent.technical_agent import TechnicalAgent
 
 AGENT_CONFIG = get_all_agent_config()
 
@@ -25,6 +26,7 @@ class AgentRegistry:
             AGENT_CONFIG["router"],
             knowledge_registry
         )
+        AgentRegistry._instances["technical"] = TechnicalAgent()
         
         # 注册检索Agent
         AgentRegistry._instances["retriever"] = RetrieverAgent()

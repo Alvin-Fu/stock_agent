@@ -237,6 +237,7 @@ class StockTools:
     ) -> pd.DataFrame | None:
         """获取和保存股票研究报告数据"""
         try:
+            logger.info(f"获取股票[{code}]研报数据")
             today = date.today()
             task_m = self.db.get_stock_daily_task(code)
             task_date = task_m.get(TASK_NAME_DAILY_TASK)
@@ -275,7 +276,7 @@ class StockTools:
 
                 # 如果研报日期早于半年前，跳过
                 if report_date < half_year_ago:
-                    logger.debug(f"[{code}] 研报 {pdf_name} 日期 ({report_date}) 早于 ({half_year_ago})，已忽略")
+                    logger.debug(f"[{code}] 研报 {pdf_name_m} 日期 ({report_date}) 早于 ({half_year_ago})，已忽略")
                     continue
 
                 if report_date in pdf_name_m:
@@ -325,6 +326,7 @@ def call_fetch_daily_data(stock_code: str) -> str:
     try:
         df = stock_tool_instance.fetch_and_save_stock_daily_data(stock_code=stock_code)
         if df is None or df.empty:
+            logger.error(f"未获取到 {stock_code} 的日线数据")
             return f"❌ 未获取到 {stock_code} 的日线数据"
         # 格式化输出（美观）
         return f"✅ 【{stock_code} 日线数据】\n{df.head(200).to_string()}"

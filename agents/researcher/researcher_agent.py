@@ -1,13 +1,12 @@
 """
-信息核实 Agent（Researcher）
-职责：联网搜索最新信息，验证事实的时效性和准确性
+信息研究 Agent（Researcher）
+职责：多维搜索全网产业/公司信息，交叉验证，输出结构化分析结论
 """
 
+import traceback
 from typing import Dict, Any, List
+from datetime import date, datetime, timedelta
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_core.tools import tool
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
 
 from agents.base import AgentState
 from core.llm import get_default_llm
@@ -15,109 +14,159 @@ from .web_search_tool import web_search
 from utils.logger import logger
 
 
-
 class ResearcherAgent:
+    """研究 Agent：程序化多维搜索 → LLM 一次性综合分析"""
+
     def __init__(self):
         self.llm = get_default_llm()
-        self.tools = [web_search]
-        self.llm_with_tools = self.llm.bind_tools(self.tools)
-        self.graph = self._build_graph()
 
-    def _build_graph(self) -> StateGraph:
-        workflow = StateGraph(AgentState)
-        workflow.add_node("research", self.research_node)
-        workflow.add_node("search_tools", ToolNode(self.tools))
-        workflow.set_entry_point("research")
-        workflow.add_conditional_edges(
-            "research",
-            self.should_continue,
-            {"continue": "search_tools", "end": END}
-        )
-        workflow.add_edge("search_tools", "research")
-        return workflow.compile()
+    def _build_search_queries(self, stock_code: str, question: str) -> List[str]:
+        """
+        根据股票代码和用户问题，生成覆盖全维度的搜索查询
+        每个维度一条查询，确保覆盖：
+          公告、产业、经营、技术、产业链地位、利好/利空
+        时间范围：最近1个月为主，部分维度扩展到最近3个月
+        """
+        today = date.today()
+        one_month_ago = today - timedelta(days=30)
+        three_months_ago = today - timedelta(days=90)
 
-    def research_node(self, state: AgentState) -> Dict[str, Any]:
+        # 格式化日期范围，搜索引擎通常支持 "2025年3月" 或 "2025-03"
+        recent_period = f"{today.year}年{today.month}月"
+        three_month_range = f"{three_months_ago.strftime('%Y-%m')} {today.strftime('%Y-%m')}"
+
+        return [
+            f"{stock_code} 公司公告 重大事项 {one_month_ago.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
+            f"{stock_code} 所属行业 产业政策 发展趋势 {three_month_range}",
+            f"{stock_code} 经营状况 营收 利润 最新业绩 {recent_period}",
+            f"{stock_code} 技术实力 研发投入 核心竞争力 专利",
+            f"{stock_code} 产业链 上下游 市场地位 竞争格局 {recent_period}",
+            f"{stock_code} 利好 利空 机构评级 目标价 {one_month_ago.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
+        ]
+
+    def _do_search(self, queries: List[str]) -> Dict[str, str]:
+        """每个查询搜一次，返回 {query: result}"""
+        results = {}
+        for q in queries:
+            try:
+                logger.info(f"搜索: {q[:40]}...")
+                results[q] = web_search.invoke({"query": q})
+            except Exception as e:
+                logger.error(f"搜索失败 [{q}]: {e}")
+                results[q] = f"搜索失败: {e}"
+        return results
+
+    def analyze_node(self, state: AgentState) -> Dict[str, Any]:
         try:
+            stock_code = state.get("stock_code", "")
             question = state.get("question", "")
-            documents = state.get("documents", [])
-            logger.info(f"研究 Agent 开始处理: {question[:80]}...")
+            logger.info(f"研究 Agent 开始，股票: {stock_code}，问题: {question[:80]}...")
 
-            # 构建上下文
-            context = "\n".join([d.page_content[:500] for d in documents[:3]]) if documents else "无现有资料"
+            # 1. 生成多维搜索查询
+            queries = self._build_search_queries(stock_code, question)
 
-            system_prompt = """你是一个财经信息研究员，负责核实和补充最新信息。
-当现有资料不足或需要实时数据时，请调用 web_search 工具搜索互联网。
-搜索时请使用精确的关键词（如公司名+年份+财务指标）。
-获得搜索结果后，请提炼关键信息并判断时效性。"""
+            # 2. 并行搜索（每个维度一条）
+            all_results = self._do_search(queries)
+
+            # 3. 拼接所有搜索结果
+            search_text = ""
+            for q, result in all_results.items():
+                search_text += f"\n{'='*40}\n【{q}】\n{result}\n"
+
+            # 4. LLM 综合分析
+            system_prompt = """你是一个专业的股票信息研究员和分析师。
+
+请基于下方搜索结果，对该公司的以下维度进行客观分析并给出核心结论：
+
+1. **公司公告与重大事项**：
+   - 近期是否有重大公告（增发/回购/并购/分红等）
+   - 这些公告对公司的影响
+
+2. **产业信息**：
+   - 所属行业当前景气度
+   - 行业政策是否利好或利空
+   - 行业发展趋势
+
+3. **经营状态**：
+   - 最新营收/利润情况
+   - 同比/环比变化
+   - 经营是否稳健
+
+4. **技术实力**：
+   - 研发投入水平
+   - 核心技术/专利情况
+   - 技术壁垒是否明显
+
+5. **产业链地位**：
+   - 公司在产业链中的位置（上游/中游/下游）
+   - 上下游议价能力
+   - 竞争格局和市场份额
+
+6. **利好与利空分析**：
+   - 利好消息汇总及影响力评估（高/中/低）
+   - 利空消息汇总及影响力评估（高/中/低）
+   - 利好利空消息数量占比
+   - 综合偏多/偏空判断
+
+【输出要求】
+- 每个维度给出明确结论，依据搜索结果
+- 如果搜索结果不足，请标注「信息不足」
+- 利好利空分析中必须给出占比和综合判断
+- 最后给出 3 句以内的核心结论总结"""
 
             user_message = f"""用户问题：{question}
+股票代码：{stock_code}
 
-【现有资料摘要】
-{context}
+========== 全网搜索结果 ==========
+{search_text[:12000]}
 
-请判断是否需要联网搜索以补充信息。如需搜索，请调用工具。"""
+请基于以上信息进行全面分析。"""
 
             messages = [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_message),
             ]
 
-            response = self.llm_with_tools.invoke(messages)
+            logger.info("LLM 综合分析中...")
+            response = self.llm.invoke(messages)
+            summary = response.content if hasattr(response, 'content') else str(response)
+            logger.info(f"研究分析完成，长度: {len(summary)}， {summary[:200]}")
+
+            # 提取搜索来源
+            sources = [q for q in queries]
 
             return {
                 "messages": [response],
-                "intermediate_steps": state.get("intermediate_steps", []) + [("researcher", response)],
+                "research_result": {
+                    "summary": summary,
+                    "sources": sources,
+                },
+                "current_node": "researcher",
+                "intermediate_steps": state.get("intermediate_steps", []) + [
+                    ("researcher", {"stock_code": stock_code, "queries": len(queries), "content": summary[:200]})
+                ],
             }
+
         except Exception as e:
-            logger.error(f"研究节点执行失败: {e}")
+            logger.error(f"研究节点执行失败: {e}\n{traceback.format_exc()}")
             return {
                 "messages": [],
+                "research_result": {
+                    "summary": f"研究执行失败: {e}",
+                    "sources": [],
+                },
                 "error": f"研究执行失败: {e}",
                 "intermediate_steps": state.get("intermediate_steps", []) + [("researcher", {"error": str(e)})],
             }
 
-    def should_continue(self, state: AgentState) -> str:
-        last_message = state["messages"][-1]
-        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-            return "continue"
-        # 将最终响应存入 research_result
-        return "end"
-
-    def invoke(self, state: AgentState) -> AgentState:
-        try:
-            result_state = self.graph.invoke(state)
-            # 提取最终回答作为研究结果
-            if result_state.get("messages") and len(result_state["messages"]) > 0:
-                final_msg = result_state["messages"][-1]
-                summary = final_msg.content if hasattr(final_msg, 'content') else str(final_msg)
-            else:
-                summary = "研究过程中未生成有效结果"
-            
-            result_state["research_result"] = {
-                "summary": summary,
-                "sources": self._extract_sources(result_state),
-            }
-            return result_state
-        except Exception as e:
-            logger.error(f"研究 Agent 执行失败: {e}")
-            state["research_result"] = {
-                "summary": f"研究执行失败: {e}",
-                "sources": [],
-            }
-            state["error"] = f"研究执行失败: {e}"
-            return state
-
-    def _extract_sources(self, state: AgentState) -> List[str]:
-        """从工具调用中提取来源 URL"""
-        sources = []
-        for msg in state["messages"]:
-            if hasattr(msg, "tool_calls"):
-                for tc in msg.tool_calls:
-                    if tc.get("name") == "web_search":
-                        sources.append(tc.get("args", {}).get("query", ""))
-        return sources
+    def invoke(self, state: AgentState) -> Dict[str, Any]:
+        return self.analyze_node(state)
 
 
 def create_researcher_node():
+    """
+    创建研究节点，返回 analyze_node（直通流程，不走工具调用循环）
+    """
     agent = ResearcherAgent()
-    return agent.research_node
+    return agent.analyze_node
+

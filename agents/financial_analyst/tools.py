@@ -2,10 +2,12 @@
 财务分析工具集
 所有工具均被装饰为 LangChain Tool，供 Agent 调用
 """
-
+import logging
 from typing import Dict, Optional
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
+from utils.logger import logger
+
 
 
 # ---------- 输入模型定义 ----------
@@ -32,6 +34,7 @@ def calculate_profitability_ratios(financial_statements: Dict) -> Dict[str, floa
                 total_assets, total_equity (平均或期末)
     """
     try:
+        logger.info(f"计算盈利能力比率")
         revenue = financial_statements.get("revenue", 0)
         cogs = financial_statements.get("cost_of_goods_sold", 0)
         net_income = financial_statements.get("net_income", 0)

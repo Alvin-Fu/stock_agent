@@ -10,9 +10,12 @@ from utils.logger import logger
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_ollama import ChatOllama
+from langchain_deepseek import ChatDeepSeek
 
 LLM_CACHE_ENABLED = True
 
+DeepseekFlashModule = "deepseek-v4-flash"
+DeepseekProModule = "deepseek-v4-pro"
 
 class LLMFactory:
     """LLM 工厂类，负责创建并缓存语言模型实例"""
@@ -90,7 +93,7 @@ class LLMFactory:
         """根据提供商创建具体 LLM 实例"""
         if provider == cls.PROVIDER_DEEPSEEK:
             return cls._create_deepseek_llm(
-                model=model or "deepseek-reasoner",
+                model=model or DeepseekFlashModule,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 streaming=streaming,
@@ -157,13 +160,13 @@ class LLMFactory:
         max_tokens: Optional[int],
         streaming: bool,
         **kwargs
-    ) -> ChatOpenAI:
+    ) -> ChatDeepSeek:
         """创建 Deepseek 模型实例"""
         deepseek_conf = get_deepseek_model_config()
         api_key = deepseek_conf["api_key"]
         if not api_key:
             raise ValueError("未配置 DEEPSEEK_API_KEY")
-        ds = ChatOpenAI(
+        ds = ChatDeepSeek(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens or 14096,
@@ -192,11 +195,11 @@ class LLMFactory:
     def _get_default_model(cls, provider: str) -> str:
         """返回各提供商的默认模型名称"""
         defaults = {
-            cls.PROVIDER_OPENAI: "deepseek-reasoner",
+            cls.PROVIDER_OPENAI: DeepseekFlashModule,
             cls.PROVIDER_AZURE: "",
             cls.PROVIDER_OLLAMA: "deepseek-r1:14b",
             cls.PROVIDER_ANTHROPIC: "claude-3-sonnet-20240229",
-            cls.PROVIDER_DEEPSEEK: "deepseek-reasoner",
+            cls.PROVIDER_DEEPSEEK: DeepseekFlashModule,
         }
         return defaults.get(provider, "deepseek-r1:14b")
 
@@ -216,22 +219,27 @@ class LLMFactory:
 @lru_cache(maxsize=1)
 def get_default_llm() -> BaseChatModel:
     """获取系统默认的 LLM 实例（基于配置文件）"""
-    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model="deepseek-reasoner")
+    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model=DeepseekFlashModule)
 
 # 为不同 Agent 预设特定参数的便捷函数
 def get_router_llm() -> BaseChatModel:
     """获取路由 Agent 专用的 LLM（低温度，更确定性）"""
-    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model="deepseek-reasoner")
+    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model=DeepseekProModule)
 
 
 def get_analyst_llm() -> BaseChatModel:
     """获取财务分析 Agent 专用的 LLM（更强大的推理模型）"""
-    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model="deepseek-reasoner")
+    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model=DeepseekFlashModule)
+
+
+def get_technical_llm() -> BaseChatModel:
+    """获取技术分析 Agent 专用的 LLM（适合技术分析推理）"""
+    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model=DeepseekFlashModule)
 
 
 def get_responder_llm() -> BaseChatModel:
     """获取回答生成 Agent 专用的 LLM（适中温度，表达自然）"""
-    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_OLLAMA, temperature=0.3, model="deepseek-r1:14b")
+    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model=DeepseekFlashModule)
 
 
 def get_local_fast_llm() -> BaseChatModel:

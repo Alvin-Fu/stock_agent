@@ -30,6 +30,7 @@ class RetrieverAgent:
     """知识检索 Agent"""
 
     def __init__(self, collection_name: str = "collection_stock"):
+        self.name = "retrieve"
         self.collection_name = collection_name
         self.embeddings = get_embeddings()
         self.vector_store = self._load_vector_store()
@@ -109,6 +110,7 @@ class RetrieverAgent:
 
             return {
                 "documents": unique_docs,
+                "current_node": "retriever",
                 "intermediate_steps": [("retriever", {"query": question, "docs_count": len(unique_docs)})],
             }
         except Exception as e:

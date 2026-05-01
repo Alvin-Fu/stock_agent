@@ -11,7 +11,8 @@ from typing import List, Dict, Any
 from storage.sqlite.stock_storage import DatabaseManager
 from tools.stock_tools import stock_tool_instance
 from orchestration.graph import get_default_graph
-from agents.base import AgentState, IntentType
+from agents.base import AgentState
+from utils.constants import IntentType
 from utils.logger import logger
 
 

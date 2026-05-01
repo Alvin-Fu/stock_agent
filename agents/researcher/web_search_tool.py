@@ -6,9 +6,10 @@ import os
 from langchain_core.tools import tool
 from langchain_tavily import TavilySearch
 from langchain_community.tools import TavilySearchResults, DuckDuckGoSearchRun
+from utils.config import get_search_config
 
 # 根据配置选择搜索引擎
-USE_TAVILY = os.getenv("TAVILY_API_KEY") is not None
+USE_TAVILY = get_search_config().get("tavily_api_key") is not None
 
 if USE_TAVILY:
     _search_tool = TavilySearch(max_results=3)
