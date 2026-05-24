@@ -1,7 +1,10 @@
 """
 技术分析Agent
-负责分析股票的均线和MACD等技术指标
+职责：
+  - 单股模式：拉取日线/周线/月线 → 均线/MACD分析
+  - 产业链模式（stock_code 含逗号分隔多代码）：逐股拉 K 线 → 技术面对比评分 → 选出技术面最强
 """
+
 from typing import Dict, Any, List
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.tools import StructuredTool
@@ -13,52 +16,55 @@ from utils.logger import logger
 
 
 class TechnicalAgent:
-    """
-    技术分析Agent
-    负责分析股票的均线和MACD等技术指标
-    """
 
     def __init__(self):
         self.name = "technical"
         self.llm = get_technical_llm()
         self.tools = all_stock_tools
-        # 工具名→工具对象映射，供直接调用
         self._tool_map = {tool.name: tool for tool in self.tools}
 
-    def _build_system_prompt(self) -> str:
+    def _build_single_prompt(self) -> str:
         return """
-你是一个专业的股票技术分析师，擅长分析股票的均线、MACD等技术指标和K线数据。
-
-请基于下方提供的日线、周线、月线数据，对每类数据分别做分析，然后汇总。
+你是一个专业的股票技术分析师。请基于下方提供的日线、周线、月线数据，进行分析。
 
 【分析要求】
-- 均线的金叉死叉信号（5日/10日/20日交叉）
-- MACD的金叉死叉信号
-- 支撑位和压力位（基于均线位置）
+- 均线的金叉死叉信号（5日/10日/20日/50日/120日/200日交叉）
+- MACD的金叉/死叉/背离信号
+- 支撑位和压力位（基于均线和近期高低点）
 - K线趋势方向和强度
 - 成交量变化及异常
 - 多周期共振分析（日/周/月是否一致）
-- 给出综合评分和操作建议
 
 【输出格式】
 ## 日线分析
-（具体分析...）
-
 ## 周线分析
-（具体分析...）
-
 ## 月线分析
-（具体分析...）
-
 ## 多周期综合研判
-（日/周/月周期是否共振，趋势是否一致...）
-
-## 投资建议与风险提示
-（操作建议、支撑/压力位、止损参考...）
+## 技术面总结与操作建议
 """
 
+    def _build_chain_prompt(self) -> str:
+        return """你是一个专业的股票技术分析师。你的任务是：对比分析多只股票的技术面，选出技术走势最强的 1 只。
+
+请基于下方提供的每只股票的日线/周线/月线数据，逐只分析并对比如下维度：
+
+【逐只分析】
+对每只股票：
+- 均线排列形态（多头/空头/缠绕，5/10/20/50/120/200日）：0-4分
+- MACD信号（金叉/死叉/背离/DIF-DEA位置）：0-3分
+- 量价配合（放量涨/缩量跌/异常放量）：0-2分
+- 支撑位与压力位：0-1分
+- 技术面总分（满分10分），附一句话判断
+
+【技术面对比排名】
+用表格按技术面总分降序：排名 | 股票代码 | 均线 | MACD | 量价 | 支撑压力 | 总分
+
+【🏆 技术面最强】
+- 股票代码
+- 核心理由（技术面角度，至少2条）
+- 风险提示（1条）"""
+
     def _call_tool(self, tool_name: str, stock_code: str) -> str:
-        """直接调用工具获取数据，只调一次"""
         tool = self._tool_map.get(tool_name)
         if tool is None:
             return f"工具 {tool_name} 不存在"
@@ -69,71 +75,101 @@ class TechnicalAgent:
             logger.error(f"工具 {tool_name}({stock_code}) 执行失败: {e}")
             return f"获取失败: {e}"
 
+    def _fetch_kline(self, code: str) -> str:
+        """拉取单只股票的日线/周线/月线，拼成文本"""
+        parts = []
+        for tool_name, label in [
+            ("stock_daily_fetcher", "日线"),
+            ("stock_weekly_fetcher", "周线"),
+            ("stock_monthly_fetcher", "月线"),
+        ]:
+            logger.info(f"  {code} 获取{label}数据...")
+            data = self._call_tool(tool_name, code)
+            parts.append(f"=== {label} ===\n{data[:2000]}")
+        return "\n\n".join(parts)
+
     def analyze_node(self, state: AgentState) -> Dict[str, Any]:
-        """
-        分析节点：直接调用工具获取数据，交给LLM一次性分析
-        """
         try:
             stock_code = state.get("stock_code", "")
             question = state.get("question", "")
-            logger.info(f"开始技术分析，股票: {stock_code}，问题: {question[:50]}...")
 
-            # 并行（实际是顺序）调用三个工具，每个只调一次
-            logger.info("获取日线数据...")
-            daily_data = self._call_tool("stock_daily_fetcher", stock_code)
+            # 判断是单股还是多股（产业链）场景
+            codes = [c.strip() for c in stock_code.split(",") if c.strip()] if stock_code else []
 
-            logger.info("获取周线数据...")
-            weekly_data = self._call_tool("stock_weekly_fetcher", stock_code)
-
-            logger.info("获取月线数据...")
-            monthly_data = self._call_tool("stock_monthly_fetcher", stock_code)
-
-            # 构建分析提示，直接嵌入所有数据
-            system_prompt = self._build_system_prompt()
-            user_message = f"""请分析股票 {stock_code} 的技术指标。
-
-【用户问题】
-{question}
-
-========== 日线数据 ==========
-{daily_data}
-
-========== 周线数据 ==========
-{weekly_data}
-
-========== 月线数据 ==========
-{monthly_data}
-
-请分别分析日线、周线、月线，然后综合研判，给出专业意见。"""
-
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_message),
-            ]
-
-            logger.info("调用LLM进行技术分析...")
-            response = self.llm.invoke(messages)
-            logger.info(f"技术分析完成，响应长度: {len(str(response.content))}")
-
-            return {
-                "messages": [response],
-                "current_node": self.name,
-                "technical_result": {"summary": response.content},
-                "intermediate_steps": state.get("intermediate_steps", []) + [
-                    ("technical_analyze", {"stock_code": stock_code, "content": str(response.content)[:200]})
-                ],
-            }
+            if len(codes) > 1:
+                return self._analyze_chain(state, codes)
+            else:
+                return self._analyze_single(state, codes[0] if codes else "")
 
         except Exception as e:
             logger.error(f"技术分析节点执行失败: {e}")
             return {
                 "messages": [],
                 "error": f"技术分析执行失败: {e}",
-                "intermediate_steps": state.get("intermediate_steps", []) + [("technical_analyze", {"error": str(e)})],
+                "intermediate_steps": [("technical_analyze", {"error": str(e)})],
             }
 
-    def invoke(self, state: AgentState) -> Dict[str, Any]:
-        return self.analyze_node(state)
+    def _analyze_single(self, state: AgentState, code: str) -> Dict[str, Any]:
+        """单股技术分析"""
+        question = state.get("question", "")
+        logger.info(f"技术分析（单股模式），股票: {code}")
+
+        kline_text = self._fetch_kline(code)
+
+        messages = [
+            SystemMessage(content=self._build_single_prompt()),
+            HumanMessage(content=f"""请分析股票 {code} 的技术指标。
+
+【用户问题】{question}
+
+========== K线数据 ==========
+{kline_text}
+
+请按日线→周线→月线→综合研判顺序分析。"""),
+        ]
+
+        response = self.llm.invoke(messages)
+        summary = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"技术分析完成，长度: {len(summary)}")
+
+        return {
+            "messages": [response],
+            "current_node": self.name,
+            "technical_result": {"summary": summary, "mode": "single", "code": code},
+            "intermediate_steps": [("technical_analyze", {"mode": "single", "code": code})],
+        }
+
+    def _analyze_chain(self, state: AgentState, codes: List[str]) -> Dict[str, Any]:
+        """产业链多股技术面对比分析"""
+        question = state.get("question", "")
+        logger.info(f"技术分析（产业链模式），共 {len(codes)} 只: {codes}")
+
+        # 逐只拉 K 线
+        all_kline = ""
+        for code in codes:
+            all_kline += f"\n{'#'*60}\n### 股票 {code}\n{self._fetch_kline(code)}\n"
+
+        messages = [
+            SystemMessage(content=self._build_chain_prompt()),
+            HumanMessage(content=f"""请对比分析以下 {len(codes)} 只股票的技术面。
+
+【用户问题】{question}
+
+{all_kline[:25000]}
+
+请逐只打分 → 排名 → 选出技术面最强的1只。"""),
+        ]
+
+        response = self.llm.invoke(messages)
+        summary = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"产业链技术面对比完成，长度: {len(summary)}")
+
+        return {
+            "messages": [response],
+            "current_node": self.name,
+            "technical_result": {"summary": summary, "mode": "chain", "codes": codes},
+            "intermediate_steps": [("technical_analyze", {"mode": "chain", "count": len(codes)})],
+        }
 
 
 def create_technical_node():

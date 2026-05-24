@@ -27,6 +27,7 @@ class RouterAgent:
         (["计算", "比率", "ROE", "ROA", "毛利率", "净利率", "估值", "杜邦"], IntentType.FINANCIAL_ANALYSIS, "analyst"),
         (["股价", "新闻", "最新", "实时", "今天", "公告"], IntentType.REAL_TIME_INFO, "researcher"),
         (["均线", "MACD", "技术", "金叉", "死叉", "趋势"], IntentType.TECHNICAL_ANALYSIS, "technical"),
+        (["行业", "产业", "产业链", "龙头", "龙一", "龙二", "景气", "赛道", "上游", "中游", "下游", "细分"], IntentType.INDUSTRY_ANALYSIS, ["researcher", "technical", "compliance"]),
         (["你好", "谢谢", "再见", "帮助"], IntentType.GENERAL_CHAT, None),
     ]
 
@@ -60,6 +61,7 @@ class RouterAgent:
         intent = route_result.get("intent", IntentType.UNKNOWN)
         next_agents = route_result.get("next_agents", [])
         stock_code = route_result.get("stock_code", "")
+        industry_name = route_result.get("industry_name", state.get("industry_name", ""))
 
         # 兼容旧格式
         if not next_agents and route_result.get("next_agent"):
@@ -84,10 +86,11 @@ class RouterAgent:
         rue =  {
             "intent": intent,
             "stock_code": stock_code,
+            "industry_name": industry_name,
             "next_agents": next_agents,
             "next_nodes": next_nodes,
             "confidence": confidence,
-            "intermediate_steps": [("router", {"intent": intent, "next_agents": next_agents, "next_nodes": next_nodes, "reasoning": reasoning})],
+            "intermediate_steps": [("router", {"intent": intent, "stock_code": stock_code, "industry_name": industry_name, "next_agents": next_agents, "next_nodes": next_nodes, "reasoning": reasoning})],
         }
         logger.info(f"状态更新: {rue}")
         return rue
@@ -126,6 +129,10 @@ class RouterAgent:
         """基于规则的兜底路由"""
         question_lower = question.lower()
         
+        # 检查行业/产业链分析
+        industry_keywords = ["行业", "产业", "产业链", "龙头", "龙一", "龙二", "景气", "赛道"]
+        is_industry = any(kw in question_lower for kw in industry_keywords)
+
         # 检查是否是股票分析相关问题
         stock_keywords = ["股票", "分析", "走势", "财务", "均线", "MACD", "K线"]
         is_stock_analysis = any(kw in question_lower for kw in stock_keywords)
@@ -134,6 +141,16 @@ class RouterAgent:
         has_financial = any(kw in question_lower for kw in ["财务", "比率", "ROE", "ROA", "毛利率", "净利率", "估值", "杜邦"])
         has_technical = any(kw in question_lower for kw in ["均线", "MACD", "K线", "走势", "金叉", "死叉"])
         has_realtime = any(kw in question_lower for kw in ["股价", "新闻", "最新", "实时", "今天", "公告"])
+
+        # 行业/产业链分析：researcher 搜公司 → technical 技术面分析 → compliance 合规
+        if is_industry and not is_stock_analysis:
+            return {
+                "intent": IntentType.INDUSTRY_ANALYSIS,
+                "industry_name": question,
+                "next_agents": ["researcher", "technical", "compliance"],
+                "confidence": 0.8,
+                "reasoning": "行业/产业链分析问题，路由至 researcher → technical → compliance",
+            }
         
         # 处理复杂的股票分析问题
         if is_stock_analysis:
@@ -158,11 +175,18 @@ class RouterAgent:
         # 处理其他简单问题
         for keywords, intent, agent in self.FALLBACK_RULES:
             if any(kw in question_lower for kw in keywords):
-                # 转换AgentName枚举值为字符串
-                agent_str = agent.value if hasattr(agent, 'value') else agent
+                # agent 可能是字符串或列表
+                if isinstance(agent, list):
+                    next_agents = agent
+                elif agent is None:
+                    next_agents = []
+                elif hasattr(agent, 'value'):
+                    next_agents = [agent.value]
+                else:
+                    next_agents = [agent]
                 return {
                     "intent": intent,
-                    "next_agents": [agent_str] if agent_str else [],
+                    "next_agents": next_agents,
                     "confidence": 0.7,
                     "reasoning": f"规则匹配关键词: {keywords}"
                 }

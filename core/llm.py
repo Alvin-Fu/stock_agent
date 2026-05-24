@@ -15,7 +15,7 @@ from langchain_deepseek import ChatDeepSeek
 LLM_CACHE_ENABLED = True
 
 DeepseekFlashModule = "deepseek-v4-flash"
-DeepseekProModule = "deepseek-v4-pro"
+DeepseekProModule = "deepseek-v4-flash"
 
 class LLMFactory:
     """LLM 工厂类，负责创建并缓存语言模型实例"""

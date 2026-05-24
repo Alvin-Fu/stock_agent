@@ -16,6 +16,8 @@ if __name__ == "__main__":
     agent_registry = AgentRegistry()
     agents = agent_registry.get_all_agents(kb_registry)
     brain_agent = agents["router_brain"]  # 🔥 直接使用大脑
+    # 设置agents引用到brain_agent，让它能够调用其他agent
+    brain_agent.set_agents(agents)
     logger.info("✅ 智能Agent加载完成")
 
     # ===================== 最终交互 =====================

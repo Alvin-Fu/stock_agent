@@ -18,6 +18,8 @@ class AgentState(TypedDict):
     字段说明：
         - messages: 对话消息历史（自动合并）
         - stock_code: 股票代码
+        - industry_name: 行业名称（行业/产业链分析时使用）
+        - chain_leaders: 行业龙头股列表 [{code, name, rank}]（龙一龙二）
         - question: 当前用户问题
         - intent: 识别出的意图类型
         - documents: 检索到的文档列表
@@ -25,6 +27,7 @@ class AgentState(TypedDict):
         - analysis_result: 分析 Agent 的输出结果
         - research_result: 研究 Agent 的输出结果
         - compliance_result: 合规 Agent 的输出结果
+        - technical_result: 技术分析 Agent 的输出结果
         - final_answer: 最终生成的回答
         - intermediate_steps: 中间步骤记录（用于调试）
         - next_agent: 下一步应调用的 Agent 名称
@@ -32,6 +35,8 @@ class AgentState(TypedDict):
     """
     messages: Annotated[List[BaseMessage], add_messages]
     stock_code: str
+    industry_name: Optional[str]
+    chain_leaders: Optional[Dict[str, Any]]
     question: str
     intent: Optional[str]
     documents: List[Any]  # Document 对象列表

@@ -3044,6 +3044,53 @@ class DatabaseManager:
         else:
             return "震荡整理 ↔️"  # 趋势不明，观望为主
 
+    def get_stocks_by_industry(self, industry: str) -> List[Dict[str, Any]]:
+        """获取指定行业的所有上市股票，按代码排序"""
+        with self.get_session() as session:
+            stmt = (
+                select(StockBasic)
+                .where(
+                    StockBasic.industry == industry,
+                    StockBasic.list_status == 'L',
+                )
+                .order_by(StockBasic.code)
+            )
+            stocks = session.execute(stmt).scalars().all()
+            return [s.to_dict() for s in stocks]
+
+    def get_top_stocks_by_industry(self, industry: str, top_n: int = 2) -> List[Dict[str, Any]]:
+        """
+        获取行业内市值排名前N的股票（近似龙一龙二）
+        通过最新日线数据的总市值排名，fallback 到代码排序
+        """
+        stocks = self.get_stocks_by_industry(industry)
+        if not stocks:
+            return []
+
+        codes = [s['code'] for s in stocks]
+
+        # 尝试用最新日线 basic 数据里的总市值排名
+        code_mv = {}
+        with self.get_session() as session:
+            from sqlalchemy import func
+            for code in codes:
+                row = session.execute(
+                    select(StockDailyBasic.total_mv)
+                    .where(StockDailyBasic.code == code)
+                    .order_by(desc(StockDailyBasic.trade_date))
+                    .limit(1)
+                ).scalar_one_or_none()
+                code_mv[code] = row or 0
+
+        # 按市值降序，取 top_n
+        stocks.sort(key=lambda s: code_mv.get(s['code'], 0), reverse=True)
+        top = stocks[:top_n]
+
+        # 补上名称，方便下游用
+        for s in top:
+            s['rank'] = top.index(s) + 1
+
+        return top
 
 
 # ===== 便捷函数 (Convenience Function) ====================================

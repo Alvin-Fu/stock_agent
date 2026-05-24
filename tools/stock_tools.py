@@ -43,6 +43,12 @@ class StockTools:
         today = date.today()
         old_daily_data = self.db.get_all_daily_data(stock_code)
         start_date = self.get_daily_start_date(stock_code, old_daily_data)
+        
+        # 检查 start_date 是否为 None
+        if start_date is None:
+            logger.error(f"无法获取股票[{stock_code}]的起始日期")
+            return old_daily_data
+        
         end_date_str = today.strftime("%Y-%m-%d")
         start_date_str = start_date.strftime("%Y-%m-%d")
         logger.info(f"股票[{stock_code}]数据开始更新, start date{start_date_str}, end date{end_date_str}")
@@ -70,6 +76,12 @@ class StockTools:
             return None
         old_monthly_data = self.db.get_all_month_data(stock_code)
         start_date = self.get_monthly_start_date(stock_code, old_monthly_data)
+        
+        # 检查 start_date 是否为 None
+        if start_date is None:
+            logger.error(f"无法获取股票[{stock_code}]的起始日期")
+            return old_monthly_data
+        
         end_date_str = date.today().strftime("%Y-%m-%d")
         start_date_str = start_date.strftime("%Y-%m-%d")
         if end_date_str == start_date_str:
@@ -97,6 +109,12 @@ class StockTools:
         today = date.today()
         old_weekly_data = self.db.get_all_weekly_data(stock_code)
         start_date = self.get_weekly_start_date(stock_code, old_weekly_data)
+        
+        # 检查 start_date 是否为 None
+        if start_date is None:
+            logger.error(f"无法获取股票[{stock_code}]的起始日期")
+            return old_weekly_data
+        
         end_date_str = today.strftime("%Y-%m-%d")
         start_date_str = start_date.strftime("%Y-%m-%d")
         if end_date_str == start_date_str:

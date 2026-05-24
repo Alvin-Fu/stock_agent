@@ -10,6 +10,7 @@ class IntentType:
     REAL_TIME_INFO = "real_time_info"  # 需要联网查询实时信息
     COMPLIANCE_CHECK = "compliance_check"  # 合规性审查
     TECHNICAL_ANALYSIS = "technical_analysis"  # 技术分析（均线、MACD等）
+    INDUSTRY_ANALYSIS = "industry_analysis"  # 行业分析（产业、产业链、龙头）
     GENERAL_CHAT = "general_chat"  # 闲聊/问候
     UNKNOWN = "unknown"  # 无法识别
 

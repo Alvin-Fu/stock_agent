@@ -17,6 +17,62 @@ from .vector_store import (
     create_remote_chroma
 )
 
+# --------------------- 5. 导出新增的核心模块 ---------------------
+from .state_manager import (
+    state_validator,
+    StateValidator,
+    StateTransitionManager,
+    StateCache,
+    AgentStatus,
+    AgentExecutionRecord
+)
+
+from .agent_coordination import (
+    AgentMessage,
+    MessageType,
+    Priority,
+    MessageBus,
+    ParallelExecutor,
+    AgentResultAggregator,
+    message_bus,
+    parallel_executor,
+    result_aggregator
+)
+
+from .business_analyzer import (
+    valuation_analyzer,
+    risk_analyzer,
+    time_series_analyzer,
+    ValuationAnalyzer,
+    RiskAnalyzer,
+    TimeSeriesAnalyzer,
+    ValuationMetrics,
+    ValuationLevel,
+    RiskLevel
+)
+
+from .data_processor import (
+    data_validator,
+    data_cleaner,
+    data_comparator,
+    DataValidator,
+    DataCleaner,
+    DataComparator,
+    DataQuality,
+    ValidationResult
+)
+
+from .plugin_system import (
+    plugin_registry,
+    config_manager,
+    agent_factory,
+    ab_test_manager,
+    PluginRegistry,
+    ConfigManager,
+    PluginType,
+    PluginMetadata
+)
+
 # --------------------- 定义对外公共接口（规范导入）---------------------
 __all__ = [
     # 基类
@@ -29,5 +85,50 @@ __all__ = [
     "create_remote_chroma",
     # 大模型
     "get_llm",
-    "get_ds"
+    "get_ds",
+    # 状态管理
+    "state_validator",
+    "StateValidator",
+    "StateTransitionManager",
+    "StateCache",
+    "AgentStatus",
+    "AgentExecutionRecord",
+    # Agent协作
+    "AgentMessage",
+    "MessageType",
+    "Priority",
+    "MessageBus",
+    "ParallelExecutor",
+    "AgentResultAggregator",
+    "message_bus",
+    "parallel_executor",
+    "result_aggregator",
+    # 业务分析
+    "valuation_analyzer",
+    "risk_analyzer",
+    "time_series_analyzer",
+    "ValuationAnalyzer",
+    "RiskAnalyzer",
+    "TimeSeriesAnalyzer",
+    "ValuationMetrics",
+    "ValuationLevel",
+    "RiskLevel",
+    # 数据处理
+    "data_validator",
+    "data_cleaner",
+    "data_comparator",
+    "DataValidator",
+    "DataCleaner",
+    "DataComparator",
+    "DataQuality",
+    "ValidationResult",
+    # 插件系统
+    "plugin_registry",
+    "config_manager",
+    "agent_factory",
+    "ab_test_manager",
+    "PluginRegistry",
+    "ConfigManager",
+    "PluginType",
+    "PluginMetadata"
 ]

@@ -25,6 +25,9 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 from .common import _is_hk_code, _is_etf_code
+from .cache_manager import cache_manager, incremental_updater
+from .data_quality import data_validator, data_cleaner, version_manager, DataQualityLevel
+from .monitor import monitor, performance_logger
 
 import pandas as pd
 import numpy as np
@@ -105,22 +108,27 @@ class BaseFetcher(ABC):
             df_db: Optional[pd.DataFrame] = None,
             start_date: Optional[str] = None,
             end_date: Optional[str] = None,
-            days: int = 30
+            days: int = 30,
+            use_cache: bool = True
     ) -> pd.DataFrame:
         """
         获取日线数据（统一入口）
 
         流程：
-        1. 计算日期范围
-        2. 调用子类获取原始数据
-        3. 标准化列名
-        4. 计算技术指标
+        1. 检查缓存（可选）
+        2. 检查是否需要更新
+        3. 调用子类获取原始数据
+        4. 数据质量检查
+        5. 标准化列名
+        6. 计算技术指标
+        7. 更新缓存
 
         Args:
             stock_code: 股票代码
             start_date: 开始日期（可选）
             end_date: 结束日期（可选，默认今天）
             days: 获取天数（当 start_date 未指定时使用）
+            use_cache: 是否使用缓存
 
         Returns:
             标准化的 DataFrame，包含技术指标
@@ -136,12 +144,44 @@ class BaseFetcher(ABC):
 
         logger.info(f"[{self.name}] 获取 {stock_code} 数据: {start_date} ~ {end_date}")
 
+        # 记录开始时间（性能监控）
+        perf_start = performance_logger.start_timer(f"get_daily_data_{stock_code}")
+
         try:
+            # Step 0: 检查缓存
+            if use_cache:
+                cached_data = cache_manager.get(
+                    stock_code=stock_code,
+                    data_type='daily',
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                if cached_data is not None:
+                    logger.info(f"[{self.name}] 从缓存获取 {stock_code}")
+                    performance_logger.end_timer(f"get_daily_data_{stock_code}", perf_start)
+                    return cached_data
+
+            # Step 0.5: 检查是否需要更新
+            needs_update, reason = incremental_updater.needs_update(stock_code, 'daily')
+            if not needs_update:
+                logger.info(f"[{self.name}] {stock_code} {reason}")
+                # 如果不需要更新但缓存也没有，继续获取
+                pass
+
             # Step 1: 获取原始数据
             raw_df = self._fetch_raw_data("daily", stock_code, start_date, end_date)
 
             if raw_df is None or raw_df.empty:
                 logger.error(f"[{self.name}] 未获取到 {stock_code} 的数据")
+                # 记录失败（监控）
+                monitor.record_request(
+                    source_name=self.name,
+                    stock_code=stock_code,
+                    success=False,
+                    response_time=time.time() - perf_start,
+                    data_type='daily',
+                    error_message="未获取到数据"
+                )
                 raise DataFetchError(f"[{self.name}] 未获取到 {stock_code} 的数据")
 
             # Step 2: 标准化列名
@@ -149,17 +189,68 @@ class BaseFetcher(ABC):
 
             df = merge_and_clean_data("date", df_db, df)
 
-            # Step 3: 数据清洗
-            df = self._clean_data(df)
+            # Step 3: 数据质量检查
+            is_valid, errors = data_validator.validate_kline_data(df)
+            if not is_valid:
+                logger.warning(f"[{self.name}] {stock_code} 数据质量问题: {errors}")
 
-            # Step 4: 计算技术指标
+            # Step 4: 数据清洗（增强版）
+            df = data_cleaner.fill_missing_values(df)
+            df = data_cleaner.remove_outliers(df)
+            df = data_cleaner.standardize_data(df)
+
+            # Step 5: 计算技术指标
             df = self._calculate_indicators(df)
 
-            logger.info(f"[{self.name}] {stock_code} 获取成功，共 {len(df)} 条数据")
+            # Step 6: 更新缓存
+            if use_cache:
+                cache_manager.set(
+                    stock_code=stock_code,
+                    data_type='daily',
+                    data=df,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+
+            # Step 7: 记录更新
+            incremental_updater.record_update(stock_code, 'daily')
+
+            # Step 8: 记录数据质量和版本
+            quality_level = data_validator.calculate_quality_score(df, 'kline')
+            version_manager.record_version(
+                stock_code=stock_code,
+                data_type='daily',
+                source_name=self.name,
+                record_count=len(df),
+                quality_level=quality_level
+            )
+
+            # Step 9: 记录成功（监控）
+            monitor.record_request(
+                source_name=self.name,
+                stock_code=stock_code,
+                success=True,
+                response_time=time.time() - perf_start,
+                data_type='daily'
+            )
+
+            logger.info(f"[{self.name}] {stock_code} 获取成功，共 {len(df)} 条数据，质量: {quality_level.value}")
+
+            performance_logger.end_timer(f"get_daily_data_{stock_code}", perf_start)
             return df
 
         except Exception as e:
+            # 记录失败（监控）
+            monitor.record_request(
+                source_name=self.name,
+                stock_code=stock_code,
+                success=False,
+                response_time=time.time() - perf_start,
+                data_type='daily',
+                error_message=str(e)
+            )
             logger.error(f"[{self.name}] 获取 {stock_code} 失败: {str(e)} {traceback.format_exc()}")
+            performance_logger.end_timer(f"get_daily_data_{stock_code}", perf_start)
             raise DataFetchError(f"[{self.name}] {stock_code}: {str(e)} ") from e
 
 
@@ -170,10 +261,20 @@ class BaseFetcher(ABC):
             df_db: Optional[pd.DataFrame] = None,
             start_date: Optional[str] = None,
             end_date: Optional[str] = None,
-            days: int = 30
+            days: int = 30,
+            use_cache: bool = True
     ) -> pd.DataFrame:
         """
         获取周线或月线数据（统一入口）
+
+        Args:
+            freq: 数据频率 ('week', 'month')
+            stock_code: 股票代码
+            df_db: 数据库已有数据（用于增量更新）
+            start_date: 开始日期
+            end_date: 结束日期
+            days: 获取天数
+            use_cache: 是否使用缓存
         """
         # 计算日期范围
         if end_date is None:
@@ -184,14 +285,39 @@ class BaseFetcher(ABC):
             start_date = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=days * 2)
             logger.info(f"start data{start_date}")
 
-        logger.info(f"[{self.name}] 获取 {stock_code} 数据: {start_date} ~ {end_date}")
+        logger.info(f"[{self.name}] 获取 {stock_code} {freq}数据: {start_date} ~ {end_date}")
+
+        # 记录开始时间（性能监控）
+        perf_start = performance_logger.start_timer(f"get_{freq}_data_{stock_code}")
 
         try:
+            # Step 0: 检查缓存
+            if use_cache:
+                cached_data = cache_manager.get(
+                    stock_code=stock_code,
+                    data_type=freq,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+                if cached_data is not None:
+                    logger.info(f"[{self.name}] 从缓存获取 {stock_code} {freq}数据")
+                    performance_logger.end_timer(f"get_{freq}_data_{stock_code}", perf_start)
+                    return cached_data
+
             # Step 1: 获取原始数据
             raw_df = self._fetch_raw_data(freq, stock_code, start_date, end_date)
 
             if raw_df is None or raw_df.empty:
                 logger.error(f"[{self.name}] 未获取到 {stock_code} 的数据")
+                # 记录失败（监控）
+                monitor.record_request(
+                    source_name=self.name,
+                    stock_code=stock_code,
+                    success=False,
+                    response_time=time.time() - perf_start,
+                    data_type=freq,
+                    error_message="未获取到数据"
+                )
                 raise DataFetchError(f"[{self.name}] 未获取到 {stock_code} 的数据")
 
             # Step 2: 标准化列名
@@ -199,17 +325,68 @@ class BaseFetcher(ABC):
 
             df = merge_and_clean_data("date", df_db, df)
 
-            # Step 3: 数据清洗
-            df = self._clean_data(df)
+            # Step 3: 数据质量检查
+            is_valid, errors = data_validator.validate_kline_data(df)
+            if not is_valid:
+                logger.warning(f"[{self.name}] {stock_code} 数据质量问题: {errors}")
 
-            # Step 4: 计算技术指标
+            # Step 4: 数据清洗（增强版）
+            df = data_cleaner.fill_missing_values(df)
+            df = data_cleaner.remove_outliers(df)
+            df = data_cleaner.standardize_data(df)
+
+            # Step 5: 计算技术指标
             df = self._calculate_indicators(df)
 
-            logger.info(f"[{self.name}] {stock_code} 获取成功，共 {len(df)} 条数据")
+            # Step 6: 更新缓存
+            if use_cache:
+                cache_manager.set(
+                    stock_code=stock_code,
+                    data_type=freq,
+                    data=df,
+                    start_date=start_date,
+                    end_date=end_date
+                )
+
+            # Step 7: 记录更新
+            incremental_updater.record_update(stock_code, freq)
+
+            # Step 8: 记录数据质量和版本
+            quality_level = data_validator.calculate_quality_score(df, 'kline')
+            version_manager.record_version(
+                stock_code=stock_code,
+                data_type=freq,
+                source_name=self.name,
+                record_count=len(df),
+                quality_level=quality_level
+            )
+
+            # Step 9: 记录成功（监控）
+            monitor.record_request(
+                source_name=self.name,
+                stock_code=stock_code,
+                success=True,
+                response_time=time.time() - perf_start,
+                data_type=freq
+            )
+
+            logger.info(f"[{self.name}] {stock_code} {freq}数据获取成功，共 {len(df)} 条数据，质量: {quality_level.value}")
+
+            performance_logger.end_timer(f"get_{freq}_data_{stock_code}", perf_start)
             return df
 
         except Exception as e:
+            # 记录失败（监控）
+            monitor.record_request(
+                source_name=self.name,
+                stock_code=stock_code,
+                success=False,
+                response_time=time.time() - perf_start,
+                data_type=freq,
+                error_message=str(e)
+            )
             logger.error(f"[{self.name}] 获取 {stock_code} 失败: {str(e)} {traceback.format_exc()}")
+            performance_logger.end_timer(f"get_{freq}_data_{stock_code}", perf_start)
             raise DataFetchError(f"[{self.name}] {stock_code}: {str(e)} ") from e
 
 

@@ -1,6 +1,5 @@
 from utils.config import get_all_agent_config
 
-from .qa_agent.service import QAAgent
 from .router.service import RouterBrainAgent
 from .retriever.retriever_agent import RetrieverAgent
 from .financial_analyst.analyst import AnalystAgent
@@ -23,7 +22,7 @@ class AgentRegistry:
     def _init_all(knowledge_registry):
         # 注册大脑
         AgentRegistry._instances["router_brain"] = RouterBrainAgent(
-            AGENT_CONFIG["router"],
+            AGENT_CONFIG.get("router_agent", {}),
             knowledge_registry
         )
         AgentRegistry._instances["technical"] = TechnicalAgent()

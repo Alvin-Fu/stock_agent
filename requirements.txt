@@ -2,6 +2,8 @@
 langchain
 langchain-core
 langgraph
+langchain-openai
+langchain-ollama
 
 # 数据库
 sqlalchemy
@@ -11,9 +13,13 @@ pandas
 schedule
 requests
 python-dateutil
+tenacity
 
-# 模型
-transformers
+# 数据源
+akshare
+tushare
 
 # 其他
 pyyaml
+Pillow
+numpy

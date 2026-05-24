@@ -52,68 +52,102 @@ class ScheduledAnalyzer:
     def analyze_stock(self, stock_code: str):
         """
         分析单个股票
-        
+
         Args:
             stock_code: 股票代码
         """
         try:
             logger.info(f"开始分析股票: {stock_code}")
-            
+
             # 1. 获取K线数据
             logger.info(f"获取股票 {stock_code} 的K线数据")
             stock_tool_instance.fetch_and_save_stock_daily_data(stock_code)
             stock_tool_instance.fetch_and_save_stock_weekly_data(stock_code)
             stock_tool_instance.fetch_and_save_stock_monthly_data(stock_code)
-            
+
             # 2. 获取研报数据
             logger.info(f"获取股票 {stock_code} 的研报数据")
             stock_tool_instance.fetch_and_save_stock_research_report(stock_code)
-            
+
             # 3. 进行综合分析（使用多Agent协作图）
             logger.info(f"分析股票 {stock_code} 的财务数据和走势")
-            state = AgentState(
-                messages=[],
-                question=f"分析{stock_code}的财务状况、投资价值和股票走势",
-                intent=IntentType.FINANCIAL_ANALYSIS,
-                documents=[],
-                financial_data=None,
-                analysis_result=None,
-                research_result=None,
-                compliance_result=None,
-                final_answer=None,
-                intermediate_steps=[],
-                next_agent=None,
-                error=None
-            )
+            state: Dict[str, Any] = {
+                "question": f"分析{stock_code}的财务状况、投资价值和股票走势",
+                "stock_code": stock_code,
+                "industry_name": "",
+                "chain_leaders": [],
+                "intent": "",
+                "documents": [],
+                "financial_data": None,
+                "analysis_result": None,
+                "research_result": None,
+                "compliance_result": None,
+                "technical_result": None,
+                "final_answer": None,
+                "intermediate_steps": [],
+                "next_agent": None,
+                "error": None,
+                "messages": [],
+            }
             result = self.graph.invoke(state)
-            
+
             logger.info(f"股票 {stock_code} 分析完成")
         except Exception as e:
             logger.error(f"分析股票 {stock_code} 失败: {e}")
     
     def analyze_industry(self, industry: str):
         """
-        分析特定行业的所有股票
-        
+        分析特定行业的所有股票（逐个分析）
+
         Args:
             industry: 行业名称
         """
         logger.info(f"开始分析行业: {industry}")
         stocks = self.get_stocks_by_industry(industry)
-        
+
         if not stocks:
             logger.warning(f"行业 {industry} 没有找到股票")
             return
-        
+
         logger.info(f"行业 {industry} 共有 {len(stocks)} 只股票")
-        
+
         for stock in stocks:
             stock_code = stock.get('code')
             stock_name = stock.get('name')
             logger.info(f"开始分析股票: {stock_code} - {stock_name}")
             self.analyze_stock(stock_code)
-        
+
         logger.info(f"行业 {industry} 分析完成")
+
+    def analyze_industry_with_leaders(self, industry: str):
+        """
+        产业链选股分析：上游/中游/下游 → 公司筛选 → 技术面对比 → 选出最值得投资的股票
+
+        Args:
+            industry: 行业名称
+        """
+        logger.info(f"开始产业链选股分析: {industry}")
+        state: Dict[str, Any] = {
+            "question": f"分析{industry}产业链上下游，筛选出所有关键公司，对比技术面和基本面，选出最值得投资的1只股票",
+            "stock_code": "",
+            "industry_name": industry,
+            "chain_leaders": {},
+            "intent": IntentType.INDUSTRY_ANALYSIS,
+            "documents": [],
+            "financial_data": None,
+            "analysis_result": None,
+            "research_result": None,
+            "compliance_result": None,
+            "technical_result": None,
+            "final_answer": None,
+            "intermediate_steps": [],
+            "next_agent": "researcher",
+            "error": None,
+            "messages": [],
+        }
+        result = self.graph.invoke(state)
+        logger.info(f"产业链选股分析完成: {industry}")
+        return result
     
     def schedule_industry_analysis(self, industry: str, time_str: str):
         """
