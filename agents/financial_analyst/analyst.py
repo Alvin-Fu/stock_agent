@@ -1,11 +1,11 @@
 """
 财务分析 Agent
-职责：直接调研报 → 提取数据 → 计算比率 → LLM分析 → 保存到数据库
+职责：拉取真实财务报表(利润表+资产负债表) → 调研报补充 → 计算比率 → LLM分析 → 保存到数据库
 """
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 from langchain_core.messages import SystemMessage, HumanMessage
-from datetime import date, datetime
+from datetime import date
 
 from core.llm import get_analyst_llm
 from agents.base import AgentState
@@ -17,14 +17,17 @@ from .tools import (
     calculate_growth_rates,
     perform_dupont_analysis,
 )
-from tools.stock_tools import call_fetch_stock_research_report
+from tools.stock_tools import (
+    call_fetch_stock_research_report,
+    call_fetch_income_data,
+    call_fetch_balance_sheet_data,
+)
 from utils.logger import logger
 from storage.sqlite.stock_storage import get_db
-import os
 
 
 class AnalystAgent:
-    """财务分析 Agent：一套直通流程，不走工具调用循环"""
+    """财务分析 Agent：基于真实财务报表数据进行分析"""
 
     def __init__(self):
         self.llm = get_analyst_llm()
@@ -46,12 +49,85 @@ class AnalystAgent:
             logger.error(f"调研报失败 {stock_code}: {e}")
             return ""
 
+    def _fetch_real_financial_data(self, stock_code: str) -> Dict[str, Any]:
+        """从数据库/Tushare 拉取真实财务报表数据"""
+        result = {"income": "", "balance_sheet": "", "parsed": {}}
+        try:
+            income_text = call_fetch_income_data(stock_code)
+            if income_text and "未获取到" not in income_text:
+                result["income"] = income_text
+        except Exception as e:
+            logger.error(f"获取利润表失败 {stock_code}: {e}")
+
+        try:
+            balance_text = call_fetch_balance_sheet_data(stock_code)
+            if balance_text and "未获取到" not in balance_text:
+                result["balance_sheet"] = balance_text
+        except Exception as e:
+            logger.error(f"获取资产负债表失败 {stock_code}: {e}")
+
+        result["parsed"] = self._parse_latest_financial_data()
+        return result
+
+    def _parse_latest_financial_data(self) -> Dict[str, Any]:
+        """从数据库读取最新一期财务数据，用于计算比率"""
+        parsed = {}
+        try:
+            stock_code = getattr(self, "_current_stock_code", "")
+            if not stock_code:
+                return parsed
+
+            income_df = self.db.get_stock_income(stock_code)
+            if income_df is not None and not income_df.empty:
+                latest = income_df.iloc[0]
+                parsed["revenue"] = float(latest.get("total_revenue") or 0) / 1e8
+                parsed["net_income"] = float(latest.get("net_profit") or 0) / 1e8
+                parsed["operating_profit"] = float(latest.get("operating_profit") or 0) / 1e8
+                if len(income_df) >= 5:
+                    parsed["revenue_yoy"] = float(latest.get("revenue_growth") or 0)
+                    parsed["profit_yoy"] = float(latest.get("profit_growth") or 0)
+                    parsed["gross_margin"] = float(latest.get("gross_margin") or 0)
+
+            balance_df = self.db.get_stock_balance_sheet(stock_code)
+            if balance_df is not None and not balance_df.empty:
+                latest_b = balance_df.iloc[0]
+                parsed["total_assets"] = float(latest_b.get("total_assets") or 0) / 1e8
+                parsed["total_liabilities"] = float(latest_b.get("total_liabilities") or 0) / 1e8
+                parsed["total_equity"] = float(latest_b.get("total_equity") or 0) / 1e8
+                parsed["current_assets"] = float(latest_b.get("current_assets") or 0) / 1e8
+                parsed["current_liabilities"] = float(latest_b.get("current_liabilities") or 0) / 1e8
+                parsed["debt_ratio"] = float(latest_b.get("asset_liability_ratio") or 0)
+                parsed["current_ratio"] = float(latest_b.get("current_ratio") or 0)
+
+                parsed["inventory"] = 0
+                parsed["cost_of_goods_sold"] = parsed.get("revenue", 0) * (1 - parsed.get("gross_margin", 0) / 100) if parsed.get("revenue") else 0
+                parsed["ebit"] = parsed.get("operating_profit", 0)
+                parsed["interest_expense"] = 0
+                parsed["ebitda"] = parsed.get("operating_profit", 0)
+                parsed["market_cap"] = 0
+
+        except Exception as e:
+            logger.error(f"解析最新财务数据失败: {e}")
+        return parsed
+
     def _call_financial_tools(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """全部财务工具各调一次，返回{工具名: 结果}"""
         results = {}
+        wrapped_data = {"financial_statements": data}
+
         for name, func in self.financial_tools:
             try:
-                results[name] = func.invoke(data)
+                if name == "增长率":
+                    if data.get("revenue") and data.get("revenue_yoy") is not None:
+                        results[name] = {
+                            "营收同比增长率": round(data.get("revenue_yoy", 0), 2),
+                            "净利润同比增长率": round(data.get("profit_yoy", 0), 2),
+                            "毛利率": round(data.get("gross_margin", 0), 2),
+                        }
+                    else:
+                        results[name] = "数据不足"
+                else:
+                    results[name] = func.invoke(wrapped_data)
                 logger.info(f"财务工具 {name} 计算完成")
             except Exception as e:
                 logger.error(f"财务工具 {name} 失败: {e}")
@@ -61,31 +137,39 @@ class AnalystAgent:
     def _build_system_prompt(self) -> str:
         return """你是一位资深财务分析师（CFA），拥有 15 年上市公司财报分析经验。
 
-请基于下方提供的研报原文和已计算的财务比率，进行定性解读。
+请基于下方提供的真实财务报表数据和研报观点，进行专业解读。
 
 【分析原则】
-1. 已计算的比率是定量依据，请在此基础上做解读
-2. 重要数据变化（>10%）需特别标注
-3. 结合研报原文做定性补充
-4. 避免给出投资建议，仅做客观分析
+1. 优先使用真实财务报表数据（利润表/资产负债表），这是定量依据
+2. 研报观点作为定性补充，用于理解市场预期和分析师观点
+3. 重要数据变化（>10%）需特别标注
+4. 财务比率结合行业特征解读（如金融业不适用流动比率）
+5. 避免给出投资建议，仅做客观分析
 
 【输出要求】
-- 先总览，再逐项解读
+- 先总览（最新报告期的核心财务指标）
+- 再逐项解读：盈利能力、偿债能力、成长能力、运营效率
+- 结合研报观点做定性补充
 - 最后给出总结性观点"""
 
     def analyze_node(self, state: AgentState) -> Dict[str, Any]:
         """
-        直通流程：调研报 → 提取数据 → 计算比率 → LLM分析 → 保存DB
+        直通流程：拉取真实财务报表 → 调研报补充 → 计算比率 → LLM分析 → 保存DB
         """
         try:
             stock_code = state.get("stock_code", "")
             question = state.get("question", "")
+            self._current_stock_code = stock_code
             logger.info(f"财务分析开始，股票: {stock_code}，问题: {question[:50]}...")
 
-            # 1. 调研报
-            logger.info("获取研报...")
-            report_text = self._fetch_report(stock_code)
+            logger.info("拉取真实财务报表数据(利润表+资产负债表)...")
+            real_data = self._fetch_real_financial_data(stock_code)
+            financial_data = real_data["parsed"]
+            income_text = real_data["income"]
+            balance_text = real_data["balance_sheet"]
 
+            logger.info("获取研报作为定性补充...")
+            report_text = self._fetch_report(stock_code)
             if not report_text or "未获取到" in report_text:
                 report_text = state.get("documents", [])
                 if report_text:
@@ -93,51 +177,47 @@ class AnalystAgent:
                 else:
                     report_text = "未获取到研报数据"
 
-            # 2. 提取财务数据
-            financial_data = self._extract_financial_data(str(report_text))
-            if not financial_data:
-                logger.warning("未能从研报中提取到财务数据")
-                financial_data = {}
-
-            # 3. 计算所有比率
             calculated = self._call_financial_tools(financial_data)
 
-            # 4. 构建 LLM 提示
             system_prompt = self._build_system_prompt()
             user_message = f"""请分析股票 {stock_code} 的财务状况。
 
 【用户问题】
 {question}
 
-========== 研报数据 ==========
-{str(report_text)[:5000]}
+========== 真实利润表数据 ==========
+{income_text if income_text else '未获取到利润表数据'}
 
-========== 提取的财务数据 ==========
+========== 真实资产负债表数据 ==========
+{balance_text if balance_text else '未获取到资产负债表数据'}
+
+========== 最新一期财务数据(单位：亿元) ==========
 {financial_data}
 
 ========== 计算出的财务比率 ==========
 {calculated}
 
-请基于以上数据给出专业分析意见。"""
+========== 研报观点（定性补充）==========
+{str(report_text)[:3000]}
+
+请基于以上真实财务数据给出专业分析意见。优先使用真实报表数据，研报观点作为补充。"""
 
             messages = [
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_message),
             ]
 
-            # 5. LLM 一次性分析
             logger.info("LLM 财务分析中...")
             response = self.llm.invoke(messages)
             summary = response.content if hasattr(response, 'content') else str(response)
             logger.info(f"财务分析完成，长度: {len(summary)}")
 
-            # 6. 保存到数据库
             self._save_analysis_to_db(state, summary, calculated)
 
             return {
                 "messages": [response],
                 "financial_data": financial_data,
-                "analysis_result": {"summary": summary, "ratios": calculated},
+                "analysis_result": {"summary": summary, "ratios": calculated, "data_source": "real_financial_statements"},
                 "agent_output": {"summary": summary, "ratios": calculated},
                 "current_node": "analyst",
                 "intermediate_steps": state.get("intermediate_steps", []) + [
@@ -174,206 +254,6 @@ class AnalystAgent:
                 logger.info(f"分析结果已保存: {stock_code}")
         except Exception as e:
             logger.error(f"保存分析结果失败: {e}")
-
-    def _extract_financial_data(self, text: str) -> Dict[str, Any]:
-        """
-        从研报或年报文本中提取财务数据
-        
-        Args:
-            text: 研报或年报文本
-            
-        Returns:
-            包含财务数据的字典
-        """
-        import re
-        financial_data = {}
-        
-        # 提取收入
-        revenue_patterns = [
-            r'营业收入[：:]?\s*([\d.,]+)\s*亿元',
-            r'营收[：:]?\s*([\d.,]+)\s*亿元',
-            r'收入[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in revenue_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['revenue'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取净利润
-        net_income_patterns = [
-            r'净利润[：:]?\s*([\d.,]+)\s*亿元',
-            r'归母净利润[：:]?\s*([\d.,]+)\s*亿元',
-            r'净利[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in net_income_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['net_income'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取总资产
-        total_assets_patterns = [
-            r'总资产[：:]?\s*([\d.,]+)\s*亿元',
-            r'资产总额[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in total_assets_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['total_assets'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取总负债
-        total_liabilities_patterns = [
-            r'总负债[：:]?\s*([\d.,]+)\s*亿元',
-            r'负债总额[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in total_liabilities_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['total_liabilities'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取所有者权益
-        total_equity_patterns = [
-            r'所有者权益[：:]?\s*([\d.,]+)\s*亿元',
-            r'股东权益[：:]?\s*([\d.,]+)\s*亿元',
-            r'权益总额[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in total_equity_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['total_equity'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取流动资产
-        current_assets_patterns = [
-            r'流动资产[：:]?\s*([\d.,]+)\s*亿元',
-            r'流动总资产[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in current_assets_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['current_assets'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取流动负债
-        current_liabilities_patterns = [
-            r'流动负债[：:]?\s*([\d.,]+)\s*亿元',
-            r'流动总负债[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in current_liabilities_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['current_liabilities'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取存货
-        inventory_patterns = [
-            r'存货[：:]?\s*([\d.,]+)\s*亿元',
-            r'库存[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in inventory_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['inventory'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取营业成本
-        cogs_patterns = [
-            r'营业成本[：:]?\s*([\d.,]+)\s*亿元',
-            r'成本[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in cogs_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['cost_of_goods_sold'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取EBIT
-        ebit_patterns = [
-            r'EBIT[：:]?\s*([\d.,]+)\s*亿元',
-            r'息税前利润[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in ebit_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['ebit'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取利息费用
-        interest_expense_patterns = [
-            r'利息费用[：:]?\s*([\d.,]+)\s*亿元',
-            r'财务费用[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in interest_expense_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['interest_expense'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取EBITDA
-        ebitda_patterns = [
-            r'EBITDA[：:]?\s*([\d.,]+)\s*亿元',
-            r'息税折旧摊销前利润[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in ebitda_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['ebitda'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        # 提取市值
-        market_cap_patterns = [
-            r'市值[：:]?\s*([\d.,]+)\s*亿元',
-            r'总市值[：:]?\s*([\d.,]+)\s*亿元'
-        ]
-        for pattern in market_cap_patterns:
-            match = re.search(pattern, text)
-            if match:
-                try:
-                    financial_data['market_cap'] = float(match.group(1).replace(',', ''))
-                    break
-                except:
-                    pass
-        
-        return financial_data
 
     def invoke(self, state: AgentState) -> Dict[str, Any]:
         return self.analyze_node(state)

@@ -45,7 +45,7 @@ from utils.logger import logger
 import random
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from .common import extract_last_segment_standard, _is_etf_code, _is_hk_code
 
 import pandas as pd
@@ -902,7 +902,7 @@ class AkshareFetcher(BaseFetcher):
             logger.error(f"[API错误] 获取 {stock_code} 筹码分布失败: {e}")
             return None
 
-    def stock_research_report_em(self, stock_code: str) -> DataFrame | None:
+    def stock_research_report_em(self, stock_code: str) -> Union[DataFrame, None]:
         """
         获取股票研究报告数据
 

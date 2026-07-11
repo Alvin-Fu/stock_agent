@@ -85,7 +85,8 @@ class TechnicalAgent:
         ]:
             logger.info(f"  {code} 获取{label}数据...")
             data = self._call_tool(tool_name, code)
-            parts.append(f"=== {label} ===\n{data[:2000]}")
+            truncated = data[:3000] if len(data) > 3000 else data
+            parts.append(f"=== {label} ===\n{truncated}")
         return "\n\n".join(parts)
 
     def analyze_node(self, state: AgentState) -> Dict[str, Any]:

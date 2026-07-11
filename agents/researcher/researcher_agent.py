@@ -63,9 +63,11 @@ class ResearcherAgent:
 
     def _identify_chain_structure(self, industry: str) -> Dict[str, Any]:
         """第一步：联网搜索+LLM识别产业链上游/中游/下游 + 特精专新企业"""
+        today = date.today()
+        recent_year = today.year
         queries = [
             f"{industry} 产业链 上游 中游 下游 全景图 结构",
-            f"{industry} 细分领域 核心环节 产业链拆解 2025",
+            f"{industry} 细分领域 核心环节 产业链拆解 {recent_year}",
             f"{industry} 专精特新 隐形冠军 小巨人 细分龙头 稀缺标的",
         ]
         results = self._do_search(queries)
@@ -214,8 +216,8 @@ class ResearcherAgent:
         queries = [
             f"{industry} 行业 现状 景气度 市场规模 {recent_period}",
             f"{industry} 产业链 政策 利好 利空 {three_month_range}",
-            f"{industry} 行业 发展趋势 投资机会 2025 2026",
-            f"{industry} 资金流向 主力资金 北向资金 机构持仓 2025",
+            f"{industry} 行业 发展趋势 投资机会 {today.year} {today.year + 1}",
+            f"{industry} 资金流向 主力资金 北向资金 机构持仓 {today.year}",
         ]
 
         for level in ["upstream", "midstream", "downstream", "niche_innovators"]:

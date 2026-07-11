@@ -36,26 +36,28 @@ class ResponderAgent:
 
         logger.info("开始生成最终回答")
 
-        # 构建综合上下文
         context = self._format_context(documents, analysis, research, technical)
 
         system_prompt = """你是一位专业的财经顾问，请根据提供的资料回答用户问题。
 
 【回答要求】
 1. 语言专业、清晰、简洁
-2. 涉及数据的必须注明来源（如文档片段编号）
+2. 涉及数据的必须注明来源（如"根据最新利润表数据"）
 3. 如资料不足，请诚实说明
 4. 根据合规审查结果，必要时添加风险提示
 5. 使用 Markdown 格式提升可读性
+6. 结构化输出：使用标题、列表、表格等
 
 【合规提示】
 {compliance_note}"""
 
         compliance_note = ""
         if compliance and compliance.get("required_disclaimer"):
-            compliance_note = "⚠️ 请在回答末尾添加标准免责声明：*以上内容基于公开信息整理，不构成投资建议。*"
+            compliance_note = "⚠️ 必须在回答末尾添加标准免责声明：*以上内容基于公开信息整理，不构成投资建议。*"
         if compliance and compliance.get("issues"):
-            compliance_note += f"\n注意避免以下问题：{', '.join(compliance['issues'])}"
+            compliance_note += f"\n⚠️ 注意避免以下问题：{', '.join(compliance['issues'])}"
+        if compliance and compliance.get("risk_level") == "high":
+            compliance_note += "\n⚠️ 风险等级较高，请格外谨慎措辞，避免任何投资建议。"
 
         user_message = f"""用户问题：{question}
 
@@ -73,9 +75,11 @@ class ResponderAgent:
         response = self.llm.invoke(messages)
         final_answer = response.content
         logger.info(f"compliance item {compliance}")
-        # 自动追加免责声明（如果合规要求且未包含）
-        #if compliance.get("required_disclaimer") and "不构成投资建议" not in final_answer:
-        #    final_answer += "\n\n---\n*免责声明：以上内容基于公开信息整理，不构成投资建议。*"
+
+        if compliance and compliance.get("required_disclaimer"):
+            disclaimer = "以上内容基于公开信息整理，不构成投资建议。"
+            if disclaimer not in final_answer:
+                final_answer += f"\n\n---\n*{disclaimer}*"
 
         logger.info("回答生成完成")
 
@@ -90,15 +94,19 @@ class ResponderAgent:
             parts.append("【知识库检索结果】")
             for i, doc in enumerate(documents[:5], 1):
                 source = doc.metadata.get("source", "未知来源")
-                parts.append(f"[{i}] 来源：{source}\n{doc.page_content[:500]}...\n")
+                parts.append(f"[{i}] 来源：{source}\n{doc.page_content[:800]}...\n")
         if analysis:
             parts.append(f"【财务分析结果】\n{analysis.get('summary', '')}")
             if analysis.get("ratios"):
                 parts.append(f"关键比率：{analysis['ratios']}")
+            if analysis.get("data_source"):
+                parts.append(f"数据来源：{analysis['data_source']}")
         if research:
-            parts.append(f"【实时信息补充】\n{research.get('summary', '')}")
+            parts.append(f"【实时信息研究】\n{research.get('summary', '')}")
         if technical:
             parts.append(f"【技术分析结果】\n{technical.get('summary', '')}")
+            if technical.get("mode"):
+                parts.append(f"分析模式：{technical['mode']}")
         return "\n\n".join(parts) if parts else "无参考资料"
 
     def invoke(self, state: AgentState) -> AgentState:

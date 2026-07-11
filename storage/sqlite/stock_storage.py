@@ -699,6 +699,112 @@ class StockMoneyFlow(Base):
             'data_source': self.data_source
         }
 
+# === 利润表模型 ===
+class StockIncome(Base):
+    """
+    股票利润表模型 - ORM映射类
+
+    数据库表: stock_income
+    功能：存储公司利润表数据
+
+    字段说明：
+    • 标识字段：code（股票代码）、report_date（报告日期）
+    • 利润数据：total_revenue（营业收入，单位：元）、operating_profit（营业利润，单位：元）、net_profit（净利润，单位：元）
+    • 元数据：data_source（数据来源）、updated_at（更新时间）
+    """
+    __tablename__ = 'stock_income'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    report_date = Column(Date, nullable=False, index=True)
+    total_revenue = Column(Float)  # 营业收入（单位：元）
+    operating_profit = Column(Float)  # 营业利润（单位：元）
+    net_profit = Column(Float)  # 净利润（单位：元）
+    basic_eps = Column(Float)  # 基本每股收益（单位：元）
+    revenue_growth = Column(Float)  # 营业收入同比增长率（单位：%）
+    profit_growth = Column(Float)  # 净利润同比增长率（单位：%）
+    gross_margin = Column(Float)  # 毛利率（单位：%）
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'report_date', name='uix_income_code_date'),
+        Index('ix_income_code_date', 'code', 'report_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockIncome(code={self.code}, report_date={self.report_date}, net_profit={self.net_profit})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'code': self.code,
+            'report_date': self.report_date,
+            'total_revenue': self.total_revenue,
+            'operating_profit': self.operating_profit,
+            'net_profit': self.net_profit,
+            'basic_eps': self.basic_eps,
+            'revenue_growth': self.revenue_growth,
+            'profit_growth': self.profit_growth,
+            'gross_margin': self.gross_margin,
+            'data_source': self.data_source,
+        }
+
+# === 资产负债表模型 ===
+class StockBalanceSheet(Base):
+    """
+    股票资产负债表模型 - ORM映射类
+
+    数据库表: stock_balance_sheet
+    功能：存储公司资产负债表数据
+
+    字段说明：
+    • 标识字段：code（股票代码）、report_date（报告日期）
+    • 资产数据：total_assets（总资产，单位：元）、current_assets（流动资产，单位：元）
+    • 负债数据：total_liabilities（总负债，单位：元）、current_liabilities（流动负债，单位：元）
+    • 权益数据：total_equity（所有者权益，单位：元）
+    • 元数据：data_source（数据来源）、updated_at（更新时间）
+    """
+    __tablename__ = 'stock_balance_sheet'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    report_date = Column(Date, nullable=False, index=True)
+    total_assets = Column(Float)  # 总资产（单位：元）
+    current_assets = Column(Float)  # 流动资产（单位：元）
+    non_current_assets = Column(Float)  # 非流动资产（单位：元）
+    total_liabilities = Column(Float)  # 总负债（单位：元）
+    current_liabilities = Column(Float)  # 流动负债（单位：元）
+    non_current_liabilities = Column(Float)  # 非流动负债（单位：元）
+    total_equity = Column(Float)  # 所有者权益（单位：元）
+    asset_liability_ratio = Column(Float)  # 资产负债率（单位：%）
+    current_ratio = Column(Float)  # 流动比率（倍数）
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'report_date', name='uix_balance_code_date'),
+        Index('ix_balance_code_date', 'code', 'report_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockBalanceSheet(code={self.code}, report_date={self.report_date}, total_assets={self.total_assets})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'code': self.code,
+            'report_date': self.report_date,
+            'total_assets': self.total_assets,
+            'current_assets': self.current_assets,
+            'non_current_assets': self.non_current_assets,
+            'total_liabilities': self.total_liabilities,
+            'current_liabilities': self.current_liabilities,
+            'non_current_liabilities': self.non_current_liabilities,
+            'total_equity': self.total_equity,
+            'asset_liability_ratio': self.asset_liability_ratio,
+            'current_ratio': self.current_ratio,
+            'data_source': self.data_source,
+        }
+
 class StockResearchReport(Base):
     """
     股票调研报告模型 - ORM映射类
@@ -2544,7 +2650,7 @@ class DatabaseManager:
 
         return result
 
-    def extract_text_from_pdf_content(self, file_content: bytes) -> str | None:
+    def extract_text_from_pdf_content(self, file_content: bytes) -> Optional[str]:
         """
         从 PDF 二进制内容中提取文本
 
@@ -3092,6 +3198,209 @@ class DatabaseManager:
 
         return top
 
+    def save_stock_income(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存利润表数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含利润表数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存利润表数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                report_dates = [parse_row_date(d) for d in df['report_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockIncome).where(
+                        and_(
+                            StockIncome.code == code,
+                            StockIncome.report_date.in_(report_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {r.report_date: r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    report_date = parse_row_date(row.get('report_date'))
+                    existing = existing_map.get(report_date)
+
+                    if existing:
+                        existing.total_revenue = row.get('total_revenue')
+                        existing.operating_profit = row.get('operating_profit')
+                        existing.net_profit = row.get('net_profit')
+                        existing.basic_eps = row.get('basic_eps')
+                        existing.revenue_growth = row.get('revenue_growth')
+                        existing.profit_growth = row.get('profit_growth')
+                        existing.gross_margin = row.get('gross_margin')
+                        existing.data_source = row.get('data_source', 'Tushare')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockIncome(
+                            code=code,
+                            report_date=report_date,
+                            total_revenue=row.get('total_revenue'),
+                            operating_profit=row.get('operating_profit'),
+                            net_profit=row.get('net_profit'),
+                            basic_eps=row.get('basic_eps'),
+                            revenue_growth=row.get('revenue_growth'),
+                            profit_growth=row.get('profit_growth'),
+                            gross_margin=row.get('gross_margin'),
+                            data_source=row.get('data_source', 'Tushare'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 利润表数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 利润表数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 利润表数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def save_stock_balance_sheet(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存资产负债表数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含资产负债表数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存资产负债表数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                report_dates = [parse_row_date(d) for d in df['report_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockBalanceSheet).where(
+                        and_(
+                            StockBalanceSheet.code == code,
+                            StockBalanceSheet.report_date.in_(report_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {r.report_date: r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    report_date = parse_row_date(row.get('report_date'))
+                    existing = existing_map.get(report_date)
+
+                    if existing:
+                        existing.total_assets = row.get('total_assets')
+                        existing.current_assets = row.get('current_assets')
+                        existing.non_current_assets = row.get('non_current_assets')
+                        existing.total_liabilities = row.get('total_liabilities')
+                        existing.current_liabilities = row.get('current_liabilities')
+                        existing.non_current_liabilities = row.get('non_current_liabilities')
+                        existing.total_equity = row.get('total_equity')
+                        existing.asset_liability_ratio = row.get('asset_liability_ratio')
+                        existing.current_ratio = row.get('current_ratio')
+                        existing.data_source = row.get('data_source', 'Tushare')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockBalanceSheet(
+                            code=code,
+                            report_date=report_date,
+                            total_assets=row.get('total_assets'),
+                            current_assets=row.get('current_assets'),
+                            non_current_assets=row.get('non_current_assets'),
+                            total_liabilities=row.get('total_liabilities'),
+                            current_liabilities=row.get('current_liabilities'),
+                            non_current_liabilities=row.get('non_current_liabilities'),
+                            total_equity=row.get('total_equity'),
+                            asset_liability_ratio=row.get('asset_liability_ratio'),
+                            current_ratio=row.get('current_ratio'),
+                            data_source=row.get('data_source', 'Tushare'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 资产负债表数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 资产负债表数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 资产负债表数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_income(self, code: str, start_date: Optional[date] = None, end_date: Optional[date] = None) -> pd.DataFrame:
+        """
+        获取利润表数据
+        Args:
+            code: 股票代码
+            start_date: 开始日期（可选）
+            end_date: 结束日期（可选）
+        Returns:
+            pd.DataFrame: 利润表数据
+        """
+        with self.get_session() as session:
+            query = select(StockIncome).where(StockIncome.code == code)
+
+            if start_date:
+                query = query.where(StockIncome.report_date >= start_date)
+            if end_date:
+                query = query.where(StockIncome.report_date <= end_date)
+
+            results = session.execute(query.order_by(desc(StockIncome.report_date))).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'report_date' in data_list.columns:
+                data_list['report_date'] = data_list['report_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    def get_stock_balance_sheet(self, code: str, start_date: Optional[date] = None, end_date: Optional[date] = None) -> pd.DataFrame:
+        """
+        获取资产负债表数据
+        Args:
+            code: 股票代码
+            start_date: 开始日期（可选）
+            end_date: 结束日期（可选）
+        Returns:
+            pd.DataFrame: 资产负债表数据
+        """
+        with self.get_session() as session:
+            query = select(StockBalanceSheet).where(StockBalanceSheet.code == code)
+
+            if start_date:
+                query = query.where(StockBalanceSheet.report_date >= start_date)
+            if end_date:
+                query = query.where(StockBalanceSheet.report_date <= end_date)
+
+            results = session.execute(query.order_by(desc(StockBalanceSheet.report_date))).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'report_date' in data_list.columns:
+                data_list['report_date'] = data_list['report_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
 
 # ===== 便捷函数 (Convenience Function) ====================================
 
