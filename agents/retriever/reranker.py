@@ -9,7 +9,8 @@ from utils.config import get_retriever_config
 
 # 获取重排序模型配置
 retriever_config = get_retriever_config()
-RERANKER_MODEL = retriever_config.get('reranker_model', 'deepseek-r1:14b')
+# 注意：必须是 CrossEncoder 类模型（如 BAAI/bge-reranker-base），不能填 Ollama LLM 名
+RERANKER_MODEL = retriever_config.get('reranker_model', 'BAAI/bge-reranker-base')
 
 
 class Reranker:

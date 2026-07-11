@@ -77,34 +77,59 @@ class AnalystAgent:
             if not stock_code:
                 return parsed
 
+            def _num(row, key):
+                """取真实数值：缺失/无法转换返回 None，不用 0 或 1 兜底伪造"""
+                value = row.get(key)
+                if value is None:
+                    return None
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+
             income_df = self.db.get_stock_income(stock_code)
             if income_df is not None and not income_df.empty:
                 latest = income_df.iloc[0]
-                parsed["revenue"] = float(latest.get("total_revenue") or 0) / 1e8
-                parsed["net_income"] = float(latest.get("net_profit") or 0) / 1e8
-                parsed["operating_profit"] = float(latest.get("operating_profit") or 0) / 1e8
-                if len(income_df) >= 5:
-                    parsed["revenue_yoy"] = float(latest.get("revenue_growth") or 0)
-                    parsed["profit_yoy"] = float(latest.get("profit_growth") or 0)
-                    parsed["gross_margin"] = float(latest.get("gross_margin") or 0)
+                for src, dst in [("total_revenue", "revenue"), ("net_profit", "net_income"),
+                                 ("operating_profit", "operating_profit")]:
+                    value = _num(latest, src)
+                    if value is not None:
+                        parsed[dst] = value / 1e8
+                for src, dst in [("revenue_growth", "revenue_yoy"), ("profit_growth", "profit_yoy"),
+                                 ("gross_margin", "gross_margin")]:
+                    value = _num(latest, src)
+                    if value is not None:
+                        parsed[dst] = value
 
             balance_df = self.db.get_stock_balance_sheet(stock_code)
             if balance_df is not None and not balance_df.empty:
                 latest_b = balance_df.iloc[0]
-                parsed["total_assets"] = float(latest_b.get("total_assets") or 0) / 1e8
-                parsed["total_liabilities"] = float(latest_b.get("total_liabilities") or 0) / 1e8
-                parsed["total_equity"] = float(latest_b.get("total_equity") or 0) / 1e8
-                parsed["current_assets"] = float(latest_b.get("current_assets") or 0) / 1e8
-                parsed["current_liabilities"] = float(latest_b.get("current_liabilities") or 0) / 1e8
-                parsed["debt_ratio"] = float(latest_b.get("asset_liability_ratio") or 0)
-                parsed["current_ratio"] = float(latest_b.get("current_ratio") or 0)
+                for src, dst in [("total_assets", "total_assets"), ("total_liabilities", "total_liabilities"),
+                                 ("total_equity", "total_equity"), ("current_assets", "current_assets"),
+                                 ("current_liabilities", "current_liabilities")]:
+                    value = _num(latest_b, src)
+                    if value is not None:
+                        parsed[dst] = value / 1e8
+                for src, dst in [("asset_liability_ratio", "debt_ratio"), ("current_ratio", "current_ratio")]:
+                    value = _num(latest_b, src)
+                    if value is not None:
+                        parsed[dst] = value
 
-                parsed["inventory"] = 0
-                parsed["cost_of_goods_sold"] = parsed.get("revenue", 0) * (1 - parsed.get("gross_margin", 0) / 100) if parsed.get("revenue") else 0
-                parsed["ebit"] = parsed.get("operating_profit", 0)
-                parsed["interest_expense"] = 0
-                parsed["ebitda"] = parsed.get("operating_profit", 0)
-                parsed["market_cap"] = 0
+            # 衍生字段：只在有真实依据时才填，缺就缺着（比率工具会标注「缺少XX数据」）
+            if parsed.get("revenue") and parsed.get("gross_margin"):
+                parsed["cost_of_goods_sold"] = parsed["revenue"] * (1 - parsed["gross_margin"] / 100)
+            if parsed.get("operating_profit") is not None:
+                parsed["ebit"] = parsed["operating_profit"]
+
+            # 市值：从每日指标表取（total_mv 单位万元，转为亿元）
+            try:
+                basic_df = self.db.get_latest_daily_basic_data(stock_code)
+                if basic_df is not None and not basic_df.empty:
+                    total_mv = basic_df.iloc[0].get("total_mv")
+                    if total_mv:
+                        parsed["market_cap"] = float(total_mv) / 1e4
+            except Exception as e:
+                logger.warning(f"获取市值数据失败（不影响其余比率）: {e}")
 
         except Exception as e:
             logger.error(f"解析最新财务数据失败: {e}")
@@ -218,11 +243,7 @@ class AnalystAgent:
                 "messages": [response],
                 "financial_data": financial_data,
                 "analysis_result": {"summary": summary, "ratios": calculated, "data_source": "real_financial_statements"},
-                "agent_output": {"summary": summary, "ratios": calculated},
-                "current_node": "analyst",
-                "intermediate_steps": state.get("intermediate_steps", []) + [
-                    ("analyze", {"stock_code": stock_code, "content": summary[:200]})
-                ],
+                "intermediate_steps": [("analyze", {"stock_code": stock_code, "content": summary[:200]})],
             }
 
         except Exception as e:
@@ -230,7 +251,7 @@ class AnalystAgent:
             return {
                 "messages": [],
                 "error": f"分析执行失败: {e}",
-                "intermediate_steps": state.get("intermediate_steps", []) + [("analyze", {"error": str(e)})],
+                "intermediate_steps": [("analyze", {"error": str(e)})],
             }
 
     def _save_analysis_to_db(self, state: AgentState, analysis_content: str, ratios: Dict[str, Any]):

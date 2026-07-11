@@ -5,12 +5,9 @@
 import os
 import io
 from datetime import datetime, date, timedelta
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Mapping
 from utils.common import parse_row_date
-
-from PIL.PdfParser import pdf_repr
-from pandas.core.computation.expressions import where
-from sqlalchemy import create_engine, Column, Integer, String, Text, JSON
 
 import pandas as pd
 import requests
@@ -24,11 +21,16 @@ from sqlalchemy import (
     Date,
     DateTime,
     Integer,
+    Text,
+    JSON,
     Index,
     UniqueConstraint,
     select,
     and_,
     desc,
+    delete,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import (
     declarative_base,
@@ -618,8 +620,10 @@ class StockDailyBasic(Base):
 class DailyForecast(Base):
     __tablename__ = 'daily_forecast'
     id = Column(Integer, primary_key=True, autoincrement=True)
-    code = Column(String(10), nullable=False, unique=True, index=True)
-    forecast_date = Column(Date, nullable=False, unique=True, index=True)
+    # 注意：code/forecast_date 不能单列 unique（否则一只股票只能有一条预测），
+    # 唯一性由下面的 (code, forecast_date) 复合唯一约束保证
+    code = Column(String(10), nullable=False, index=True)
+    forecast_date = Column(Date, nullable=False, index=True)
     forecast_rue = Column(String, nullable=False)
     practice_rue = Column(String, nullable=False)
     forecast_model = Column(String, nullable=False)
@@ -833,15 +837,15 @@ class StockResearchReport(Base):
     month_research_count = Column(Integer)  # 近一个月研报数
     industry = Column(String(200))  # 行业
     share_year1 = Column(String(10))
-    ratio_yaar1 = Column(String(10))
+    ratio_year1 = Column(String(10))
     forecasting_earning_per_share1 = Column(Float) # 每股收益
     Predicted_price_earnings_ratio1 = Column(Float)
     share_year2 = Column(String(10))
-    ratio_yaar2 = Column(String(10))
+    ratio_year2 = Column(String(10))
     forecasting_earning_per_share2 = Column(Float)
     Predicted_price_earnings_ratio2 = Column(Float)
     share_year3 = Column(String(10))
-    ratio_yaar3 = Column(String(10))
+    ratio_year3 = Column(String(10))
     forecasting_earning_per_share3 = Column(Float)
     Predicted_price_earnings_ratio3 = Column(Float)
     downloaded_path = Column(String(200))  # 下载路径
@@ -855,7 +859,7 @@ class StockResearchReport(Base):
     )
 
     def __repr__(self):
-        return f"<StockResearchReport(code={self.code}, date={self.date}, pdf_name={self.pdf_name}, title={self.title})>"
+        return f"<StockResearchReport(code={self.code}, date={self.date}, pdf_name={self.pdf_name}, title={self.report_name})>"
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典格式，便于数据交互"""
@@ -863,21 +867,21 @@ class StockResearchReport(Base):
             'code': self.code,
             'date': self.date,
             'pdf_name': self.pdf_name,
-            'title': self.title,
+            'title': self.report_name,
             'east_rating': self.east_rating,
             'rating_agency': self.rating_agency,
             'month_research_count': self.month_research_count,
             'industry': self.industry,
             'share_year1': self.share_year1,
-            'ratio_yaar1': self.ratio_yaar1,
+            'ratio_year1': self.ratio_year1,
             'forecasting_earning_per_share1': self.forecasting_earning_per_share1,
             'Predicted_price_earnings_ratio1': self.Predicted_price_earnings_ratio1,
             'share_year2': self.share_year2,
-            'ratio_yaar2': self.ratio_yaar2,
+            'ratio_year2': self.ratio_year2,
             'forecasting_earning_per_share2': self.forecasting_earning_per_share2,
             'Predicted_price_earnings_ratio2': self.Predicted_price_earnings_ratio2,
             'share_year3': self.share_year3,
-            'ratio_yaar3': self.ratio_yaar3,
+            'ratio_year3': self.ratio_year3,
             'forecasting_earning_per_share3': self.forecasting_earning_per_share3,
             'Predicted_price_earnings_ratio3': self.Predicted_price_earnings_ratio3,
             'downloaded_path': self.downloaded_path,
@@ -1057,14 +1061,59 @@ class DatabaseManager:
             autoflush=False,  # 手动刷新数据，提高性能
         )
 
+        # 步骤3.5：历史 schema 修复（必须在 create_all 之前执行）
+        self._migrate_legacy_tables()
+
         # 步骤4：创建所有表（如果不存在）
         # Base.metadata.create_all 会检查表是否存在，不存在则创建
         # 这是SQLAlchemy的便利功能，避免手动编写CREATE TABLE语句
         Base.metadata.create_all(self._engine)
 
+        # PDF 研报下载目录（统一目录，供下载与文件列举使用）
+        self.download_dir = Path("./data/pdf")
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+
         # 标记为已初始化，防止重复初始化
         self._initialized = True
         logger.info(f"数据库初始化完成: {db_url}")
+
+    def _migrate_legacy_tables(self) -> None:
+        """
+        小迁移：修复历史 schema 错误。
+        这两张表因字段/约束错误从未成功写入过（表为空），直接 DROP 后由
+        create_all 按新模型重建，安全无数据丢失：
+        1. stock_research_report：ratio_yaar1/2/3 列名 typo → ratio_year1/2/3
+        2. daily_forecast：code/forecast_date 错误的单列 unique 约束 → 只保留复合唯一约束
+        """
+        try:
+            inspector = inspect(self._engine)
+            table_names = inspector.get_table_names()
+            with self._engine.connect() as conn:
+                # stock_research_report：存在 typo 列 ratio_yaar1 说明是旧表
+                if 'stock_research_report' in table_names:
+                    cols = [c['name'] for c in inspector.get_columns('stock_research_report')]
+                    if 'ratio_yaar1' in cols:
+                        conn.execute(text('DROP TABLE stock_research_report'))
+                        conn.commit()
+                        logger.info("检测到 stock_research_report 旧表（ratio_yaar1 列名 typo），已删除待重建")
+
+                # daily_forecast：存在 code 或 forecast_date 的单列唯一索引说明是旧表
+                if 'daily_forecast' in table_names:
+                    idx_rows = conn.execute(text("PRAGMA index_list('daily_forecast')")).fetchall()
+                    for idx in idx_rows:
+                        # 行结构: (seq, name, unique, origin, partial)
+                        if not idx[2]:
+                            continue
+                        col_rows = conn.execute(text(f"PRAGMA index_info('{idx[1]}')")).fetchall()
+                        col_names = [r[2] for r in col_rows]
+                        if len(col_names) == 1 and col_names[0] in ('code', 'forecast_date'):
+                            conn.execute(text('DROP TABLE daily_forecast'))
+                            conn.commit()
+                            logger.info("检测到 daily_forecast 旧表（单列 unique 约束），已删除待重建")
+                            break
+        except Exception as e:
+            # 迁移失败不阻塞启动，但要暴露出来便于排查
+            logger.error(f"历史表结构迁移失败: {e}")
 
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':
@@ -1606,7 +1655,7 @@ class DatabaseManager:
 
         return result
 
-    def get_stock_research_report_days(self, code: str, days: int = 30):
+    def get_stock_research_report_days(self, code: str, days: int = 30) -> List[StockResearchReport]:
         """
         获取最近一段时间的研报
         """
@@ -1616,11 +1665,12 @@ class DatabaseManager:
                 .where(
                     and_(
                         StockResearchReport.code == code,
-
+                        StockResearchReport.date >= (date.today() - timedelta(days=days))
                     )
                 )
                 .order_by(desc(StockResearchReport.date))
-            )
+            ).scalars().all()
+            return list(results)
 
     def save_stock_basic(self, df: pd.DataFrame) -> int:
         """存储股票基本数据"""
@@ -1922,7 +1972,13 @@ class DatabaseManager:
                     elif isinstance(row_date, pd.Timestamp):
                         row_date = row_date.date()
 
-                    if  row_date < start_date_str:
+                    # 日期缺失/解析失败的行直接跳过
+                    if not isinstance(row_date, date):
+                        logger.warning(f"[{code}] 日线数据行日期无效，跳过: {row.get('date')}")
+                        continue
+
+                    # start_date 为 None 时不做区间过滤，保存全部行
+                    if start_date_str is not None and row_date < start_date_str:
                         continue
 
                     # === 步骤2：检查记录是否已存在（UPSERT核心）===
@@ -2057,8 +2113,15 @@ class DatabaseManager:
                     # === 步骤1：解析日期（支持多种格式）===
                     # 数据可能来自不同来源，日期格式不统一，需要标准化
                     row_date = parse_row_date(row.get('date'))
+                    if not isinstance(row_date, date):
+                        logger.warning(f"[{code}] 周线数据行日期无效，跳过: {row.get('date')}")
+                        continue
                     end_date = parse_row_date(row.get('end_date'))
-                    if end_date < start_date_str:
+                    # end_date 缺失时用 date 字段兜底（tushare 周/月线接口不返回 end_date）
+                    if not isinstance(end_date, date):
+                        end_date = row_date
+                    # start_date 为 None 时不做区间过滤
+                    if start_date_str is not None and end_date < start_date_str:
                         continue
 
                     # === 步骤2：检查记录是否已存在（UPSERT核心）===
@@ -2197,10 +2260,15 @@ class DatabaseManager:
                     # === 步骤1：解析日期（支持多种格式）===
                     # 数据可能来自不同来源，日期格式不统一，需要标准化
                     row_date = parse_row_date(row.get('date'))
+                    if not isinstance(row_date, date):
+                        logger.warning(f"[{code}] 月线数据行日期无效，跳过: {row.get('date')}")
+                        continue
                     e_date = parse_row_date(row.get('end_date'))
-
-
-                    if e_date < start_date_str:
+                    # end_date 缺失时用 date 字段兜底（tushare 周/月线接口不返回 end_date）
+                    if not isinstance(e_date, date):
+                        e_date = row_date
+                    # start_date 为 None 时不做区间过滤
+                    if start_date_str is not None and e_date < start_date_str:
                         continue
 
                     # === 步骤2：检查记录是否已存在（UPSERT核心）===
@@ -2317,6 +2385,37 @@ class DatabaseManager:
         # 只返回新增记录数（更新的记录不计入）
         return saved_count
 
+    def _delete_stock_data(self, model, code: str) -> int:
+        """按股票代码删除某张行情表的全部数据（内部通用实现）"""
+        if code is None:
+            logger.error(f"code is null")
+            return 0
+        with self.get_session() as session:
+            try:
+                result = session.execute(
+                    delete(model).where(model.code == code)
+                )
+                session.commit()
+                deleted_count = result.rowcount or 0
+                logger.info(f"删除 {model.__tablename__} 中 {code} 的 {deleted_count} 条数据")
+                return deleted_count
+            except Exception as e:
+                session.rollback()
+                logger.error(f"删除 {code} 数据失败: {e}")
+                raise
+
+    def delete_daily_data(self, code: str) -> int:
+        """删除某股票的全部日线数据（前复权基准漂移时全量重拉前调用）"""
+        return self._delete_stock_data(StockDaily, code)
+
+    def delete_week_data(self, code: str) -> int:
+        """删除某股票的全部周线数据（前复权基准漂移时全量重拉前调用）"""
+        return self._delete_stock_data(StockWeekly, code)
+
+    def delete_month_data(self, code: str) -> int:
+        """删除某股票的全部月线数据（前复权基准漂移时全量重拉前调用）"""
+        return self._delete_stock_data(StockMonth, code)
+
     def save_daily_forecast(
             self,
             df: pd.DataFrame,
@@ -2354,8 +2453,9 @@ class DatabaseManager:
                     if existing:
                         # 情况A：记录已存在 → 执行UPDATE（更新）
                         # 更新所有字段，确保数据最新
+                        existing.forecast_rue = row.get('forecast_rue')
                         existing.practice_rue = row.get('practice_rue')
-                        forecast_model = forecast_model
+                        existing.forecast_model = row.get('forecast_model')
                         existing.updated_at = datetime.now()  # 更新修改时间
                         # 注意：更新操作不增加saved_count（只统计新增）
                     else:
@@ -2364,7 +2464,7 @@ class DatabaseManager:
                         record = DailyForecast(
                             # 标识字段
                             code=code,  # 股票代码
-                            foreccst_date=row_date,  # 交易日期
+                            forecast_date=row_date,  # 交易日期
                             forecast_rue = row.get('forecast_rue'),
                             practice_rue=row.get('practice_rue'),
                             forecast_model=row.get('forecast_model'),
@@ -2507,6 +2607,11 @@ class DatabaseManager:
                     date = parse_row_date(row.get("date"))
                     pdf_name = row.get("pdf_name")
 
+                    # 日期解析失败的行直接跳过
+                    if date is None:
+                        logger.warning(f"[{code}] 研报 {pdf_name} 日期无效，跳过: {row.get('date')}")
+                        continue
+
                     half_year_ago = date.today() - timedelta(days=90)
 
                     # 如果研报日期早于半年前，跳过
@@ -2555,6 +2660,8 @@ class DatabaseManager:
             except Exception as e:
                 session.rollback()
                 logger.error(f"保存 {code} 数据失败: {e}")
+                # 与其他 save 方法一致：重新抛出异常，让调用者处理（不静默吞掉）
+                raise
 
         return save_count
 
@@ -2594,11 +2701,12 @@ class DatabaseManager:
             if not self.is_valid_pdf_filename(filename):  # 验证文件名是否有效
                 filename = f"{filename}.pdf"
 
-            pdf_path = ().get_pdf_dir()
+            # 使用统一的 PDF 下载目录（初始化时已创建）
+            pdf_path = self.download_dir
             # 创建子目录（如果提供了股票代码）
             if stock_code:
                 stock_dir = pdf_path/stock_code
-                stock_dir.mkdir(exist_ok=True)
+                stock_dir.mkdir(parents=True, exist_ok=True)
                 file_path = stock_dir / filename
             else:
                 file_path = pdf_path / filename
@@ -2738,12 +2846,11 @@ class DatabaseManager:
         # 生成文件名
         filename = f"{research_report.code}_{research_report.date}_{research_report.pdf_name}.pdf"
 
-        # 下载PDF
+        # 下载PDF（download_research_report 没有 report_date 参数，日期已编入文件名）
         result = self.download_research_report(
             url=research_report.report_pdf_link,
             filename=filename,
             stock_code=research_report.code,
-            report_date=str(research_report.date)
         )
 
         # 如果下载成功，更新数据库中的下载路径
@@ -3441,7 +3548,7 @@ def get_db() -> DatabaseManager:
 
 if __name__ == '__main__':
 
-    dbM = get_db("")
+    dbM = get_db()
     print("=" * 60)
     print("  存储模块 (storage.py) 功能测试")
     print("=" * 60)

@@ -30,7 +30,8 @@ class AgentState(TypedDict):
         - technical_result: 技术分析 Agent 的输出结果
         - final_answer: 最终生成的回答
         - intermediate_steps: 中间步骤记录（用于调试）
-        - next_agent: 下一步应调用的 Agent 名称
+        - next_agents: 大脑（router）排出的待执行 Agent 队列，各节点执行后弹出自己
+        - confidence: 路由置信度
         - error: 错误信息（如有）
     """
     messages: Annotated[List[BaseMessage], add_messages]
@@ -47,7 +48,8 @@ class AgentState(TypedDict):
     technical_result: Optional[Dict[str, Any]]
     final_answer: Optional[str]
     intermediate_steps: Annotated[List[tuple], operator.add]
-    next_agent: Optional[str]
+    next_agents: List[str]
+    confidence: Optional[float]
     error: Optional[str]
 
 

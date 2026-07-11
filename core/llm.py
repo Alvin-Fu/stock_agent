@@ -33,7 +33,7 @@ class LLMFactory:
     def get_llm(
         cls,
         model: Optional[str] = None,
-        provider: str = PROVIDER_OPENAI,
+        provider: str = PROVIDER_DEEPSEEK,
         temperature: float = 0,
         max_tokens: Optional[int] = None,
         streaming: bool = False,
@@ -58,6 +58,7 @@ class LLMFactory:
             model=model or cls._get_default_model(provider),
             temperature=temperature,
             max_tokens=max_tokens,
+            streaming=streaming,
             **kwargs
         )
 
@@ -169,10 +170,11 @@ class LLMFactory:
         ds = ChatDeepSeek(
             model=model,
             temperature=temperature,
-            max_tokens=max_tokens or 14096,
+            max_tokens=max_tokens or 8192,
+            streaming=streaming,
             api_key=api_key,
             base_url=deepseek_conf["url"],
-            verbose= False,
+            verbose=False,
         )
         return ds
 
@@ -189,6 +191,8 @@ class LLMFactory:
             key_parts.append(f"maxtok_{kwargs['max_tokens']}")
         if "timeout" in kwargs:
             key_parts.append(f"timeout_{kwargs['timeout']}")
+        if kwargs.get("streaming"):
+            key_parts.append("streaming")
         return "|".join(key_parts)
 
     @classmethod
@@ -253,14 +257,15 @@ def get_local_fast_llm() -> BaseChatModel:
 def get_llm():
     """
     🔥 全局远程LLM大模型工厂
-    自动连接另一台机器的Ollama服务
+    自动连接另一台机器的Ollama服务（配置读 models.ollama / models.llm_model）
     :return: 远程Ollama模型实例
     """
     model_cfg = get_model_config()
+    ollama_cfg = model_cfg.get("ollama", {})
 
     llm = OllamaLLM(
-        model=model_cfg["llm_model"],
-        base_url=model_cfg["ollama_url"],  # 默认地址 http://127.0.0.1:11434,  # 🔥 指定远程Ollama地址
+        model=model_cfg.get("llm_model", "deepseek-r1:14b"),
+        base_url=ollama_cfg.get("url", "http://127.0.0.1:11434"),
         temperature=0.1,  # 精准回答，不编造
         verbose=False
     )
@@ -268,13 +273,13 @@ def get_llm():
 
 def get_ds():
     """
-    获取ds
+    获取 DeepSeek 模型（配置读 models.deepseek 段，与 LLMFactory 同源）
     """
-    model_cfg = get_model_config()
+    deepseek_cfg = get_deepseek_model_config()
     llm = ChatOpenAI(
-        model=model_cfg["deepseek_model"],
-        base_url=model_cfg["deepseek_url"],  # 默认地址 http://127.0.0.1:11434,  # 🔥 指定远程Ollama地址
-        api_key=model_cfg["deepseek_api_key"],
+        model=get_model_config().get("brain_model", DeepseekFlashModule),
+        base_url=deepseek_cfg.get("url", "https://api.deepseek.com/v1"),
+        api_key=deepseek_cfg.get("api_key", ""),
         temperature=0.1,  # 精准回答，不编造
         verbose=False
     )

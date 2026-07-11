@@ -22,6 +22,8 @@ def parse_row_date(row_date):
                 return datetime.strptime(date_str, date_format).date()
             except ValueError:
                 continue
+        # 所有格式都解析失败，返回 None 由调用方处理（不再原样返回字符串）
+        return None
     elif isinstance(row_date, datetime):
         row_date = row_date.date()
     elif isinstance(row_date, pd.Timestamp):

@@ -53,7 +53,7 @@ if prompt := st.chat_input("请输入您的财经问题..."):
             with st.expander("🔍 查看分析详情"):
                 st.json({
                     "intent": state.get("intent"),
-                    "next_agent": state.get("next_agent"),
+                    "next_agents": state.get("next_agents"),
                     "steps": [str(step) for step in state.get("intermediate_steps", [])],
                     "documents_count": len(state.get("documents", []))
                 })

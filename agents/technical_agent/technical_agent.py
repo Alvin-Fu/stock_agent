@@ -135,7 +135,6 @@ class TechnicalAgent:
 
         return {
             "messages": [response],
-            "current_node": self.name,
             "technical_result": {"summary": summary, "mode": "single", "code": code},
             "intermediate_steps": [("technical_analyze", {"mode": "single", "code": code})],
         }
@@ -167,7 +166,6 @@ class TechnicalAgent:
 
         return {
             "messages": [response],
-            "current_node": self.name,
             "technical_result": {"summary": summary, "mode": "chain", "codes": codes},
             "intermediate_steps": [("technical_analyze", {"mode": "chain", "count": len(codes)})],
         }

@@ -1,9 +1,19 @@
 # 核心依赖
 langchain
 langchain-core
+langchain-community
+langchain-text-splitters
 langgraph
 langchain-openai
 langchain-ollama
+langchain-deepseek
+langchain-chroma
+langchain-tavily
+
+# 向量库 / 检索
+chromadb
+sentence-transformers   # reranker（CrossEncoder），未开启 use_reranker 时可不装
+duckduckgo-search       # DuckDuckGo 搜索（未配 Tavily key 时的兜底）
 
 # 数据库
 sqlalchemy
@@ -14,10 +24,15 @@ schedule
 requests
 python-dateutil
 tenacity
+pypdf                   # PyPDFLoader 文档加载
+PyPDF2                  # 研报 PDF 解析（storage 使用）
 
 # 数据源
 akshare
 tushare
+
+# Web 界面
+streamlit
 
 # 其他
 pyyaml

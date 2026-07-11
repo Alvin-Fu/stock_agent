@@ -2,6 +2,7 @@
 启动定时分析任务
 """
 import argparse
+import time
 from tasks.scheduled_analyzer import ScheduledAnalyzer
 
 
@@ -69,7 +70,7 @@ def main():
     
     try:
         while True:
-            pass
+            time.sleep(1)
     except KeyboardInterrupt:
         analyzer.stop()
         print("定时分析任务已停止")

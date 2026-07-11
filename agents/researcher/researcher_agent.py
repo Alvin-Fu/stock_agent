@@ -14,7 +14,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from agents.base import AgentState
 from core.llm import get_default_llm
 from .web_search_tool import web_search
-from storage.sqlite.stock_storage import DatabaseManager
+from tools.company_code_validator import find_stock_code, find_company_name
 from utils.logger import logger
 
 
@@ -23,7 +23,6 @@ class ResearcherAgent:
 
     def __init__(self):
         self.llm = get_default_llm()
-        self.db = DatabaseManager.get_instance()
 
     # ========== 个股搜索模式 ==========
 
@@ -151,12 +150,6 @@ class ResearcherAgent:
 
                 leaders = self._extract_leaders_from_text(str(result), seg_name, level)
 
-                if not leaders:
-                    for candidate in self.db.get_stocks_by_industry(industry):
-                        if any(kw in candidate.get('name', '') for kw in seg_name[:4]):
-                            leaders.append({"code": candidate['code'], "name": candidate['name'], "rank": 1})
-                            break
-
                 level_leaders.append({
                     "segment": seg_name,
                     "leaders": leaders,
@@ -189,18 +182,32 @@ class ResearcherAgent:
             match = re.search(r'\[.*\]', raw, re.DOTALL)
             if match:
                 leaders = json.loads(match.group(0))
-                for i, l in enumerate(leaders):
-                    l["rank"] = i + 1
-                    # 尝试从 DB 补全代码
-                    if not l.get("code"):
-                        name = l.get("name", "")
-                        all_names = self.db.get_stocks_by_industry("")  # 全量搜索
-                        if all_names:
-                            for c in all_names:
-                                if name[:2] in c.get('name', ''):
-                                    l["code"] = c["code"]
-                                    break
-                return leaders[:2]
+                validated = []
+                for l in leaders:
+                    name = (l.get("name") or "").strip()
+                    code = (l.get("code") or "").strip()
+                    # LLM 给的代码必须能反查到真实公司名，否则视为幻觉丢弃
+                    if code:
+                        try:
+                            real_name = find_company_name(code)
+                        except Exception:
+                            real_name = None
+                        if not real_name:
+                            logger.warning(f"[{segment}] LLM 给出的代码 {code}({name}) 验证失败，尝试按名字查")
+                            code = ""
+                        else:
+                            name = real_name
+                    # 没有有效代码时，用公司名去股票基础表查
+                    if not code and name:
+                        try:
+                            code = find_stock_code(name) or ""
+                        except Exception as e:
+                            logger.warning(f"按公司名查代码失败（{name}）: {e}")
+                    if code:
+                        validated.append({"name": name, "code": code, "rank": len(validated) + 1})
+                    else:
+                        logger.warning(f"[{segment}] 无法确认「{name}」的股票代码，跳过")
+                return validated[:2]
         except Exception as e:
             logger.error(f"提取龙头失败: {e}")
 
@@ -365,7 +372,6 @@ class ResearcherAgent:
         return {
             "messages": [response],
             "research_result": {"summary": summary, "sources": queries},
-            "current_node": "researcher",
             "intermediate_steps": [("researcher", {"mode": "stock", "stock_code": stock_code, "queries": len(queries)})],
         }
 
@@ -383,7 +389,6 @@ class ResearcherAgent:
         # ---- Step 2：搜索每个细分领域的龙一龙二 ----
         logger.info("Step 2/3: 搜索各环节龙一龙二（含特精专新）...")
         chain = self._search_leaders_for_chain(industry_name, chain)
-        state["chain_leaders"] = chain
 
         # 收集所有龙头代码
         all_leader_codes = set()
@@ -435,9 +440,9 @@ class ResearcherAgent:
         summary = response.content if hasattr(response, 'content') else str(response)
         logger.info(f"产业链分析完成，长度: {len(summary)}")
 
-        # 从 LLM 输出中提取 candidate_codes，存入 state 供 technical_agent 使用
+        # 从 LLM 输出中提取 candidate_codes，供下游 technical_agent 使用
         import json, re
-        candidate_codes = list(all_leader_codes)  # fallback：DB 搜到的代码
+        candidate_codes = list(all_leader_codes)  # fallback：龙头搜索阶段已验证过的代码
         json_match = re.search(r'\{[^{}]*"candidate_codes"[^{}]*\}', summary, re.DOTALL)
         if json_match:
             try:
@@ -448,13 +453,26 @@ class ResearcherAgent:
             except json.JSONDecodeError:
                 pass
 
+        # 出口统一验证：只把能在股票基础表反查到的代码交给 technical_agent
+        verified_codes = []
+        for code in candidate_codes:
+            code = str(code).strip()
+            try:
+                if find_company_name(code):
+                    verified_codes.append(code)
+                else:
+                    logger.warning(f"候选代码 {code} 验证失败，剔除")
+            except Exception:
+                # 验证器不可用（如无 tushare token）时保留原代码，不让整条链断掉
+                verified_codes.append(code)
+        logger.info(f"候选代码验证: {len(candidate_codes)} -> {len(verified_codes)}")
+
         return {
             "messages": [response],
             "research_result": {"summary": summary, "sources": all_queries},
             "chain_leaders": chain,
-            "stock_code": ",".join(candidate_codes) if candidate_codes else "",
-            "current_node": "researcher",
-            "intermediate_steps": [("researcher", {"mode": "chain", "industry": industry_name, "segments": sum(len(chain.get(k,[])) for k in ["upstream","midstream","downstream","niche_innovators"]), "candidates": len(candidate_codes), "queries": len(all_queries)})],
+            "stock_code": ",".join(verified_codes) if verified_codes else "",
+            "intermediate_steps": [("researcher", {"mode": "chain", "industry": industry_name, "segments": sum(len(chain.get(k,[])) for k in ["upstream","midstream","downstream","niche_innovators"]), "candidates": len(verified_codes), "queries": len(all_queries)})],
         }
 
     def invoke(self, state: AgentState) -> Dict[str, Any]:

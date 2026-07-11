@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-AkshareFetcher - 主数据源 (Priority 1)
+AkshareFetcher - 主数据源 (Priority 0)
 ===================================
 
 数据来源：东方财富爬虫（通过 akshare 库）
@@ -44,6 +44,7 @@ import logging
 from utils.logger import logger
 import random
 import time
+import requests
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Union
 from .common import extract_last_segment_standard, _is_etf_code, _is_hk_code
@@ -222,8 +223,8 @@ _etf_realtime_cache: Dict[str, Any] = {
 class AkshareFetcher(BaseFetcher):
     """
     Akshare 数据源实现
-    
-    优先级：1（最高）
+
+    优先级：0（最高，主数据源）
     数据来源：东方财富网爬虫
     
     关键策略：
@@ -233,7 +234,7 @@ class AkshareFetcher(BaseFetcher):
     """
     
     name = "AkshareFetcher"
-    priority = 1
+    priority = 0
     
     def __init__(self, sleep_min: float = 10.0, sleep_max: float = 50.0):
         """
@@ -287,7 +288,12 @@ class AkshareFetcher(BaseFetcher):
     @retry(
         stop=stop_after_attempt(3),  # 最多重试3次
         wait=wait_exponential(multiplier=1, min=2, max=30),  # 指数退避：2, 4, 8... 最大30秒
-        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        retry=retry_if_exception_type((
+            ConnectionError,
+            TimeoutError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        )),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def _fetch_raw_data(self, freq: str, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -525,7 +531,12 @@ class AkshareFetcher(BaseFetcher):
         
         # 重命名列
         df = df.rename(columns=column_mapping)
-        
+
+        # 成交量单位转换（akshare A股/ETF 的成交量单位是手，统一转换为股；
+        # 港股接口返回的成交量本身就是股，不重复转换）
+        if 'volume' in df.columns and not _is_hk_code(stock_code):
+            df['volume'] = df['volume'] * 100
+
         # 添加股票代码列
         df['code'] = stock_code
         

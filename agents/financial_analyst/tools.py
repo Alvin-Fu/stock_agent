@@ -1,13 +1,14 @@
 """
 财务分析工具集
 所有工具均被装饰为 LangChain Tool，供 Agent 调用
+
+原则：数据缺失时明确返回「缺少XX数据」，绝不使用默认值伪造比率——
+喂给 LLM 一个用假数算出来的 ROE 比没有数据更糟。
 """
-import logging
 from typing import Dict, Optional
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from utils.logger import logger
-
 
 
 # ---------- 输入模型定义 ----------
@@ -25,104 +26,142 @@ class GrowthInput(BaseModel):
     periods: Optional[int] = Field(default=1, description="期数（用于年化）")
 
 
+def _get(fs: Dict, key: str):
+    """取字段：不存在或为 None 返回 None，不做任何默认值兜底"""
+    value = fs.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------- 工具函数 ----------
 @tool(args_schema=RatioInput)
-def calculate_profitability_ratios(financial_statements: Dict) -> Dict[str, float]:
+def calculate_profitability_ratios(financial_statements: Dict) -> Dict[str, object]:
     """
     计算盈利能力比率：毛利率、净利率、ROE、ROA
     输入需包含：revenue, cost_of_goods_sold, net_income,
                 total_assets, total_equity (平均或期末)
     """
     try:
-        logger.info(f"计算盈利能力比率")
-        revenue = financial_statements.get("revenue", 0)
-        cogs = financial_statements.get("cost_of_goods_sold", 0)
-        net_income = financial_statements.get("net_income", 0)
-        total_assets = financial_statements.get("total_assets", 1)
-        total_equity = financial_statements.get("total_equity", 1)
+        fs = financial_statements
+        revenue = _get(fs, "revenue")
+        cogs = _get(fs, "cost_of_goods_sold")
+        net_income = _get(fs, "net_income")
+        total_assets = _get(fs, "total_assets")
+        total_equity = _get(fs, "total_equity")
 
-        gross_margin = (revenue - cogs) / revenue if revenue else 0
-        net_margin = net_income / revenue if revenue else 0
-        roa = net_income / total_assets if total_assets else 0
-        roe = net_income / total_equity if total_equity else 0
-
-        return {
-            "毛利率": round(gross_margin * 100, 2),
-            "净利率": round(net_margin * 100, 2),
-            "ROA": round(roa * 100, 2),
-            "ROE": round(roe * 100, 2),
-        }
+        result = {}
+        if revenue and cogs is not None:
+            result["毛利率"] = round((revenue - cogs) / revenue * 100, 2)
+        else:
+            result["毛利率"] = "缺少营收/成本数据"
+        if revenue and net_income is not None:
+            result["净利率"] = round(net_income / revenue * 100, 2)
+        else:
+            result["净利率"] = "缺少营收/净利润数据"
+        if total_assets and net_income is not None:
+            result["ROA"] = round(net_income / total_assets * 100, 2)
+        else:
+            result["ROA"] = "缺少总资产/净利润数据"
+        if total_equity and net_income is not None:
+            result["ROE"] = round(net_income / total_equity * 100, 2)
+        else:
+            result["ROE"] = "缺少净资产/净利润数据"
+        return result
     except Exception as e:
+        logger.error(f"计算盈利能力比率失败: {e}")
         return {"错误": str(e)}
 
 
 @tool(args_schema=RatioInput)
-def calculate_liquidity_ratios(financial_statements: Dict) -> Dict[str, float]:
+def calculate_liquidity_ratios(financial_statements: Dict) -> Dict[str, object]:
     """
     计算短期偿债能力比率：流动比率、速动比率
     输入需包含：current_assets, current_liabilities, inventory
     """
     try:
-        current_assets = financial_statements.get("current_assets", 0)
-        current_liabilities = financial_statements.get("current_liabilities", 1)
-        inventory = financial_statements.get("inventory", 0)
+        fs = financial_statements
+        current_assets = _get(fs, "current_assets")
+        current_liabilities = _get(fs, "current_liabilities")
+        inventory = _get(fs, "inventory")
 
-        current_ratio = current_assets / current_liabilities
-        quick_ratio = (current_assets - inventory) / current_liabilities
+        if not current_liabilities or current_assets is None:
+            return {"说明": "缺少流动资产/流动负债数据，无法计算短期偿债比率"}
 
-        return {
-            "流动比率": round(current_ratio, 2),
-            "速动比率": round(quick_ratio, 2),
-        }
+        result = {"流动比率": round(current_assets / current_liabilities, 2)}
+        if inventory is not None:
+            result["速动比率"] = round((current_assets - inventory) / current_liabilities, 2)
+        else:
+            result["速动比率"] = "缺少存货数据"
+        return result
     except Exception as e:
+        logger.error(f"计算短期偿债比率失败: {e}")
         return {"错误": str(e)}
 
 
 @tool(args_schema=RatioInput)
-def calculate_solvency_ratios(financial_statements: Dict) -> Dict[str, float]:
+def calculate_solvency_ratios(financial_statements: Dict) -> Dict[str, object]:
     """
     计算长期偿债能力比率：资产负债率、利息保障倍数
     输入需包含：total_liabilities, total_assets, ebit, interest_expense
     """
     try:
-        total_liabilities = financial_statements.get("total_liabilities", 0)
-        total_assets = financial_statements.get("total_assets", 1)
-        ebit = financial_statements.get("ebit", 0)
-        interest_expense = financial_statements.get("interest_expense", 1)
+        fs = financial_statements
+        total_liabilities = _get(fs, "total_liabilities")
+        total_assets = _get(fs, "total_assets")
+        ebit = _get(fs, "ebit")
+        interest_expense = _get(fs, "interest_expense")
 
-        debt_ratio = total_liabilities / total_assets
-        interest_coverage = ebit / interest_expense if interest_expense else 0
-
-        return {
-            "资产负债率": round(debt_ratio * 100, 2),
-            "利息保障倍数": round(interest_coverage, 2),
-        }
+        result = {}
+        if total_assets and total_liabilities is not None:
+            result["资产负债率"] = round(total_liabilities / total_assets * 100, 2)
+        else:
+            result["资产负债率"] = "缺少总资产/总负债数据"
+        if interest_expense and ebit is not None:
+            result["利息保障倍数"] = round(ebit / interest_expense, 2)
+        else:
+            result["利息保障倍数"] = "缺少利息费用数据"
+        return result
     except Exception as e:
+        logger.error(f"计算长期偿债比率失败: {e}")
         return {"错误": str(e)}
 
 
 @tool(args_schema=RatioInput)
-def calculate_valuation_ratios(financial_statements: Dict) -> Dict[str, float]:
+def calculate_valuation_ratios(financial_statements: Dict) -> Dict[str, object]:
     """
     计算估值比率（需要市值数据）
     输入需包含：market_cap, net_income, total_equity, ebitda
     """
     try:
-        market_cap = financial_statements.get("market_cap", 0)
-        net_income = financial_statements.get("net_income", 1)
-        total_equity = financial_statements.get("total_equity", 1)
-        ebitda = financial_statements.get("ebitda", 1)
+        fs = financial_statements
+        market_cap = _get(fs, "market_cap")
+        net_income = _get(fs, "net_income")
+        total_equity = _get(fs, "total_equity")
+        ebitda = _get(fs, "ebitda")
 
-        pe = market_cap / net_income if net_income else 0
-        pb = market_cap / total_equity if total_equity else 0
-        ev_ebitda = market_cap / ebitda if ebitda else 0  # 简化，未考虑净债务
+        if not market_cap:
+            return {"说明": "缺少市值数据，无法计算估值比率"}
 
-        return {
-            "市盈率 (P/E)": round(pe, 2),
-            "市净率 (P/B)": round(pb, 2),
-            "EV/EBITDA": round(ev_ebitda, 2),
-        }
+        result = {}
+        if net_income:
+            result["市盈率 (P/E)"] = round(market_cap / net_income, 2)
+        else:
+            result["市盈率 (P/E)"] = "净利润为零或缺失"
+        if total_equity:
+            result["市净率 (P/B)"] = round(market_cap / total_equity, 2)
+        else:
+            result["市净率 (P/B)"] = "缺少净资产数据"
+        if ebitda:
+            result["EV/EBITDA"] = round(market_cap / ebitda, 2)  # 简化，未考虑净债务
+        else:
+            result["EV/EBITDA"] = "缺少EBITDA数据"
+        return result
     except Exception as e:
+        logger.error(f"计算估值比率失败: {e}")
         return {"错误": str(e)}
 
 
@@ -152,19 +191,23 @@ def calculate_growth_rates(
 
 
 @tool(args_schema=RatioInput)
-def perform_dupont_analysis(financial_statements: Dict) -> Dict[str, float]:
+def perform_dupont_analysis(financial_statements: Dict) -> Dict[str, object]:
     """
     杜邦分析：分解 ROE 为 净利率 × 资产周转率 × 权益乘数
     """
     try:
-        net_income = financial_statements.get("net_income", 0)
-        revenue = financial_statements.get("revenue", 1)
-        total_assets = financial_statements.get("total_assets", 1)
-        total_equity = financial_statements.get("total_equity", 1)
+        fs = financial_statements
+        net_income = _get(fs, "net_income")
+        revenue = _get(fs, "revenue")
+        total_assets = _get(fs, "total_assets")
+        total_equity = _get(fs, "total_equity")
 
-        net_margin = net_income / revenue if revenue else 0
-        asset_turnover = revenue / total_assets if total_assets else 0
-        equity_multiplier = total_assets / total_equity if total_equity else 0
+        if not revenue or not total_assets or not total_equity or net_income is None:
+            return {"说明": "缺少净利润/营收/总资产/净资产数据，无法做杜邦分解"}
+
+        net_margin = net_income / revenue
+        asset_turnover = revenue / total_assets
+        equity_multiplier = total_assets / total_equity
         roe = net_margin * asset_turnover * equity_multiplier
 
         return {
@@ -174,4 +217,5 @@ def perform_dupont_analysis(financial_statements: Dict) -> Dict[str, float]:
             "ROE (杜邦)": round(roe * 100, 2),
         }
     except Exception as e:
+        logger.error(f"杜邦分析失败: {e}")
         return {"错误": str(e)}

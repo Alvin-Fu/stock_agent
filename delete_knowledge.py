@@ -1,20 +1,29 @@
+"""
+删除远程 Chroma 中的知识库集合（用于解除向量维度冲突后重建）
+连接信息与集合名统一从配置读取，避免删错集合。
+"""
 import chromadb
 
-# 1. 连接到你的远程 Chroma (Docker 部署)
-client = chromadb.HttpClient(host='127.0.0.1', port=8000)
-
-# 2. 定义你要删除的集合名称
-collection_name = "collection_stock"
-
-
-
-# 3. (可选) 立即创建一个干净的同名集合
-# 注意：不需要手动指定维度，入库时第一个数据存入后会自动确定维度
+from utils.config import load_config
 
 if __name__ == "__main__":
-    try:
-        # 检查是否存在并删除
-        client.delete_collection(name=collection_name)
-        print(f"✅ 成功删除旧集合: {collection_name}，维度冲突已解除。")
-    except Exception as e:
-        print(f"⚠️ 删除失败或集合不存在: {e}")
+    cfg = load_config()
+    chroma_cfg = cfg.get("chroma_server", {})
+    collection_name = (
+        cfg.get("knowledge_bases", {}).get("kb_stock", {}).get("collection_name", "collection_stock")
+    )
+
+    client = chromadb.HttpClient(
+        host=chroma_cfg.get("host", "127.0.0.1"),
+        port=chroma_cfg.get("port", 8000),
+    )
+
+    confirm = input(f"即将删除远程 Chroma 集合「{collection_name}」，输入 yes 确认: ").strip().lower()
+    if confirm != "yes":
+        print("已取消")
+    else:
+        try:
+            client.delete_collection(name=collection_name)
+            print(f"✅ 成功删除旧集合: {collection_name}，维度冲突已解除。")
+        except Exception as e:
+            print(f"⚠️ 删除失败或集合不存在: {e}")

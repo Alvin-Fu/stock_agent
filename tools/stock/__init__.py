@@ -10,8 +10,8 @@
 3. 防封禁流控策略
 
 数据源优先级：
-1. AkshareFetcher (Priority 1) - 来自 akshare 库
-2. TushareFetcher (Priority 2) - 来自 tushare 库
+0. AkshareFetcher (Priority 0) - 主源，来自 akshare 库
+1. TushareFetcher (Priority 1) - 备用，来自 tushare 库
 """
 
 from .base import BaseFetcher, DataFetcherManager

@@ -110,7 +110,6 @@ class RetrieverAgent:
 
             return {
                 "documents": unique_docs,
-                "current_node": "retriever",
                 "intermediate_steps": [("retriever", {"query": question, "docs_count": len(unique_docs)})],
             }
         except Exception as e:

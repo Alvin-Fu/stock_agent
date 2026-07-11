@@ -36,11 +36,12 @@ def init_single_knowledge_base(kb_id: str, kb_config: dict):
         chunk_overlap=kb_config["chunk_overlap"]
     )
 
-    # 4. 🔥 写入远程 Docker Chroma（核心步骤）
+    # 4. 🔥 写入远程 Docker Chroma（rebuild=True：重跑脚本先清旧集合，避免重复堆积）
     create_remote_chroma(
         split_docs=split_docs,
         embedding_function=embeddings,
-        collection_name=kb_config["collection_name"]
+        collection_name=kb_config["collection_name"],
+        rebuild=True
     )
 
     logger.info(f"✅ {kb_config['name']} 写入 Chroma 完成！")

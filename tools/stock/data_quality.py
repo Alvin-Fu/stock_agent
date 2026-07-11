@@ -174,9 +174,12 @@ class DataValidator:
             errors = []
         
         if not is_valid:
-            # 检查错误严重程度
-            critical_errors = ['缺少必需列', '日期格式错误', '价格逻辑错误']
-            has_critical = any(error in critical_errors for error in errors)
+            # 检查错误严重程度（子串匹配，错误信息带具体上下文，精确相等永远匹配不上）
+            critical_keywords = ['缺少必需列', '格式错误', '异常数据']
+            has_critical = any(
+                any(keyword in error for keyword in critical_keywords)
+                for error in errors
+            )
             
             if has_critical:
                 return DataQualityLevel.INVALID
@@ -318,38 +321,27 @@ class DataCleaner:
     def remove_outliers(cls, df: pd.DataFrame, method: str = 'iqr') -> pd.DataFrame:
         """
         去除异常值
-        
+
+        注意：K线数据不做统计学离群过滤（IQR/Z-score 会把趋势股的真实高低价区、
+        重尾成交量当成"异常"整行删掉，导致均线/MACD 计算失真）。
+        这里只删除物理上不可能的行：
+        1. 价格列（open/high/low/close）<= 0
+        2. 最高价 < 最低价
+
         Args:
-            method: 'iqr'（四分位距）或 'zscore'（Z分数）
+            method: 保留参数以兼容旧调用方，当前不再使用
         """
         df = df.copy()
-        
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'amount', 'pct_chg']
-        cols_to_check = [col for col in numeric_cols if col in df.columns]
-        
-        for col in cols_to_check:
-            series = df[col]
-            
-            if method == 'iqr':
-                # IQR方法
-                q1 = series.quantile(0.25)
-                q3 = series.quantile(0.75)
-                iqr = q3 - q1
-                lower_bound = q1 - 1.5 * iqr
-                upper_bound = q3 + 1.5 * iqr
-                
-                # 只过滤极端异常值，保留合理范围内的数据
-                df = df[(df[col] >= lower_bound) & (df[col] <= upper_bound)]
-            
-            elif method == 'zscore':
-                # Z分数方法
-                mean = series.mean()
-                std = series.std()
-                z_scores = (series - mean) / std
-                
-                # 保留Z分数在-3到3之间的数据
-                df = df[(z_scores >= -3) & (z_scores <= 3)]
-        
+
+        # 价格必须为正数（NaN 保留，交给缺失值填充处理）
+        price_cols = [col for col in ['open', 'high', 'low', 'close'] if col in df.columns]
+        for col in price_cols:
+            df = df[df[col].isna() | (df[col] > 0)]
+
+        # 最高价不能低于最低价
+        if 'high' in df.columns and 'low' in df.columns:
+            df = df[df['high'].isna() | df['low'].isna() | (df['high'] >= df['low'])]
+
         return df
 
     @classmethod

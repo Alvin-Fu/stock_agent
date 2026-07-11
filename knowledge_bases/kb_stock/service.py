@@ -13,18 +13,9 @@ class StockKnowledge(BaseKnowledge):
     支持：股票知识、研报、行情文档、交易规则等
     """
     def __init__(self, config: dict):
-        # 1. 保存配置
-        self.config = config
-
-        # 2. 初始化 collection_name (修复之前的报错)
+        # 基类负责 self.config / self.name / self.vector_store
+        super().__init__(config)
         self.collection_name = config.get("collection_name", "stock_data")
-
-        # 3. 关键：初始化 vector_store 属性
-        # 你可以先设为 None，让 get_retriever 里的懒加载逻辑生效
-        self.vector_store = None
-
-        # 或者在这里直接初始化（取决于你的逻辑）
-        # self.vector_store = init_vector_store(self.collection_name)
 
     def load_and_split_documents(self):
         """

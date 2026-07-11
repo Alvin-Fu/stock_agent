@@ -40,22 +40,24 @@ class WorkflowExecutor:
             "technical_result": None,
             "final_answer": None,
             "intermediate_steps": [],
-            "next_agent": None,
+            "next_agents": [],
+            "confidence": None,
             "error": None,
             **kwargs
         }
 
-    def run_sync(self, question: str, thread_id: Optional[str] = None) -> AgentState:
+    def run_sync(self, question: str, thread_id: Optional[str] = None, **kwargs) -> AgentState:
         """
         同步执行工作流
         :param question: 用户问题
         :param thread_id: 会话 ID（用于多轮对话记忆）
+        :param kwargs: 额外初始状态字段（如 stock_code / industry_name）
         :return: 最终状态
         """
         if thread_id:
             self.thread_id = thread_id
 
-        initial_state = self._init_state(question)
+        initial_state = self._init_state(question, **kwargs)
         config = {"configurable": {"thread_id": self.thread_id}}
 
         logger.info(f"开始执行工作流，问题: {question[:50]}...")

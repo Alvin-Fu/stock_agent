@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-TushareFetcher - 备用数据源 1 (Priority 2)
+TushareFetcher - 备用数据源 (Priority 1)
 ===================================
 
 数据来源：Tushare Pro API（挖地兔）
@@ -19,6 +19,7 @@ import time
 import traceback
 from datetime import datetime
 from typing import Optional, Tuple
+import requests
 import tushare as ts
 from utils.config import get_stock_tools_config
 
@@ -37,8 +38,8 @@ from utils.logger import logger
 class TushareFetcher(BaseFetcher):
     """
     Tushare Pro 数据源实现
-    
-    优先级：2
+
+    优先级：1（备用数据源）
     数据来源：Tushare Pro API
     
     关键策略：
@@ -52,9 +53,9 @@ class TushareFetcher(BaseFetcher):
     """
     
     name = "TushareFetcher"
-    priority = 0
-    
-    def __init__(self, rate_limit_per_minute: int = 200):
+    priority = 1
+
+    def __init__(self, rate_limit_per_minute: int = 80):
         """
         初始化 TushareFetcher
         
@@ -173,7 +174,12 @@ class TushareFetcher(BaseFetcher):
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=30),
-        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        retry=retry_if_exception_type((
+            ConnectionError,
+            TimeoutError,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        )),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def _fetch_raw_data(self, freq: str, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -264,7 +270,9 @@ class TushareFetcher(BaseFetcher):
             if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
                 logger.warning(f"Tushare 配额可能超限: {e}")
                 raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            # 非配额异常也要抛出，让上层 DataFetcherManager 记录根因并降级
             logger.error(f"tushare 获取数据失败[{e}] {traceback.format_exc()}")
+            raise DataFetchError(f"Tushare 获取数据失败: {e}") from e
 
 
     def get_stock_basic(self) -> pd.DataFrame:
@@ -358,8 +366,9 @@ class TushareFetcher(BaseFetcher):
             df['date'] = pd.to_datetime(df['date'], format='%Y%m%d')
 
         # 成交量单位转换（Tushare 的 vol 单位是手，需要转换为股）
-        if 'vol' in df.columns:
-            df['volume'] = df['vol'] * 100
+        # 注意：上面已经把 vol rename 成 volume，这里必须判断/取 volume 列
+        if 'volume' in df.columns:
+            df['volume'] = df['volume'] * 100
 
         # 成交额单位转换（Tushare 的 amount 单位是千元，转换为元）
         if 'amount' in df.columns:

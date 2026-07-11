@@ -5,8 +5,10 @@ import yaml
 
 # 项目根目录（自动获取，避免路径错误）
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# 配置文件路径
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "local.yaml")
+# 配置文件路径：优先读 local.yaml（个人配置，不入库），没有则回退仓库自带的 config.yaml
+_LOCAL_CONFIG = os.path.join(PROJECT_ROOT, "local.yaml")
+_DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "config.yaml")
+CONFIG_PATH = _LOCAL_CONFIG if os.path.exists(_LOCAL_CONFIG) else _DEFAULT_CONFIG
 
 # 单例缓存（配置只加载一次，提升性能）
 _CONFIG_CACHE: Dict[str, Any] = None

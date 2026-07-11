@@ -10,7 +10,7 @@ from typing import List, Dict, Any
 
 from storage.sqlite.stock_storage import DatabaseManager
 from tools.stock_tools import stock_tool_instance
-from orchestration.graph import get_default_graph
+from orchestration.workflow import WorkflowExecutor
 from agents.base import AgentState
 from utils.constants import IntentType
 from utils.logger import logger
@@ -20,13 +20,13 @@ class ScheduledAnalyzer:
     """
     定时分析任务管理器
     """
-    
+
     def __init__(self):
         """
         初始化定时分析任务管理器
         """
         self.db = DatabaseManager.get_instance()
-        self.graph = get_default_graph(enable_memory=False)
+        self.executor = WorkflowExecutor(enable_memory=False)
         self.running = False
         self.thread = None
     
@@ -71,25 +71,10 @@ class ScheduledAnalyzer:
 
             # 3. 进行综合分析（使用多Agent协作图）
             logger.info(f"分析股票 {stock_code} 的财务数据和走势")
-            state: Dict[str, Any] = {
-                "question": f"分析{stock_code}的财务状况、投资价值和股票走势",
-                "stock_code": stock_code,
-                "industry_name": "",
-                "chain_leaders": [],
-                "intent": "",
-                "documents": [],
-                "financial_data": None,
-                "analysis_result": None,
-                "research_result": None,
-                "compliance_result": None,
-                "technical_result": None,
-                "final_answer": None,
-                "intermediate_steps": [],
-                "next_agent": None,
-                "error": None,
-                "messages": [],
-            }
-            result = self.graph.invoke(state)
+            self.executor.run_sync(
+                f"分析{stock_code}的财务状况、投资价值和股票走势",
+                stock_code=stock_code,
+            )
 
             logger.info(f"股票 {stock_code} 分析完成")
         except Exception as e:
@@ -127,25 +112,10 @@ class ScheduledAnalyzer:
             industry: 行业名称
         """
         logger.info(f"开始产业链选股分析: {industry}")
-        state: Dict[str, Any] = {
-            "question": f"分析{industry}产业链上下游，筛选出所有关键公司，对比技术面和基本面，选出最值得投资的1只股票",
-            "stock_code": "",
-            "industry_name": industry,
-            "chain_leaders": {},
-            "intent": IntentType.INDUSTRY_ANALYSIS,
-            "documents": [],
-            "financial_data": None,
-            "analysis_result": None,
-            "research_result": None,
-            "compliance_result": None,
-            "technical_result": None,
-            "final_answer": None,
-            "intermediate_steps": [],
-            "next_agent": "researcher",
-            "error": None,
-            "messages": [],
-        }
-        result = self.graph.invoke(state)
+        result = self.executor.run_sync(
+            f"分析{industry}产业链上下游，筛选出所有关键公司，对比技术面和基本面，选出最值得投资的1只股票",
+            industry_name=industry,
+        )
         logger.info(f"产业链选股分析完成: {industry}")
         return result
     
@@ -172,20 +142,20 @@ class ScheduledAnalyzer:
     
     def stop(self):
         """
-        停止定时任务
+        停止定时任务（不等待正在执行的分析结束，线程是 daemon）
         """
         self.running = False
         if self.thread:
-            self.thread.join()
+            self.thread.join(timeout=5)
         logger.info("定时分析任务已停止")
-    
+
     def _run_scheduler(self):
         """
         运行调度器
         """
         while self.running:
             schedule.run_pending()
-            time.sleep(60)  # 每分钟检查一次
+            time.sleep(1)  # 小步轮询，保证 stop() 能及时生效
 
 
 # 示例用法

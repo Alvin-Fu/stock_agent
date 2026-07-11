@@ -1,6 +1,6 @@
 from dateutil.utils import today
 
-from .stock.base import DataFetcherManager
+from .stock.base import DataFetcherManager, DataFetchError
 from storage.sqlite import get_db
 import pandas as pd
 from utils.logger import logger
@@ -29,6 +29,52 @@ class StockTools:
         self.data_manager = DataFetcherManager([self.tushare, self.akshare])
         self.db = get_db()
 
+    def _has_qfq_drift(self, old_df: pd.DataFrame, new_df: pd.DataFrame, rel_tol: float = 1e-4) -> bool:
+        """
+        前复权基准漂移检测。
+
+        增量拉取的区间从库内最新一天开始（包含重叠行），比较该重叠日新旧收盘价：
+        相对误差超过容差即认为发生分红送转导致 qfq 全历史价格基准变化，
+        库里旧段与新段基准不一致，需要删除旧数据全量重拉。
+        """
+        try:
+            if old_df is None or old_df.empty or new_df is None or new_df.empty:
+                return False
+            if 'date' not in old_df.columns or 'date' not in new_df.columns or 'close' not in old_df.columns:
+                return False
+            # 库内最新一天即重叠日（get_all_*_data 按日期降序返回，iloc[0] 为最新）
+            overlap_date = parse_row_date(old_df.iloc[0].get('date'))
+            old_close = old_df.iloc[0].get('close')
+            if overlap_date is None or old_close is None or pd.isna(old_close):
+                return False
+            # 合并结果中重叠日的行保留的是新拉取的数据（merge 时 keep="last"）
+            new_dates = new_df['date'].apply(parse_row_date)
+            matched = new_df[new_dates == overlap_date]
+            if matched.empty:
+                return False
+            new_close = matched.iloc[0].get('close')
+            if new_close is None or pd.isna(new_close):
+                return False
+            old_close = float(old_close)
+            new_close = float(new_close)
+            if old_close == 0:
+                return False
+            drift = abs(new_close - old_close) / abs(old_close)
+            if drift > rel_tol:
+                logger.warning(f"重叠日 {overlap_date} 收盘价漂移: 库内[{old_close}] vs 新拉取[{new_close}]，相对误差[{drift:.6f}]")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"复权漂移校验异常，跳过校验: {e} {traceback.format_exc()}")
+            return False
+
+    def _get_full_reload_start_date(self, stock_code: str, fallback: date) -> date:
+        """全量重拉时的起始日期：优先用股票上市日期，取不到则退回原起始日期"""
+        full_start = self.get_stock_start_date_by_stock_basic(stock_code)
+        if full_start is None:
+            return fallback
+        return full_start
+
     def fetch_and_save_stock_daily_data(self, stock_code: str)-> Union[pd.DataFrame, None]:
         """
         获取股票每日数据
@@ -55,10 +101,30 @@ class StockTools:
         if end_date_str == start_date_str:
             logger.info(f"股票[{stock_code}]数据已经更新完成")
             return  old_daily_data
-        daily_datas,  fetcher_name = self.data_manager.get_daily_data(stock_code, old_daily_data, start_date_str, end_date_str)
+        try:
+            daily_datas,  fetcher_name = self.data_manager.get_daily_data(stock_code, old_daily_data, start_date_str, end_date_str)
+        except DataFetchError as e:
+            # 所有数据源都失败：库里已有历史数据时回退本地缓存，而不是直接报失败
+            if old_daily_data is not None and not old_daily_data.empty:
+                latest_date = parse_row_date(old_daily_data.iloc[0].get('date'))
+                logger.warning(f"股票[{stock_code}]数据源不可用，使用本地缓存（截至 {latest_date} 日）")
+                return old_daily_data
+            logger.error(f"获取股票[{stock_code}]数据失败且本地无缓存: {e}")
+            return None
         if daily_datas is None or daily_datas.empty:
             logger.error(f"获取股票[{stock_code}]数据为空")
             return  old_daily_data
+        # 前复权基准漂移校验：分红送转后 qfq 全历史价变化，旧段与新段基准不一致
+        if self._has_qfq_drift(old_daily_data, daily_datas):
+            logger.warning(f"股票[{stock_code}]检测到前复权基准漂移，全量重拉日线数据")
+            start_date = self._get_full_reload_start_date(stock_code, start_date)
+            start_date_str = start_date.strftime("%Y-%m-%d")
+            daily_datas, fetcher_name = self.data_manager.get_daily_data(stock_code, pd.DataFrame(), start_date_str, end_date_str)
+            if daily_datas is None or daily_datas.empty:
+                logger.error(f"股票[{stock_code}]全量重拉数据为空，保留原有数据")
+                return old_daily_data
+            # 重拉成功后再删除旧数据，避免拉取失败导致本地数据丢失
+            self.db.delete_daily_data(stock_code)
         save_count = self.db.save_daily_data(daily_datas, stock_code, start_date, fetcher_name)
         logger.info(f"保存的数据为[{save_count}]")
         return daily_datas
@@ -87,10 +153,30 @@ class StockTools:
         if end_date_str == start_date_str:
             logger.info(f"股票[{stock_code}]数据已经更新完成")
             return  old_monthly_data
-        monthly_datas,  fetcher_name = self.data_manager.get_monthly_data(stock_code, old_monthly_data, start_date_str, end_date_str)
+        try:
+            monthly_datas,  fetcher_name = self.data_manager.get_monthly_data(stock_code, old_monthly_data, start_date_str, end_date_str)
+        except DataFetchError as e:
+            # 所有数据源都失败：库里已有历史数据时回退本地缓存，而不是直接报失败
+            if old_monthly_data is not None and not old_monthly_data.empty:
+                latest_date = parse_row_date(old_monthly_data.iloc[0].get('date'))
+                logger.warning(f"股票[{stock_code}]数据源不可用，使用本地缓存（截至 {latest_date} 日）")
+                return old_monthly_data
+            logger.error(f"获取股票[{stock_code}]数据失败且本地无缓存: {e}")
+            return None
         if monthly_datas is None or monthly_datas.empty:
             logger.error(f"获取股票[{stock_code}]数据为空")
             return  old_monthly_data
+        # 前复权基准漂移校验：分红送转后 qfq 全历史价变化，旧段与新段基准不一致
+        if self._has_qfq_drift(old_monthly_data, monthly_datas):
+            logger.warning(f"股票[{stock_code}]检测到前复权基准漂移，全量重拉月线数据")
+            start_date = self._get_full_reload_start_date(stock_code, start_date)
+            start_date_str = start_date.strftime("%Y-%m-%d")
+            monthly_datas, fetcher_name = self.data_manager.get_monthly_data(stock_code, pd.DataFrame(), start_date_str, end_date_str)
+            if monthly_datas is None or monthly_datas.empty:
+                logger.error(f"股票[{stock_code}]全量重拉数据为空，保留原有数据")
+                return old_monthly_data
+            # 重拉成功后再删除旧数据，避免拉取失败导致本地数据丢失
+            self.db.delete_month_data(stock_code)
         save_count = self.db.save_month_data(monthly_datas, stock_code, start_date, fetcher_name)
         logger.info(f"保存的数据为[{save_count}]")
         return monthly_datas
@@ -120,10 +206,30 @@ class StockTools:
         if end_date_str == start_date_str:
             logger.info(f"股票[{stock_code}]数据已经更新完成")
             return  old_weekly_data
-        weekly_datas,  fetcher_name = self.data_manager.get_weekly_data(stock_code, old_weekly_data, start_date_str, end_date_str)
+        try:
+            weekly_datas,  fetcher_name = self.data_manager.get_weekly_data(stock_code, old_weekly_data, start_date_str, end_date_str)
+        except DataFetchError as e:
+            # 所有数据源都失败：库里已有历史数据时回退本地缓存，而不是直接报失败
+            if old_weekly_data is not None and not old_weekly_data.empty:
+                latest_date = parse_row_date(old_weekly_data.iloc[0].get('date'))
+                logger.warning(f"股票[{stock_code}]数据源不可用，使用本地缓存（截至 {latest_date} 日）")
+                return old_weekly_data
+            logger.error(f"获取股票[{stock_code}]数据失败且本地无缓存: {e}")
+            return None
         if weekly_datas is None or weekly_datas.empty:
             logger.error(f"获取股票[{stock_code}]数据为空")
             return  old_weekly_data
+        # 前复权基准漂移校验：分红送转后 qfq 全历史价变化，旧段与新段基准不一致
+        if self._has_qfq_drift(old_weekly_data, weekly_datas):
+            logger.warning(f"股票[{stock_code}]检测到前复权基准漂移，全量重拉周线数据")
+            start_date = self._get_full_reload_start_date(stock_code, start_date)
+            start_date_str = start_date.strftime("%Y-%m-%d")
+            weekly_datas, fetcher_name = self.data_manager.get_weekly_data(stock_code, pd.DataFrame(), start_date_str, end_date_str)
+            if weekly_datas is None or weekly_datas.empty:
+                logger.error(f"股票[{stock_code}]全量重拉数据为空，保留原有数据")
+                return old_weekly_data
+            # 重拉成功后再删除旧数据，避免拉取失败导致本地数据丢失
+            self.db.delete_week_data(stock_code)
         save_count = self.db.save_week_data(weekly_datas, stock_code, start_date, fetcher_name)
         logger.info(f"保存的数据为[{save_count}]")
         return weekly_datas
@@ -279,25 +385,27 @@ class StockTools:
             return  df
         logger.warning(f"获取的数据[{df.head(1)}]")
         try:
-            pdf_name_m, analyze_list = self.db.get_financial_analyze(code)
+            # get_financial_analyze 返回 (记录列表, pdf_name映射)，注意顺序
+            analyze_list, pdf_name_m = self.db.get_financial_analyze(code)
 
             logger.warning(f"已存在的研报[{pdf_name_m}]")
-            need_analyze_list = pd.DataFrame(columns=["pdf_name", "pdf_url", "content", "code", "report_date"])
+            # pandas 2.x 已移除 DataFrame.append，用列表收集后统一构建 DataFrame
+            need_analyze_rows = []
             for _, row in df.iterrows():
                 report_date = row.get("date")
                 if report_date is None:
                     logger.error(f"[{code}] 研报[{report_date}]无日期")
                     continue
                 report_date = parse_row_date(report_date)
+                if report_date is None:
+                    logger.error(f"[{code}] 研报日期解析失败[{row.get('date')}]")
+                    continue
 
-                half_year_ago = date.today() - timedelta(days=2)
+                half_year_ago = date.today() - timedelta(days=182)
 
                 # 如果研报日期早于半年前，跳过
                 if report_date < half_year_ago:
                     logger.debug(f"[{code}] 研报 {pdf_name_m} 日期 ({report_date}) 早于 ({half_year_ago})，已忽略")
-                    continue
-
-                if report_date in pdf_name_m:
                     continue
 
                 pdf_url = row.get("report_pdf_link")
@@ -315,7 +423,7 @@ class StockTools:
                 if content is None:
                     logger.error(f"[{code}] 获取股票研报内容失败")
                     continue
-                need_analyze_list.append(
+                need_analyze_rows.append(
                     {
                         "pdf_name": pdf_name,
                         "pdf_url": pdf_url,
@@ -325,9 +433,7 @@ class StockTools:
                     }
                 )
 
-
-
-            return need_analyze_list
+            return pd.DataFrame(need_analyze_rows, columns=["pdf_name", "pdf_url", "content", "code", "report_date"])
         except Exception as e:
             logger.error(f"处理股票研报数据错误[{e}] {traceback.format_exc()}")
             return  df

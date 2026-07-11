@@ -1,72 +1,74 @@
+# =====================================================================
+# 配置模板：真实密钥请复制本文件为 local.yaml 再填写（local.yaml 不入库，优先加载）
+# =====================================================================
+
 # 全局模型配置
 models:
+  # DeepSeek（LLMFactory 主用）：models.deepseek.api_key / url
   deepseek:
-    api_key: ""
-    url: ""
+    api_key: ""                          # 必填：DeepSeek API key
+    url: "https://api.deepseek.com/v1"
+  # 本地/远程 Ollama：models.ollama.url
   ollama:
     api_key: ""
-    url: ""
-  embedding:
-    api_key: ""
-    url: ""
-  brain_model: "deepseek-reasoner"
-  deepseek_model_url: "http://api.deepseek.com/v1"
-  deepseek_token: ""
-  ollama_model_url: "http://ip:port"
-  embedding_model: "qwen3.5:9b"  # 本地向量模型
-  llm_model: "qwen3.5:9b"               # 本地大模型
+    url: "http://127.0.0.1:11434"
+  brain_model: "deepseek-reasoner"       # get_ds 使用
+  llm_model: "qwen3.5:9b"                # get_llm（Ollama）使用
   device: "cpu"
 
+# 嵌入模型（远程 Ollama）：embedding.model / url
 embedding:
   model: "bge-m3:latest"
-  url: "http://ip:port"
+  url: "http://127.0.0.1:11434"
 
+# 远程 Docker Chroma 服务
+chroma_server:
+  host: "127.0.0.1"
+  port: 8000
+  ssl: false
+
+# 检索配置
 retriever:
   top_k: 3
-  model: "deepseek-r1:14b"
-  url: "http://ip:port"
-  use_reranker: true
-  reranker_model: "deepseek-r1:14b"
+  use_reranker: false                    # 开启前先配置真实的 CrossEncoder 模型
+  reranker_model: "BAAI/bge-reranker-base"  # 注意：必须是 CrossEncoder 模型，不能填 Ollama LLM 名
 
 # 多知识库配置（新增知识库只需在这里加配置）
 knowledge_bases:
+  kb_stock:
+    name: "股票知识库"
+    data_path: "./data/kb_stock"
+    collection_name: "collection_stock"
+    chunk_size: 500
+    chunk_overlap: 50
   kb_product:
     name: "产品文档知识库"
     data_path: "./data/kb_product"
-    chroma_path: "./storage/chroma/kb_product"
+    collection_name: "collection_product"
     chunk_size: 500
     chunk_overlap: 50
   kb_technical:
     name: "技术文档知识库"
     data_path: "./data/kb_technical"
-    chroma_path: "./storage/chroma/kb_technical"
+    collection_name: "collection_technical"
     chunk_size: 600
     chunk_overlap: 60
 
 # 多Agent配置
 agents:
-  qa_agent:
-    name: "问答智能体"
-    description: "基于知识库回答问题"
-  summary_agent:
-    name: "总结智能体"
-    description: "总结文档内容"
   router_agent:
     name: "路由智能体"
-    description: "自动分配问题到对应知识库"
+    description: "大脑：任务拆解与分派"
 
-# 末尾添加
-tushare:
-  token: "你的tushare token"  # 去 tushare.pro 官网申请
-
-# 工具配置
+# 工具配置（tushare token 读的是 tools.stock.tushare_token）
 tools:
-  enable_akshare: true
-  enable_tushare: true
+  stock:
+    tushare_token: ""                    # 去 tushare.pro 官网申请
 
 database:
   sqlite_path: "./data/sqlite/stock.db"
 
+# 联网搜索（填了 tavily_api_key 用 Tavily，否则用 DuckDuckGo）
 search:
   tavily_api_key: ""
   serpapi_api_key: ""

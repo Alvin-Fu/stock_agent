@@ -1,8 +1,6 @@
 from knowledge_bases.kb_stock.service import StockKnowledge
 from utils.config import load_config
 
-config = load_config()
-KB_CONFIG = config["knowledge_bases"]
 
 class KnowledgeRegistry:
     """🌟 统一管理所有知识库：调用时直接获取"""
@@ -17,5 +15,8 @@ class KnowledgeRegistry:
 
     @staticmethod
     def _init_all():
-        """初始化所有知识库"""
-        KnowledgeRegistry._instances["kb_stock"] = StockKnowledge(KB_CONFIG["kb_stock"])
+        """初始化所有知识库（延迟读配置，缺 kb_stock 段时给出明确报错）"""
+        kb_config = load_config().get("knowledge_bases", {})
+        if "kb_stock" not in kb_config:
+            raise KeyError("配置缺少 knowledge_bases.kb_stock 段，请在 config.yaml 或 local.yaml 中补充")
+        KnowledgeRegistry._instances["kb_stock"] = StockKnowledge(kb_config["kb_stock"])

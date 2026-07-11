@@ -429,13 +429,21 @@ class BaseFetcher(ABC):
         - Volume_Ratio: 量比（今日成交量 / 5日平均成交量）
         """
         df = df.copy()
+        # 所有指标（MACD/均线/量比）必须在按日期升序的序列上计算，
+        # 否则 rolling/ewm/shift 取到的是"未来"数据
+        if 'date' in df.columns:
+            df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
         df = self._calculate_macd_signal(df)
         df = self.calculate_ma_ema(df, "close")
 
-        # 量比：当日成交量 / 5日平均成交量
+        # 量比：当日成交量 / 前5日平均成交量（升序数据上 shift(1) 才是历史均量）
         avg_volume_5 = df['volume'].rolling(window=5, min_periods=1).mean()
         df['volume_ratio'] = df['volume'] / avg_volume_5.shift(1)
         df['volume_ratio'] = df['volume_ratio'].fillna(1.0).round(2)
+
+        # 全部指标计算完成后再按日期降序排列（仅用于展示，最新数据在前）
+        if 'date' in df.columns:
+            df = df.sort_values(by='date', ascending=False).reset_index(drop=True)
         logger.info(f"calculate indicators success")
         return df
 
@@ -474,7 +482,8 @@ class BaseFetcher(ABC):
             ema = df[price_col].ewm(span=period, adjust=False).mean().round(2)
             key = f'ema{period}'
             df[key] = ema
-        df = df.sort_values(by='date', ascending=False).reset_index(drop=True)
+        # 注意：这里保持升序返回，后续量比等指标仍需在升序序列上计算，
+        # 统一由 _calculate_indicators 最后再做展示排序
         return df
 
     def _calculate_macd_signal(
@@ -543,11 +552,8 @@ class DataFetcherManager:
         初始化默认数据源列表
 
         按优先级排序：
-        0. EfinanceFetcher (Priority 0) - 最高优先级
-        1. AkshareFetcher (Priority 1)
-        2. TushareFetcher (Priority 2)
-        3. BaostockFetcher (Priority 3)
-        4. YfinanceFetcher (Priority 4)
+        0. AkshareFetcher (Priority 0) - 主源
+        1. TushareFetcher (Priority 1) - 备用
         """
         from .akshare_fetcher import AkshareFetcher
         from .tushare_fetcher import TushareFetcher
