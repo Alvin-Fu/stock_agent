@@ -235,8 +235,8 @@ class StockTools:
         return weekly_datas
 
     def fetch_and_save_stock_basic_daily(self, stock_code: str)-> Union[pd.DataFrame, None]:
-        """"
-        获取股票的基本信息每日指标
+        """
+        获取并保存股票的每日指标（PE/PB/市值等，供财务分析计算估值比率）
         """
         if stock_code is None:
             logger.error(f"code is null")
@@ -244,13 +244,26 @@ class StockTools:
         today = date.today()
         old_basic_data = self.db.get_latest_daily_basic_data(stock_code, 10)
         start_date = self.get_basic_daily_start_date(stock_code, old_basic_data)
+        if start_date is None:
+            logger.error(f"无法获取股票[{stock_code}]每日指标的起始日期")
+            return old_basic_data
         end_date_str = today.strftime("%Y-%m-%d")
         start_date_str = start_date.strftime("%Y-%m-%d")
         if end_date_str == start_date_str:
-            logger.info(f"股票[{stock_code}]数据已经更新完成")
-            return  old_basic_data
-        new_basic_daily = self.tushare.stock_daily_basic( start_date=start_date_str, end_date=end_date_str, stock_code=stock_code)
-        return old_basic_data
+            logger.info(f"股票[{stock_code}]每日指标已经更新完成")
+            return old_basic_data
+        try:
+            new_basic_daily = self.tushare.stock_daily_basic(
+                start_date=start_date_str, end_date=end_date_str, stock_code=stock_code)
+        except Exception as e:
+            logger.warning(f"股票[{stock_code}]每日指标获取失败，回退本地缓存: {e}")
+            return old_basic_data
+        if new_basic_daily is None or new_basic_daily.empty:
+            logger.info(f"股票[{stock_code}]每日指标无新数据")
+            return old_basic_data
+        saved = self.db.save_stock_daily_basic(new_basic_daily, stock_code)
+        logger.info(f"股票[{stock_code}]每日指标保存 {saved} 条")
+        return new_basic_daily
 
     def get_daily_start_date(
             self,
@@ -322,7 +335,8 @@ class StockTools:
         if stock_code is None:
             logger.error(f"code is null")
             return None
-        if  len(old_basic_daily_data) == 0 or old_basic_daily_data[0].date is None:
+        if old_basic_daily_data is None or old_basic_daily_data.empty \
+                or old_basic_daily_data.iloc[0].get('trade_date') is None:
             start_date = self.get_stock_start_date_by_stock_basic(stock_code)
             if start_date is None :
                 logger.error(f"股票的基本信息为空通过接口获取数据[{stock_code}]")
@@ -330,7 +344,7 @@ class StockTools:
                 self.save_stock_basic_by_tushare()
                 start_date = self.get_stock_start_date_by_stock_basic(stock_code)
             return start_date
-        return old_basic_daily_data.iloc[0].get('date')
+        return parse_row_date(old_basic_daily_data.iloc[0].get('trade_date'))
 
 
     def get_stock_start_date_by_stock_basic(self, code: str) -> Union[date, None]:
@@ -420,8 +434,8 @@ class StockTools:
                     logger.error(f"[{code}] 下载股票研报失败[{res.get('error')}]")
                     continue
                 content = res.get("file_content")
-                if content is None:
-                    logger.error(f"[{code}] 获取股票研报内容失败")
+                if not content:
+                    logger.error(f"[{code}] 研报[{pdf_name}]文本提取为空（检查 PyPDF2 是否安装/是否扫描版PDF），跳过分析")
                     continue
                 need_analyze_rows.append(
                     {

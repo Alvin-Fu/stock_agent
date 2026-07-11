@@ -2711,11 +2711,12 @@ class DatabaseManager:
             else:
                 file_path = pdf_path / filename
 
-            # 检查文件是否已存在
+            # 检查文件是否已存在（已存在也要提取文本，否则下游拿不到 file_content）
             if file_path.exists():
                 result['success'] = True
                 result['file_path'] = str(file_path)
                 result['file_size'] = file_path.stat().st_size
+                result['file_content'] = self.extract_text_from_pdf_content(file_path.read_bytes()) or ""
                 logger.info(f"PDF文件已存在: {file_path}")
                 return result
 
@@ -2745,13 +2746,14 @@ class DatabaseManager:
                 result['error'] = "下载的文件为空"
                 logger.error(result['error'])
                 return result
-            content = self.extract_text_from_pdf_content(file_content)
+            # 文本提取失败（如未装 PyPDF2、扫描版 PDF）不影响下载结果本身
+            content = self.extract_text_from_pdf_content(file_content) or ""
             result['success'] = True
             result['file_path'] = str(file_path)
             result['file_size'] = file_size
             result['file_content'] = content
 
-            logger.info(f"PDF下载成功: {file_path} {len(content)}({file_size} bytes)")
+            logger.info(f"PDF下载成功: {file_path} 提取文本{len(content)}字符({file_size} bytes)")
         except Exception as e:
             result['error'] = f"下载失败: {e}"
             logger.error(result['error'])
@@ -2776,7 +2778,7 @@ class DatabaseManager:
 
             # 读取 PDF
             reader = PyPDF2.PdfReader(pdf_file)
-            print(f"[PDF 提取] 共 {len(reader.pages)} 页")
+            logger.info(f"[PDF 提取] 共 {len(reader.pages)} 页")
 
             # 提取前几页的内容（避免 token 超限）
             max_pages = min(len(reader.pages), 10)
@@ -2786,21 +2788,20 @@ class DatabaseManager:
                 text = page.extract_text()
                 if text:
                     text_content.append(f"=== 第 {i + 1} 页 ===\n{text}")
-                    print(f"[PDF 提取] 第 {i + 1} 页提取成功，{len(text)} 字符")
                 else:
-                    print(f"[PDF 提取] 第 {i + 1} 页无法提取文本（可能是图片或扫描版）")
+                    logger.debug(f"[PDF 提取] 第 {i + 1} 页无法提取文本（可能是图片或扫描版）")
 
             # 合并为字符串
             full_text = "\n\n".join(text_content)
-            print(f"[PDF 提取] 总共提取 {len(full_text)} 字符")
+            logger.info(f"[PDF 提取] 总共提取 {len(full_text)} 字符")
 
             return full_text
 
         except ImportError:
-            print("[PDF 提取] 未安装 PyPDF2，请运行：pip install PyPDF2")
+            logger.error("[PDF 提取] 未安装 PyPDF2，请运行：pip install PyPDF2（文本提取跳过，不影响 PDF 下载）")
             return None
         except Exception as e:
-            print(f"[PDF 提取] 提取失败：{e}")
+            logger.error(f"[PDF 提取] 提取失败：{e}")
             return None
 
     def  is_valid_pdf_filename(self, filename):

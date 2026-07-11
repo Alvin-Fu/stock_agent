@@ -52,6 +52,14 @@ class AnalystAgent:
     def _fetch_real_financial_data(self, stock_code: str) -> Dict[str, Any]:
         """从数据库/Tushare 拉取真实财务报表数据"""
         result = {"income": "", "balance_sheet": "", "parsed": {}}
+
+        # 先更新每日指标（PE/PB/市值），估值比率依赖它；失败不阻断其余分析
+        try:
+            from tools.stock_tools import stock_tool_instance
+            stock_tool_instance.fetch_and_save_stock_basic_daily(stock_code)
+        except Exception as e:
+            logger.warning(f"更新每日指标失败（不影响其余分析）: {e}")
+
         try:
             income_text = call_fetch_income_data(stock_code)
             if income_text and "未获取到" not in income_text:
@@ -90,6 +98,10 @@ class AnalystAgent:
             income_df = self.db.get_stock_income(stock_code)
             if income_df is not None and not income_df.empty:
                 latest = income_df.iloc[0]
+                # 报告期：让 LLM 知道数据是哪一期的，才能正确表述同比/环比
+                report_date = latest.get("report_date")
+                if report_date is not None:
+                    parsed["report_period"] = str(report_date)
                 for src, dst in [("total_revenue", "revenue"), ("net_profit", "net_income"),
                                  ("operating_profit", "operating_profit")]:
                     value = _num(latest, src)
@@ -160,7 +172,9 @@ class AnalystAgent:
         return results
 
     def _build_system_prompt(self) -> str:
-        return """你是一位资深财务分析师（CFA），拥有 15 年上市公司财报分析经验。
+        today = date.today().strftime("%Y-%m-%d")
+        return f"""你是一位资深财务分析师（CFA），拥有 15 年上市公司财报分析经验。
+今天的日期是 {today}，请以此为时间基准表述"最新/近期"。
 
 请基于下方提供的真实财务报表数据和研报观点，进行专业解读。
 
@@ -168,11 +182,17 @@ class AnalystAgent:
 1. 优先使用真实财务报表数据（利润表/资产负债表），这是定量依据
 2. 研报观点作为定性补充，用于理解市场预期和分析师观点
 3. 重要数据变化（>10%）需特别标注
-4. 财务比率结合行业特征解读（如金融业不适用流动比率）
-5. 避免给出投资建议，仅做客观分析
+4. 财务比率必须结合行业特征解读：
+   - 资产负债率要区分有息负债与经营性占款（如车企/零售的应付账款是无息占用上游资金，
+     高负债率不等于高杠杆风险，不要直接定性为"高杠杆运营风险高"）
+   - 金融业不适用流动比率；制造业/车企流动比率常年低于1属行业常态
+5. 数据中标注"缺少XX数据"的项：直接说明缺失，禁止估算或用行业均值代替
+6. 每个定性结论必须有对应数据支撑，禁止使用与数据矛盾的模板化表述
+   （例如：单车均价上涨时不得使用"以价换量"的说法）
+7. 避免给出投资建议，仅做客观分析
 
 【输出要求】
-- 先总览（最新报告期的核心财务指标）
+- 先总览（明确标注报告期，如"2026年一季报"）
 - 再逐项解读：盈利能力、偿债能力、成长能力、运营效率
 - 结合研报观点做定性补充
 - 最后给出总结性观点"""

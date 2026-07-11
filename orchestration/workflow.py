@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage
 
 from agents.base import AgentState
 from .graph import get_default_graph
+from utils.common import sanitize_text
 from utils.logger import logger
 
 
@@ -24,7 +25,8 @@ class WorkflowExecutor:
         self.thread_id = "default"
 
     def _init_state(self, question: str, **kwargs) -> AgentState:
-        """初始化状态"""
+        """初始化状态（入口统一清洗非法 Unicode，防 surrogates not allowed）"""
+        question = sanitize_text(question)
         return {
             "messages": [HumanMessage(content=question)],
             "question": question,

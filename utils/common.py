@@ -1,7 +1,25 @@
+import unicodedata
 from datetime import datetime
 import pandas as pd
 
 TASK_NAME_DAILY_TASK = "daily_task"
+
+
+def sanitize_text(text: str) -> str:
+    """
+    清理终端输入中的非法 Unicode（如 surrogate 半字符 \\udce5）。
+    这类字符会让 logging 和 LLM 请求在 utf-8 编码时直接抛
+    UnicodeEncodeError: surrogates not allowed。
+    """
+    if not text:
+        return text
+    # encode('utf-8', 'ignore') 会丢弃孤立的 surrogate 字符
+    cleaned = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    try:
+        cleaned = unicodedata.normalize("NFKC", cleaned)
+    except Exception:
+        pass
+    return cleaned
 
 def parse_row_date(row_date):
     if isinstance(row_date, str):
