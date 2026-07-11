@@ -1,5 +1,4 @@
 # core/vector_store.py
-from langchain_chroma import Chroma  # 建议使用新包名
 from utils.config import load_config
 from utils.logger import logger
 
@@ -20,6 +19,8 @@ def get_remote_chroma_client(collection_name: str, embedding_function):
     :return: Chroma 客户端实例
     """
     try:
+        # 延迟导入：未安装 langchain-chroma 时不影响纯分析链路的 import
+        from langchain_chroma import Chroma
         server_cfg = _get_chroma_server_cfg()
         # 🔥 关键：远程连接 Docker Chroma（无本地路径，只用IP+端口）
         chroma_client = Chroma(

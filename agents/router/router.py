@@ -155,7 +155,8 @@ class RouterAgent:
         has_technical = any(kw in question_lower for kw in ["均线", "macd", "k线", "走势", "金叉", "死叉"])
         has_realtime = any(kw in question_lower for kw in ["股价", "新闻", "最新", "实时", "今天", "公告"])
 
-        if is_industry and not is_stock_analysis:
+        # 行业/产业链关键词优先：这类问题通常也含"分析"等个股词，不能被个股分支劫走
+        if is_industry:
             return {
                 "intent": IntentType.INDUSTRY_ANALYSIS,
                 "industry_name": question,
