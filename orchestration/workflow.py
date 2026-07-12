@@ -80,7 +80,9 @@ class WorkflowExecutor:
                 if snap_answer:
                     if snap_code and "," not in snap_code:
                         from monitoring.review import snapshot_analysis_async
-                        snapshot_analysis_async(snap_code, question, snap_answer)
+                        snapshot_analysis_async(
+                            snap_code, question, snap_answer,
+                            trade_plan=(final_state.get("technical_result") or {}).get("trade_plan"))
                     elif snap_industry and "," in snap_code:
                         from monitoring.review import snapshot_industry_analysis_async
                         codes = [c.strip() for c in snap_code.split(",") if c.strip()]
@@ -95,6 +97,8 @@ class WorkflowExecutor:
             except Exception as e:
                 logger.warning(f"分析快照留档触发失败（不影响本次回答）: {e}")
 
+            self._archive_report(question, final_state)
+
             logger.debug(f"最终状态: {final_state}")
             return final_state
         except Exception as e:
@@ -102,6 +106,27 @@ class WorkflowExecutor:
             initial_state["error"] = str(e)
             initial_state["final_answer"] = f"系统处理出错：{e}"
             return initial_state
+
+    @staticmethod
+    def _archive_report(question: str, final_state) -> None:
+        """把最终报告存 data/reports/ 下的 markdown（横向对比与复盘引用用），失败不影响回答"""
+        try:
+            answer = final_state.get("final_answer") or ""
+            if not answer.strip():
+                return
+            import os
+            import re as _re
+            from datetime import datetime as _dt
+            os.makedirs("./data/reports", exist_ok=True)
+            code = final_state.get("stock_code") or ""
+            tag = final_state.get("industry_name") or (code.replace(",", "_") if code else "query")
+            tag = _re.sub(r"[^\w一-鿿_-]", "", str(tag))[:40] or "query"
+            path = f"./data/reports/{_dt.now().strftime('%Y%m%d_%H%M%S')}_{tag}.md"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"# {question}\n\n> 生成时间：{_dt.now().strftime('%Y-%m-%d %H:%M')}\n\n{answer}\n")
+            logger.info(f"报告已归档: {path}")
+        except Exception as e:
+            logger.warning(f"报告归档失败（不影响本次回答）: {e}")
 
     async def run_async(self, question: str, thread_id: Optional[str] = None) -> AgentState:
         """

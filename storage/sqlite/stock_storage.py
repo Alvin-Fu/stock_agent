@@ -945,6 +945,7 @@ class AnalysisSnapshot(Base):
     resistance = Column(Text)  # 压力位列表 JSON
     key_reasons = Column(Text)  # 核心理由列表 JSON
     indicators = Column(Text)  # 当时关键指标快照 JSON（ma_pattern/rsi6/pos_52w等）
+    trade_plan = Column(Text)  # 当时的程序操作参考 JSON（方向/观察区/止损/目标），条件触发提醒用
     review_done = Column(Integer, nullable=False, default=0)  # 是否已自动复盘
     created_at = Column(DateTime, default=datetime.now, index=True)
 
@@ -961,6 +962,7 @@ class AnalysisSnapshot(Base):
             'resistance': self.resistance,
             'key_reasons': self.key_reasons,
             'indicators': self.indicators,
+            'trade_plan': self.trade_plan,
             'review_done': bool(self.review_done),
             'created_at': self.created_at,
         }
@@ -1381,6 +1383,14 @@ class DatabaseManager:
                         conn.execute(text('ALTER TABLE industry_snapshot ADD COLUMN valuation TEXT'))
                         conn.commit()
                         logger.info("industry_snapshot 表补充 valuation 列（行业估值指标 JSON）")
+
+                # analysis_snapshot：旧表缺 trade_plan 列时补齐（条件触发提醒用）
+                if 'analysis_snapshot' in table_names:
+                    asnap_cols = [c['name'] for c in inspector.get_columns('analysis_snapshot')]
+                    if 'trade_plan' not in asnap_cols:
+                        conn.execute(text('ALTER TABLE analysis_snapshot ADD COLUMN trade_plan TEXT'))
+                        conn.commit()
+                        logger.info("analysis_snapshot 表补充 trade_plan 列（程序操作参考 JSON）")
 
                 # stock_income：旧表缺四项费用列时用 ALTER TABLE 补齐（有数据不能 DROP 重建）
                 if 'stock_income' in table_names:

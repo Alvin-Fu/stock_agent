@@ -25,6 +25,28 @@ from agents.responder.responder_agent import create_responder_node
 from utils.logger import logger
 
 
+def _make_checkpointer():
+    """
+    对话记忆检查点：优先 SQLite 持久化（重启进程不丢多轮上下文），
+    未安装 langgraph-checkpoint-sqlite 时回退内存记忆并告警。
+    """
+    try:
+        import os
+        import sqlite3
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        path = "./data/sqlite/conversation_memory.db"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # 分析在工作线程里跑，必须放开 same_thread 限制（SqliteSaver 内部有锁）
+        conn = sqlite3.connect(path, check_same_thread=False)
+        logger.info(f"对话记忆使用 SQLite 持久化: {path}")
+        return SqliteSaver(conn)
+    except Exception as e:
+        logger.warning(f"SQLite 记忆不可用（pip install langgraph-checkpoint-sqlite 可启用持久化），"
+                       f"回退进程内记忆: {e}")
+        return MemorySaver()
+
+
 class MultiAgentGraph:
     """
     多 Agent 协作图构建器
@@ -33,7 +55,7 @@ class MultiAgentGraph:
 
     def __init__(self, enable_memory: bool = True):
         self.enable_memory = enable_memory
-        self.memory = MemorySaver() if enable_memory else None
+        self.memory = _make_checkpointer() if enable_memory else None
         self.graph = self._build_graph()
 
     def _build_graph(self) -> StateGraph:

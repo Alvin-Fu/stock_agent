@@ -12,6 +12,7 @@ langchain-core>=0.3
 langchain-community>=0.3
 langchain-text-splitters>=0.3
 langgraph>=0.2
+langgraph-checkpoint-sqlite>=1.0   # 对话记忆 SQLite 持久化（不装则回退进程内记忆）
 langchain-openai>=0.2
 langchain-ollama>=0.2
 langchain-deepseek>=0.1
@@ -49,3 +50,6 @@ lark-oapi>=1.4,<2
 # 其他
 pyyaml>=6,<7
 Pillow>=10.0
+
+# 测试（改完代码跑 pytest tests/ 防回归）
+pytest>=8.0

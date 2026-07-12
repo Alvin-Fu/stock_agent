@@ -29,6 +29,34 @@ from storage.sqlite.stock_storage import get_db
 from utils.config import load_config
 from utils.logger import logger
 
+def split_report(text: str, limit: int = 4000) -> list:
+    """
+    长报告切分：优先在 ##/### 标题边界断段，段内超限再按行边界硬切，
+    绝不在表格行/句子中间截断。返回切好的段列表。
+    """
+    if len(text) <= limit:
+        return [text]
+    parts, buf = [], ""
+    sections = re.split(r"(?=\n#{2,3} )", "\n" + text)
+    for sec in sections:
+        if not sec.strip():
+            continue
+        if len(buf) + len(sec) <= limit:
+            buf += sec
+            continue
+        if buf.strip():
+            parts.append(buf.strip())
+        while len(sec) > limit:
+            cut = sec.rfind("\n", limit // 2, limit)
+            cut = cut if cut > 0 else limit
+            parts.append(sec[:cut].strip())
+            sec = sec[cut:]
+        buf = sec
+    if buf.strip():
+        parts.append(buf.strip())
+    return parts or [text[:limit]]
+
+
 HELP_TEXT = """🤖 股票分析助手使用说明
 · 直接提问：如「分析比亚迪」「600519 技术面怎么样」「白酒产业链有哪些机会」
 · 监控 比亚迪 —— 加入监控清单（公司名或6位代码；识别不到代码时按行业监控）
@@ -65,9 +93,11 @@ class FeishuBot:
             executor = self._get_workflow()
             state = executor.run_sync(question, thread_id=thread_id)
             answer = executor.get_final_answer(state)
-            # 飞书单条文本消息上限约 150KB，超长拆段（按 4000 字符）
-            for i in range(0, len(answer), 4000):
-                reply(answer[i:i + 4000])
+            # 超长报告按章节边界切段发送（不在表格/句子中间截断），多段带序号
+            chunks = split_report(answer)
+            total = len(chunks)
+            for i, chunk in enumerate(chunks, 1):
+                reply(f"({i}/{total})\n{chunk}" if total > 1 else chunk)
         except Exception as e:
             logger.error(f"[飞书] 分析失败: {e}\n{traceback.format_exc()}")
             reply(f"❌ 分析出错了：{e}")
@@ -226,6 +256,11 @@ class FeishuBot:
     # ---------- 启动 ----------
 
     def start(self):
+        # 财报发布触发的自动重分析：丢进工作线程池跑，结果推到默认通道
+        self.monitor.set_analysis_runner(
+            lambda question: self.pool.submit(
+                self._run_analysis, question, "report-trigger", self.notifier.send))
+
         # 监控调度始终启动（有 watchlist 且配了任一推送通道即可工作）
         self.monitor.start()
 

@@ -17,6 +17,7 @@ from utils.logger import logger
 from .notifier import FeishuNotifier
 from .signal_scanner import SignalScanner
 from .news_monitor import NewsMonitor
+from .condition_watcher import ConditionWatcher
 from .review import ReviewRunner
 
 
@@ -34,6 +35,7 @@ class MonitorScheduler:
         self.notifier = notifier or FeishuNotifier()
         self.signal_scanner = SignalScanner(self.notifier)
         self.news_monitor = NewsMonitor(self.notifier)
+        self.condition_watcher = ConditionWatcher(self.notifier)
         self.review_runner = ReviewRunner(self.notifier)
         self.review_after_days = int(cfg.get("review_after_days", 5))
         self.industry_review_after_days = int(cfg.get("industry_review_after_days", 10))
@@ -53,6 +55,11 @@ class MonitorScheduler:
             self.signal_scanner.scan()
         except Exception as e:
             logger.error(f"[监控] 盘后信号扫描异常: {e}")
+        # 条件触发盯盘：紧随信号扫描（日线刚更新完），对照快照里的操作参考
+        try:
+            self.condition_watcher.scan()
+        except Exception as e:
+            logger.error(f"[监控] 条件触发盯盘异常: {e}")
 
     def _run_news_scan(self):
         hour = datetime.now().hour
@@ -105,8 +112,12 @@ class MonitorScheduler:
 
     # ---------- 手动触发（对话命令/调试用） ----------
 
+    def set_analysis_runner(self, runner) -> None:
+        """注入完整分析的执行器（callable(question)），财报发布触发自动重分析用"""
+        self.news_monitor.analysis_runner = runner
+
     def run_once_now(self) -> str:
         """立即跑一轮信号+新闻扫描（同步），返回摘要"""
         self._run_signal_scan()
         self._run_news_scan()
-        return "已完成一轮监控扫描（盘后信号+新闻）"
+        return "已完成一轮监控扫描（盘后信号+条件盯盘+新闻）"

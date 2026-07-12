@@ -68,10 +68,12 @@ def _parse_judgement(raw: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def snapshot_analysis(stock_code: str, question: str, final_answer: str) -> Optional[int]:
+def snapshot_analysis(stock_code: str, question: str, final_answer: str,
+                      trade_plan: Optional[Dict[str, Any]] = None) -> Optional[int]:
     """
     分析完成后留档（同步实现，调用方用线程异步跑）。
     仅对单只股票的分析留档；返回快照 id。
+    trade_plan：技术分析算出的程序操作参考（方向/观察区/止损/目标），供条件触发提醒对照。
     """
     if not stock_code or "," in stock_code or not final_answer:
         return None
@@ -112,6 +114,7 @@ def snapshot_analysis(stock_code: str, question: str, final_answer: str) -> Opti
             resistance=json.dumps(judgement["resistance"], ensure_ascii=False),
             key_reasons=json.dumps(judgement["key_reasons"], ensure_ascii=False),
             indicators=json.dumps(indicators, ensure_ascii=False, default=str),
+            trade_plan=json.dumps(trade_plan, ensure_ascii=False, default=str) if trade_plan else None,
         )
         logger.info(f"[复盘] {stock_code} 分析快照已留档 #{snapshot_id}"
                     f"（短期{judgement['short_term_view']}，价 {price}）")
@@ -121,10 +124,11 @@ def snapshot_analysis(stock_code: str, question: str, final_answer: str) -> Opti
         return None
 
 
-def snapshot_analysis_async(stock_code: str, question: str, final_answer: str) -> None:
+def snapshot_analysis_async(stock_code: str, question: str, final_answer: str,
+                            trade_plan: Optional[Dict[str, Any]] = None) -> None:
     """fire-and-forget 异步留档，不阻塞对话回复"""
     threading.Thread(
-        target=snapshot_analysis, args=(stock_code, question, final_answer),
+        target=snapshot_analysis, args=(stock_code, question, final_answer, trade_plan),
         name="analysis-snapshot", daemon=True,
     ).start()
 

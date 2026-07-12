@@ -159,6 +159,19 @@ def build_trade_plan(daily_row: Dict[str, Any],
     else:
         pos_notes.append("多周期偏空，不建议参与")
 
+    # ---------- 4. 盈亏比（第一目标收益 / 止损风险，以买入区中值为基准） ----------
+    # 盈亏比过低时，即使回踩到支撑也不具备参与价值——这笔账由程序算死，不靠 LLM 自觉
+    risk_reward = None
+    if entry_zone and targets and stop_loss is not None:
+        entry_mid = (entry_zone[0] + entry_zone[1]) / 2
+        risk = entry_mid - stop_loss
+        if risk > 0:
+            risk_reward = round((targets[0] - entry_mid) / risk, 2)
+    if risk_reward is not None and risk_reward < 1.5 and direction == "可考虑介入":
+        direction = "观望"
+        position = 0
+        pos_notes.append(f"盈亏比{risk_reward}不足1.5，回踩到位也不参与")
+
     return {
         "direction": direction,
         "score": score,
@@ -169,6 +182,7 @@ def build_trade_plan(daily_row: Dict[str, Any],
         "stop_loss": stop_loss,
         "stop_pct": stop_pct,
         "targets": targets,
+        "risk_reward": risk_reward,
         "position": position,
         "position_notes": pos_notes,
     }
@@ -178,16 +192,27 @@ def format_trade_plan(plan: Optional[Dict[str, Any]]) -> str:
     """格式化为 prompt/报告文本块"""
     if not plan:
         return ""
+    can_enter = plan["direction"] == "可考虑介入"
     lines = ["【操作参考（程序规则计算：仅为若参与时的纪律参考，不构成预测）】"]
     lines.append(f"  方向结论：{plan['direction']}（信号分 {plan['score']}：{'；'.join(plan['score_reasons'])}）")
     lines.append(f"  现价：{plan['close']}")
     if plan["entry_zone"]:
-        lines.append(f"  买入参考区：{plan['entry_zone'][0]} ~ {plan['entry_zone'][1]}（{plan['entry_note']}）")
+        if can_enter:
+            lines.append(f"  买入参考区：{plan['entry_zone'][0]} ~ {plan['entry_zone'][1]}（{plan['entry_note']}）")
+        else:
+            # 观望/回避时不给可执行买点，只给观察位——避免"0仓位"和"可试探"自相矛盾
+            lines.append(f"  观察参考区：{plan['entry_zone'][0]} ~ {plan['entry_zone'][1]}"
+                         f"（{plan['entry_note']}；当前信号不支持参与，回踩到位也只是观察，信号转多再评估）")
     elif plan["entry_note"]:
         lines.append(f"  买入参考：{plan['entry_note']}")
     lines.append(f"  止损纪律位：{plan['stop_loss']}（距现价 {plan['stop_pct']}%，跌破无条件离场）")
     if plan["targets"]:
         lines.append(f"  目标参考位：{' / '.join(str(t) for t in plan['targets'])}（到达可分批了结）")
+    if plan.get("risk_reward") is not None:
+        rr = plan["risk_reward"]
+        note = "达标" if rr >= 1.5 else "不足1.5，风险收益不划算，不建议参与"
+        lines.append(f"  盈亏比：{rr}（第一目标收益÷止损风险，{note}）")
     lines.append(f"  参考仓位：{plan['position']}成（{'；'.join(plan['position_notes'])}）")
-    lines.append("  ⚠️ 以上价位与仓位为规则化纪律参考，LLM 不得修改数字，只可解释依据与风险")
+    lines.append("  ⚠️ 以上价位、仓位与措辞为规则化纪律参考，LLM 不得修改数字，"
+                 "不得改写文案用词（如添加原文没有的'复利'等），只可解释依据与风险")
     return "\n".join(lines)

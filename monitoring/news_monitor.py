@@ -28,6 +28,8 @@ class NewsMonitor:
         self.min_importance = self.importance_order.get(
             str(monitor_cfg.get("news_importance_min", "中")), 2)
         self._llm = None
+        # 财报发布自动触发：由入口（feishu_bot）注入 callable(question)，未注入则只推提醒不重分析
+        self.analysis_runner = None
 
     def _get_llm(self):
         if self._llm is None:
@@ -137,9 +139,37 @@ class NewsMonitor:
         logger.info(f"[监控] 新闻扫描完成：{len(targets)} 个标的，"
                     f"本轮推送 {self.db.count_events_pushed_today() - pushed_before} 条")
 
+    # 定期报告/业绩类公告标题特征（排除摘要与取消类）
+    _REPORT_TITLE = re.compile(r"(年度报告|半年度报告|季度报告|业绩快报|业绩预告)")
+    _REPORT_EXCLUDE = re.compile(r"(摘要|英文|已取消|提示性公告|披露时间)")
+
+    def _check_report_release(self, code: str, name: str) -> None:
+        """监控标的发布定期报告/业绩公告 → 推送提醒 + 自动触发完整重分析"""
+        from tools.info_sources import fetch_stock_announcements
+        for it in fetch_stock_announcements(code, days=5, limit=10):
+            title = it.get("title", "")
+            if not self._REPORT_TITLE.search(title) or self._REPORT_EXCLUDE.search(title):
+                continue
+            key = "report:" + hashlib.md5(f"{code}|{title}".encode("utf-8")).hexdigest()
+            saved = self.db.save_monitor_event(
+                target=name, event_type="report", dedup_key=key,
+                title=title, importance="高", pushed=True,
+            )
+            if not saved:
+                continue
+            self.notifier.send(f"📢 财报发布 | {name}({code})\n{title}（{it.get('time', '')}）\n"
+                               + ("已自动触发重新分析，完成后推送报告" if self.analysis_runner
+                                  else "可发送「分析 " + name + "」获取最新解读"))
+            if self.analysis_runner:
+                try:
+                    self.analysis_runner(f"分析{name}（{code}）最新财报发布后的基本面与技术面变化")
+                except Exception as e:
+                    logger.error(f"[监控] 财报触发重分析失败 {name}: {e}")
+
     def _scan_one(self, target: Dict[str, Any]) -> None:
         name = target["name"]
         if target["target_type"] == "company" and target.get("code"):
+            self._check_report_release(target["code"], name)
             items = self._fetch_company_news(target["code"], name)
         else:
             items = self._fetch_industry_news(name, target.get("keywords") or "")

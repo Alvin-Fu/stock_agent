@@ -49,6 +49,8 @@ class ResponderAgent:
    发现材料之间互相矛盾的数字要明确指出，不要各说各话；
    营业数据与财务趋势必须互相印证：销量在涨但利润率在掉、营收加速但现金流恶化
    这类背离是最重要的决策信息，发现了必须单独点出；
+   交叉推算必须同口径同期间：Q1营收只能配Q1销量，禁止拿半年销量除单季营收
+   推算均价这类比值；跨期数据只能用于方向前瞻，不能用于数值推算；
    财报空窗期前瞻：财报报告期之后已公布的月度销量/订单数据（如一季报后的4/5/6月销量）
    要用来对下一期财报做方向性前瞻，并标注"基于月度数据推断"，禁止推算具体数字
 6. 总结段只能提炼正文已有的、有数据支撑的论点，禁止在总结里引入正文没出现过的新判断
@@ -124,6 +126,17 @@ class ResponderAgent:
             if review:
                 parts.append(f"最近一次复盘结论（{str(review.get('created_at'))[:10]}，"
                              f"方向判断{review.get('direction_verdict')}）：\n{(review.get('review_content') or '')[:600]}")
+            # 系统累计成绩单：让结论自带对历史偏差的修正
+            try:
+                acc = db.get_direction_accuracy(30)
+                if acc.get("judged", 0) >= 3:
+                    parts.append(
+                        f"【系统历史成绩单（近{acc['total']}次复盘）】方向判断可对账{acc['judged']}次，"
+                        f"命中{acc['correct']}次（{acc['accuracy']}%）。"
+                        f"要求：命中率低于55%时，本次方向结论的语气必须更保守，"
+                        f"并检查是否重复历史错误模式（如高位追多）；禁止把历史命中率写成对未来的胜率")
+            except Exception:
+                pass
             return "\n".join(parts)
         except Exception as e:
             logger.warning(f"读取历史分析记录失败（不影响本次回答）: {e}")
