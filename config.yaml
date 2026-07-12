@@ -88,3 +88,6 @@ monitor:
   price_change_threshold: 5.0    # 涨跌幅提醒阈值（%）
   daily_push_limit: 20           # 每日推送上限（防轰炸）
   news_importance_min: "中"      # 新闻重要性达到该级别才推送（高/中/低）
+  review_after_days: 5           # 个股分析满 N 个自然日后自动复盘
+  industry_review_after_days: 10 # 产业链分析满 N 个自然日后自动复盘（产业逻辑兑现较慢）
+  review_time: "15:40"           # 自动复盘时间（交易日盘后）

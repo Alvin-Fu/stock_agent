@@ -896,6 +896,7 @@ def _build_kline_summary(df: pd.DataFrame, stock_code: str, freq_label: str,
 
     # 近20根K线的信号（代码判定结果，倒序=最近的在前）
     signal_lines = []
+    recent_signal_names = set()  # 近期出现过的信号种类，用于筛选历史胜率展示
     for _, row in df.head(20).iterrows():
         sig_parts = []
         if row.get("macd_signal") == 1:
@@ -905,11 +906,26 @@ def _build_kline_summary(df: pd.DataFrame, stock_code: str, freq_label: str,
         for col in ("ma_cross", "vol_signal", "gap_signal"):
             v = row.get(col)
             if v and isinstance(v, str) and v.strip():
-                sig_parts.append(v.strip())
+                sig_parts.extend(v.strip().split())
         if sig_parts:
+            recent_signal_names.update(sig_parts)
             signal_lines.append(f"  {parse_row_date(row.get('date'))}: {'、'.join(sig_parts)}")
     lines.append("【近20根K线信号（程序判定，请勿自行推算交叉）】")
     lines.append("\n".join(signal_lines) if signal_lines else "  （无信号）")
+
+    # 信号历史胜率：只统计近期出现过的信号种类（含当前均线形态的切换信号）
+    pattern = latest.get("ma_pattern")
+    if pattern == "多头排列":
+        recent_signal_names.add("转多头排列")
+    elif pattern == "空头排列":
+        recent_signal_names.add("转空头排列")
+    if recent_signal_names:
+        from .stock.base import calc_signal_history_stats, format_signal_stats
+        stats_text = format_signal_stats(
+            calc_signal_history_stats(df), signal_names=sorted(recent_signal_names))
+        if stats_text:
+            lines.append("【信号历史胜率（该股全部历史的条件统计，不代表未来）】")
+            lines.append(stats_text)
 
     # 近10根紧凑行情表
     cols = [c for c in ["date", "open", "high", "low", "close", "volume", "volume_ratio", "pct_chg"]

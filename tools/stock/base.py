@@ -832,6 +832,87 @@ class DataFetcherManager:
         logger.error(error_summary)
         raise DataFetchError(error_summary)
 
+# 信号历史胜率统计：信号名 -> 构造出现日 mask 的函数（在升序 df 上求值）
+_SIGNAL_MASKS = {
+    "MACD金叉": lambda df: df.get("macd_signal") == 1,
+    "MACD死叉": lambda df: df.get("macd_signal") == -1,
+    "金叉5x10": lambda df: df.get("ma_cross", pd.Series(dtype=str)).astype(str).str.contains("金叉5x10", na=False),
+    "死叉5x10": lambda df: df.get("ma_cross", pd.Series(dtype=str)).astype(str).str.contains("死叉5x10", na=False),
+    "金叉10x20": lambda df: df.get("ma_cross", pd.Series(dtype=str)).astype(str).str.contains("金叉10x20", na=False),
+    "死叉10x20": lambda df: df.get("ma_cross", pd.Series(dtype=str)).astype(str).str.contains("死叉10x20", na=False),
+    "放量上涨": lambda df: df.get("vol_signal") == "放量上涨",
+    "放量下跌": lambda df: df.get("vol_signal") == "放量下跌",
+    "异常放量": lambda df: df.get("vol_signal") == "异常放量",
+    "缩量回调": lambda df: df.get("vol_signal") == "缩量回调",
+    "向上跳空": lambda df: df.get("gap_signal") == "向上跳空",
+    "向下跳空": lambda df: df.get("gap_signal") == "向下跳空",
+    "转多头排列": lambda df: (df.get("ma_pattern") == "多头排列") & (df.get("ma_pattern").shift(1) != "多头排列"),
+    "转空头排列": lambda df: (df.get("ma_pattern") == "空头排列") & (df.get("ma_pattern").shift(1) != "空头排列"),
+}
+
+
+def calc_signal_history_stats(df: pd.DataFrame, horizons=(5, 20), min_samples: int = 5):
+    """
+    信号历史胜率统计：对每类信号，回看它在历史序列上的全部出现日，
+    统计其后 N 根K线的收益分布（以信号日收盘价为基准，无前视偏差）。
+
+    返回: {信号名: {horizon: {"win_rate": %, "avg": %, "median": %, "n": 样本数}}}
+    仅统计样本数 >= min_samples 的信号；这是历史条件频率，不是对未来的预测。
+    """
+    if df is None or df.empty or "close" not in df.columns:
+        return {}
+    data = df.copy()
+    if "date" in data.columns:
+        data = data.sort_values(by="date", ascending=True).reset_index(drop=True)
+
+    close = pd.to_numeric(data["close"], errors="coerce")
+    # 各持有期的未来收益（升序上 shift(-n) 是未来第 n 根）
+    future_returns = {n: (close.shift(-n) / close - 1) * 100 for n in horizons}
+
+    stats = {}
+    for name, mask_fn in _SIGNAL_MASKS.items():
+        try:
+            mask = mask_fn(data)
+            if mask is None:
+                continue
+            mask = mask.fillna(False)
+        except Exception:
+            continue
+        per_horizon = {}
+        for n in horizons:
+            rets = future_returns[n][mask].dropna()
+            if len(rets) < min_samples:
+                continue
+            per_horizon[n] = {
+                "win_rate": round(float((rets > 0).mean()) * 100, 1),
+                "avg": round(float(rets.mean()), 2),
+                "median": round(float(rets.median()), 2),
+                "n": int(len(rets)),
+            }
+        if per_horizon:
+            stats[name] = per_horizon
+    return stats
+
+
+def format_signal_stats(stats: dict, signal_names=None, unit: str = "根K线") -> str:
+    """
+    把胜率统计格式化为摘要文本。signal_names 非空时只展示这些信号（近期出现过的）。
+    """
+    if not stats:
+        return ""
+    names = [n for n in (signal_names or stats.keys()) if n in stats]
+    if not names:
+        return ""
+    lines = []
+    for name in names:
+        parts = []
+        for horizon, s in sorted(stats[name].items()):
+            note = "（样本偏少）" if s["n"] < 20 else ""
+            parts.append(f"{horizon}{unit}后胜率{s['win_rate']}%(均{s['avg']:+.1f}% 中位{s['median']:+.1f}% 共{s['n']}次){note}")
+        lines.append(f"  {name}: " + " | ".join(parts))
+    return "\n".join(lines)
+
+
 def merge_and_clean_data(date_field: str, df_db, df_new):
     """
         核心逻辑：

@@ -17,6 +17,7 @@ from utils.logger import logger
 from .notifier import FeishuNotifier
 from .signal_scanner import SignalScanner
 from .news_monitor import NewsMonitor
+from .review import ReviewRunner
 
 
 def _is_weekday() -> bool:
@@ -33,6 +34,10 @@ class MonitorScheduler:
         self.notifier = notifier or FeishuNotifier()
         self.signal_scanner = SignalScanner(self.notifier)
         self.news_monitor = NewsMonitor(self.notifier)
+        self.review_runner = ReviewRunner(self.notifier)
+        self.review_after_days = int(cfg.get("review_after_days", 5))
+        self.industry_review_after_days = int(cfg.get("industry_review_after_days", 10))
+        self.review_time = str(cfg.get("review_time", "15:40"))
 
         self._running = False
         self._thread = None
@@ -58,6 +63,14 @@ class MonitorScheduler:
         except Exception as e:
             logger.error(f"[监控] 新闻扫描异常: {e}")
 
+    def _run_reviews(self):
+        if not _is_weekday():
+            return
+        try:
+            self.review_runner.run_due_reviews(self.review_after_days, self.industry_review_after_days)
+        except Exception as e:
+            logger.error(f"[复盘] 定时复盘异常: {e}")
+
     # ---------- 生命周期 ----------
 
     def start(self):
@@ -68,11 +81,13 @@ class MonitorScheduler:
             return
         self._schedule.every().day.at(self.signal_scan_time).do(self._run_signal_scan)
         self._schedule.every(self.news_interval).minutes.do(self._run_news_scan)
+        self._schedule.every().day.at(self.review_time).do(self._run_reviews)
 
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="monitor-scheduler", daemon=True)
         self._thread.start()
-        logger.info(f"[监控] 调度已启动：盘后信号 {self.signal_scan_time}，新闻每 {self.news_interval} 分钟")
+        logger.info(f"[监控] 调度已启动：盘后信号 {self.signal_scan_time}，新闻每 {self.news_interval} 分钟，"
+                    f"复盘 {self.review_time}（分析满 {self.review_after_days} 天）")
 
     def _loop(self):
         while self._running:

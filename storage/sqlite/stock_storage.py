@@ -927,6 +927,141 @@ class MonitorEvent(Base):
         }
 
 
+class AnalysisSnapshot(Base):
+    """
+    分析快照：每次个股分析完成后留档的「可检验判断」，复盘的对账依据
+    JSON 字段（support/resistance/key_reasons/indicators）以 json.dumps 文本存储
+    """
+    __tablename__ = 'analysis_snapshot'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    name = Column(String(50))
+    question = Column(String(500))  # 当时的用户问题
+    price_at_analysis = Column(Float)  # 分析时点收盘价（前复权）
+    short_term_view = Column(String(10))  # 短期方向判断：偏多/中性/偏空
+    mid_term_view = Column(String(10))  # 中期方向判断
+    support = Column(Text)  # 支撑位列表 JSON
+    resistance = Column(Text)  # 压力位列表 JSON
+    key_reasons = Column(Text)  # 核心理由列表 JSON
+    indicators = Column(Text)  # 当时关键指标快照 JSON（ma_pattern/rsi6/pos_52w等）
+    review_done = Column(Integer, nullable=False, default=0)  # 是否已自动复盘
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'code': self.code,
+            'name': self.name,
+            'question': self.question,
+            'price_at_analysis': self.price_at_analysis,
+            'short_term_view': self.short_term_view,
+            'mid_term_view': self.mid_term_view,
+            'support': self.support,
+            'resistance': self.resistance,
+            'key_reasons': self.key_reasons,
+            'indicators': self.indicators,
+            'review_done': bool(self.review_done),
+            'created_at': self.created_at,
+        }
+
+
+class AnalysisReview(Base):
+    """
+    复盘记录：快照到期后与实际走势对账的结果
+    """
+    __tablename__ = 'analysis_review'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(Integer, nullable=False, index=True)
+    code = Column(String(10), nullable=False, index=True)
+    days_elapsed = Column(Integer)  # 距分析的自然日数
+    price_now = Column(Float)
+    pct_change = Column(Float)  # 区间涨跌幅 %
+    direction_verdict = Column(String(10))  # 方向对账：正确/错误/未验证
+    review_content = Column(Text)  # LLM 生成的复盘卡片全文
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'snapshot_id': self.snapshot_id,
+            'code': self.code,
+            'days_elapsed': self.days_elapsed,
+            'price_now': self.price_now,
+            'pct_change': self.pct_change,
+            'direction_verdict': self.direction_verdict,
+            'review_content': self.review_content,
+            'created_at': self.created_at,
+        }
+
+
+class IndustrySnapshot(Base):
+    """
+    产业链分析快照：候选清单（含当时价与综合排名）、技术面首选、行业判断、基准点位
+    """
+    __tablename__ = 'industry_snapshot'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    industry_name = Column(String(100), nullable=False, index=True)
+    question = Column(String(500))
+    candidates = Column(Text)  # JSON: [{"code","name","price","rank"}]，rank 从 1 开始
+    top_pick = Column(String(10))  # 技术面最强的股票代码
+    industry_view = Column(String(10))  # 行业判断：偏多/中性/偏空
+    benchmark_price = Column(Float)  # 沪深300 当时点位
+    review_done = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'industry_name': self.industry_name,
+            'question': self.question,
+            'candidates': self.candidates,
+            'top_pick': self.top_pick,
+            'industry_view': self.industry_view,
+            'benchmark_price': self.benchmark_price,
+            'review_done': bool(self.review_done),
+            'created_at': self.created_at,
+        }
+
+
+class IndustryReview(Base):
+    """
+    产业链复盘记录：组合超额/排名区分度/首选命中/方向 四维对账结果
+    """
+    __tablename__ = 'industry_review'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(Integer, nullable=False, index=True)
+    industry_name = Column(String(100), nullable=False, index=True)
+    days_elapsed = Column(Integer)
+    portfolio_return = Column(Float)  # 候选等权收益 %
+    benchmark_return = Column(Float)  # 沪深300 同期收益 %
+    excess_return = Column(Float)  # 超额 %
+    portfolio_verdict = Column(String(10))  # 跑赢/跑输/持平
+    rank_effective = Column(String(10))  # 排名区分度：有效/无区分/反向
+    top_pick_rank = Column(String(20))  # 首选实际涨幅名次，如 "2/8"
+    direction_verdict = Column(String(10))  # 行业方向：正确/错误/未验证
+    review_content = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'snapshot_id': self.snapshot_id,
+            'industry_name': self.industry_name,
+            'days_elapsed': self.days_elapsed,
+            'portfolio_return': self.portfolio_return,
+            'benchmark_return': self.benchmark_return,
+            'excess_return': self.excess_return,
+            'portfolio_verdict': self.portfolio_verdict,
+            'rank_effective': self.rank_effective,
+            'top_pick_rank': self.top_pick_rank,
+            'direction_verdict': self.direction_verdict,
+            'review_content': self.review_content,
+            'created_at': self.created_at,
+        }
+
+
 class StockResearchReport(Base):
     """
     股票调研报告模型 - ORM映射类
@@ -3845,6 +3980,162 @@ class DatabaseManager:
                 select(MonitorEvent.id).where(MonitorEvent.pushed_at >= today_start)
             ).scalars().all()
             return len(results)
+
+    # ===== 分析快照 / 复盘 ==================================================
+
+    def save_analysis_snapshot(self, **kwargs) -> int:
+        """保存分析快照，返回快照 id"""
+        with self.get_session() as session:
+            try:
+                record = AnalysisSnapshot(**kwargs)
+                session.add(record)
+                session.commit()
+                return record.id
+            except Exception:
+                session.rollback()
+                raise
+
+    def get_snapshots_due_review(self, after_days: int = 5) -> List[Dict[str, Any]]:
+        """获取到期待复盘的快照（创建超过 after_days 个自然日且未复盘）"""
+        with self.get_session() as session:
+            cutoff = datetime.now() - timedelta(days=after_days)
+            results = session.execute(
+                select(AnalysisSnapshot).where(
+                    and_(AnalysisSnapshot.review_done == 0,
+                         AnalysisSnapshot.created_at <= cutoff)
+                ).order_by(AnalysisSnapshot.created_at)
+            ).scalars().all()
+            return [r.to_dict() for r in results]
+
+    def get_latest_snapshot(self, code: str, exclude_id: int = None) -> Optional[Dict[str, Any]]:
+        """获取某股票最近一次分析快照"""
+        with self.get_session() as session:
+            stmt = select(AnalysisSnapshot).where(AnalysisSnapshot.code == code)
+            if exclude_id is not None:
+                stmt = stmt.where(AnalysisSnapshot.id != exclude_id)
+            result = session.execute(
+                stmt.order_by(desc(AnalysisSnapshot.created_at)).limit(1)
+            ).scalar_one_or_none()
+            return result.to_dict() if result else None
+
+    def mark_snapshot_reviewed(self, snapshot_id: int) -> None:
+        with self.get_session() as session:
+            try:
+                snap = session.execute(
+                    select(AnalysisSnapshot).where(AnalysisSnapshot.id == snapshot_id)
+                ).scalar_one_or_none()
+                if snap:
+                    snap.review_done = 1
+                    session.commit()
+            except Exception:
+                session.rollback()
+                raise
+
+    def save_analysis_review(self, **kwargs) -> int:
+        with self.get_session() as session:
+            try:
+                record = AnalysisReview(**kwargs)
+                session.add(record)
+                session.commit()
+                return record.id
+            except Exception:
+                session.rollback()
+                raise
+
+    def get_last_review_for_code(self, code: str) -> Optional[Dict[str, Any]]:
+        """获取某股票最近一次复盘记录（供下次分析注入）"""
+        with self.get_session() as session:
+            result = session.execute(
+                select(AnalysisReview).where(AnalysisReview.code == code)
+                .order_by(desc(AnalysisReview.created_at)).limit(1)
+            ).scalar_one_or_none()
+            return result.to_dict() if result else None
+
+    # ===== 产业链快照 / 复盘 ================================================
+
+    def save_industry_snapshot(self, **kwargs) -> int:
+        with self.get_session() as session:
+            try:
+                record = IndustrySnapshot(**kwargs)
+                session.add(record)
+                session.commit()
+                return record.id
+            except Exception:
+                session.rollback()
+                raise
+
+    def get_industry_snapshots_due_review(self, after_days: int = 10) -> List[Dict[str, Any]]:
+        """到期待复盘的产业链快照"""
+        with self.get_session() as session:
+            cutoff = datetime.now() - timedelta(days=after_days)
+            results = session.execute(
+                select(IndustrySnapshot).where(
+                    and_(IndustrySnapshot.review_done == 0,
+                         IndustrySnapshot.created_at <= cutoff)
+                ).order_by(IndustrySnapshot.created_at)
+            ).scalars().all()
+            return [r.to_dict() for r in results]
+
+    def get_latest_industry_snapshot(self, industry_name: str) -> Optional[Dict[str, Any]]:
+        """按行业名模糊匹配最近一次产业链快照"""
+        with self.get_session() as session:
+            result = session.execute(
+                select(IndustrySnapshot)
+                .where(IndustrySnapshot.industry_name.like(f"%{industry_name}%"))
+                .order_by(desc(IndustrySnapshot.created_at)).limit(1)
+            ).scalar_one_or_none()
+            return result.to_dict() if result else None
+
+    def mark_industry_snapshot_reviewed(self, snapshot_id: int) -> None:
+        with self.get_session() as session:
+            try:
+                snap = session.execute(
+                    select(IndustrySnapshot).where(IndustrySnapshot.id == snapshot_id)
+                ).scalar_one_or_none()
+                if snap:
+                    snap.review_done = 1
+                    session.commit()
+            except Exception:
+                session.rollback()
+                raise
+
+    def save_industry_review(self, **kwargs) -> int:
+        with self.get_session() as session:
+            try:
+                record = IndustryReview(**kwargs)
+                session.add(record)
+                session.commit()
+                return record.id
+            except Exception:
+                session.rollback()
+                raise
+
+    def get_industry_track_record(self, recent_n: int = 20) -> Dict[str, Any]:
+        """产业链选股成绩单：组合跑赢次数 / 排名有效次数"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(IndustryReview).order_by(desc(IndustryReview.created_at)).limit(recent_n)
+            ).scalars().all()
+            total = len(results)
+            outperform = sum(1 for r in results if r.portfolio_verdict == "跑赢")
+            rank_ok = sum(1 for r in results if r.rank_effective == "有效")
+            return {"total": total, "outperform": outperform, "rank_effective": rank_ok}
+
+    def get_direction_accuracy(self, recent_n: int = 30) -> Dict[str, Any]:
+        """近 N 次复盘的方向判断命中率（系统成绩单）"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(AnalysisReview).order_by(desc(AnalysisReview.created_at)).limit(recent_n)
+            ).scalars().all()
+            verdicts = [r.direction_verdict for r in results if r.direction_verdict]
+            judged = [v for v in verdicts if v in ("正确", "错误")]
+            correct = sum(1 for v in judged if v == "正确")
+            return {
+                "total": len(verdicts),
+                "judged": len(judged),
+                "correct": correct,
+                "accuracy": round(correct / len(judged) * 100, 1) if judged else None,
+            }
 
 # ===== 便捷函数 (Convenience Function) ====================================
 

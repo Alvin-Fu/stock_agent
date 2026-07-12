@@ -28,6 +28,11 @@ class ResponderAgent:
 
         context = self._format_context(documents, analysis, research, technical)
 
+        # 分析连续性：单只个股时注入上次分析快照与复盘结论
+        history = self._format_history(state.get("stock_code") or "")
+        if history:
+            context += f"\n\n{history}"
+
         system_prompt = f"""你是一位专业的财经顾问，请根据提供的资料回答用户问题。
 今天的日期是 {date.today().strftime('%Y-%m-%d')}，请以此为时间基准表述"最新/近期"。
 
@@ -66,6 +71,30 @@ class ResponderAgent:
             "final_answer": final_answer,
             "intermediate_steps": [("responder", final_answer[:200])],
         }
+
+    def _format_history(self, stock_code: str) -> str:
+        """取上次分析快照与最近复盘，形成「较上次分析…」的连续性素材"""
+        if not stock_code or "," in stock_code:
+            return ""
+        try:
+            from storage.sqlite.stock_storage import get_db
+            db = get_db()
+            snap = db.get_latest_snapshot(stock_code)
+            if not snap:
+                return ""
+            parts = ["【上次分析记录（供连续性对比，如有变化请点明）】"]
+            created = str(snap.get("created_at"))[:10]
+            parts.append(f"时间：{created}，当时价格：{snap.get('price_at_analysis')}，"
+                         f"短期判断：{snap.get('short_term_view') or '未明确'}，"
+                         f"中期判断：{snap.get('mid_term_view') or '未明确'}")
+            review = db.get_last_review_for_code(stock_code)
+            if review:
+                parts.append(f"最近一次复盘结论（{str(review.get('created_at'))[:10]}，"
+                             f"方向判断{review.get('direction_verdict')}）：\n{(review.get('review_content') or '')[:600]}")
+            return "\n".join(parts)
+        except Exception as e:
+            logger.warning(f"读取历史分析记录失败（不影响本次回答）: {e}")
+            return ""
 
     def _format_context(self, documents, analysis, research, technical) -> str:
         parts = []

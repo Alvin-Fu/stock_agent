@@ -35,6 +35,7 @@ HELP_TEXT = """🤖 股票分析助手使用说明
 · 取消监控 比亚迪
 · 监控列表
 · 立即扫描 —— 马上跑一轮信号+新闻扫描
+· 复盘 比亚迪 —— 对最近一次分析做复盘（对照实际走势）
 · 帮助 —— 显示本说明
 监控提醒：盘后技术信号 + 个股新闻/行业政策，自动推送到这里"""
 
@@ -95,6 +96,10 @@ class FeishuBot:
             ok = self.db.remove_watch_target(name)
             return f"✅ 已取消监控：{name}" if ok else f"未找到监控标的：{name}"
 
+        m = re.match(r"^复盘\s*(.+)$", text)
+        if m:
+            return ("__REVIEW__", m.group(1).strip())
+
         m = re.match(r"^监控\s*(.+)$", text)
         if m:
             return self._add_watch(m.group(1).strip())
@@ -104,6 +109,36 @@ class FeishuBot:
             return "__SCAN__"
 
         return None
+
+    def _run_review(self, raw: str, reply):
+        """手动复盘：先按个股解析，解析不到按行业找快照（不推送全局通道，直接回复）"""
+        from tools.company_code_validator import find_stock_code
+        from monitoring.review import ReviewRunner
+
+        code = raw if re.match(r"^\d{6}$", raw) else None
+        if code is None:
+            try:
+                code = find_stock_code(raw)
+            except Exception:
+                code = None
+
+        runner = ReviewRunner(self.notifier)
+        if code:
+            snap = self.db.get_latest_snapshot(code)
+            if not snap:
+                reply(f"没有 {raw} 的分析记录，先发送「分析 {raw}」，隔几天再来复盘")
+                return
+            card = runner.review_snapshot(snap, push=False)
+            reply(card or "复盘失败（可能分析后还没有新交易日）")
+            return
+
+        # 按行业复盘
+        ind_snap = self.db.get_latest_industry_snapshot(raw)
+        if ind_snap:
+            card = runner.review_industry_snapshot(ind_snap, push=False)
+            reply(card or "产业链复盘失败（可能候选行情数据不足）")
+            return
+        reply(f"未找到「{raw}」的个股或产业链分析记录")
 
     def _add_watch(self, raw: str) -> str:
         """添加监控：优先按公司解析代码，解析不到按行业"""
@@ -164,6 +199,10 @@ class FeishuBot:
             if command_result == "__SCAN__":
                 reply("🔍 开始扫描，完成后推送结果…")
                 self.pool.submit(self._safe_scan, reply)
+                return
+            if isinstance(command_result, tuple) and command_result[0] == "__REVIEW__":
+                reply("📋 复盘中…")
+                self.pool.submit(self._run_review, command_result[1], reply)
                 return
             if command_result is not None:
                 reply(command_result)
