@@ -84,19 +84,55 @@ def _pick_sales_flash(announcements: List[Dict[str, str]]) -> Optional[Dict[str,
     return None
 
 
+def _to_pdf_urls(url: str) -> List[str]:
+    """
+    把巨潮公告链接换算成 PDF 直链候选（纯函数）。
+    akshare 巨潮接口给的"公告链接"是网页详情页（/new/disclosure/detail?...，返回 HTML），
+    直接喂 PDF 解析器必报 "EOF marker not found"；真正的 PDF 在
+    https://static.cninfo.com.cn/finalpage/{公告日期}/{announcementId}.PDF（扩展名大小写都存在）。
+    无法解析出参数时原样返回，兼容本来就是直链的 URL。
+    """
+    from urllib.parse import urlparse, parse_qs
+    try:
+        q = parse_qs(urlparse(url).query)
+        ann_id = (q.get("announcementId") or [""])[0].strip()
+        ann_time = (q.get("announcementTime") or [""])[0].strip()[:10]
+        if ann_id and ann_time:
+            base = f"https://static.cninfo.com.cn/finalpage/{ann_time}/{ann_id}"
+            return [f"{base}.PDF", f"{base}.pdf"]
+    except Exception:
+        pass
+    return [url]
+
+
 def _download_pdf_text(url: str, max_pages: int = 4) -> str:
     """下载公告 PDF 并抽取文本；任何失败返回空串"""
     try:
         import io
         import requests
         from PyPDF2 import PdfReader
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        reader = PdfReader(io.BytesIO(resp.content))
-        pages = [p.extract_text() or "" for p in reader.pages[:max_pages]]
-        return "\n".join(pages).strip()
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+        last_err = "无候选URL"
+        for cand in _to_pdf_urls(url):
+            try:
+                resp = requests.get(cand, timeout=15, headers=headers)
+                resp.raise_for_status()
+                # 内容嗅探：详情页/错误页是 HTML，喂给 PdfReader 只会报晦涩的 EOF 错误
+                if not resp.content.lstrip().startswith(b"%PDF"):
+                    last_err = f"响应不是PDF（HTML详情页或错误页）: {cand}"
+                    continue
+                reader = PdfReader(io.BytesIO(resp.content))
+                pages = [p.extract_text() or "" for p in reader.pages[:max_pages]]
+                text = "\n".join(pages).strip()
+                if text:
+                    return text
+                last_err = f"PDF无文本层（扫描版？）: {cand}"
+            except Exception as e:
+                last_err = f"{cand}: {e}"
+        logger.warning(f"[信源] 公告 PDF 抽取失败 {url}: {last_err}")
+        return ""
     except Exception as e:
-        logger.warning(f"[信源] 产销快报 PDF 抽取失败 {url}: {e}")
+        logger.warning(f"[信源] 公告 PDF 抽取失败 {url}: {e}")
         return ""
 
 
