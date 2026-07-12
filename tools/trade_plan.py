@@ -207,12 +207,21 @@ def format_trade_plan(plan: Optional[Dict[str, Any]]) -> str:
         if can_enter:
             lines.append(f"  买入参考区：{plan['entry_zone'][0]} ~ {plan['entry_zone'][1]}（{plan['entry_note']}）")
         else:
-            # 观望/回避时不给可执行买点，只给观察位——避免"0仓位"和"可试探"自相矛盾
-            lines.append(f"  观察参考区：{plan['entry_zone'][0]} ~ {plan['entry_zone'][1]}"
-                         f"（{plan['entry_note']}；当前信号不支持参与，回踩到位也只是观察，信号转多再评估）")
+            # 观望/回避时不给可执行买点，只给观察位——避免"0仓位"和"可试探"自相矛盾。
+            # 现价已在区间内时必须写明（否则 LLM 会写出"等待回踩至XX"这种价格条件已满足的空话）
+            if plan["close"] <= plan["entry_zone"][1] * 1.002:
+                zone_note = ("现价已在该区间内，价格条件不是障碍——不参与的原因是信号/盈亏比不达标，"
+                             "信号转多再评估，禁止表述为'等待回踩'")
+            else:
+                zone_note = f"{plan['entry_note']}；当前信号不支持参与，回踩到位也只是观察，信号转多再评估"
+            lines.append(f"  观察参考区：{plan['entry_zone'][0]} ~ {plan['entry_zone'][1]}（{zone_note}）")
     elif plan["entry_note"]:
         lines.append(f"  买入参考：{plan['entry_note']}")
-    lines.append(f"  止损纪律位：{plan['stop_loss']}（距现价 {plan['stop_pct']}%，跌破无条件离场）")
+    stop_line = f"  止损纪律位：{plan['stop_loss']}（距现价 {plan['stop_pct']}%，跌破无条件离场）"
+    if plan["stop_pct"] is not None and plan["stop_pct"] <= -12:
+        stop_line += ("；⚠️该结构位距现价较远、风险敞口大（这也是盈亏比难达标的直接原因），"
+                      "若日后信号转多，应按当时的支撑重算止损，不得沿用本位")
+    lines.append(stop_line)
     if plan["targets"]:
         # 附带相对现价的空间百分比：这是"价位距离"不是涨幅预测，供收益空间评估
         tgt_parts = [f"{t}(+{(t / plan['close'] - 1) * 100:.1f}%)" for t in plan["targets"]]

@@ -66,6 +66,8 @@ HELP_TEXT = """🤖 股票分析助手使用说明
 · 监控列表
 · 立即扫描 —— 马上跑一轮信号+新闻扫描
 · 复盘 比亚迪 —— 对最近一次分析做复盘（对照实际走势）
+· 纠错 比亚迪 销量应该是38万不是41万 —— 指出报告里的错误，系统记住，下次分析严禁再犯
+· 纠错列表 —— 查看已记录的纠错
 · 帮助 —— 显示本说明
 监控提醒：盘后技术信号 + 个股新闻/行业政策，自动推送到这里"""
 
@@ -172,6 +174,22 @@ class FeishuBot:
         if m:
             return ("__REVIEW__", m.group(1).strip())
 
+        if text == "纠错列表":
+            records = self.db.list_recent_feedback()
+            if not records:
+                return "还没有纠错记录。发送「纠错 比亚迪 哪里错了」记录一条。"
+            lines = ["📝 纠错记录（新→旧）："]
+            for r in records:
+                day = str(r["created_at"])[:10]
+                lines.append(f"· [{day}] {r['target_name']}：{r['content'][:60]}")
+            return "\n".join(lines)
+
+        m = re.match(r"^纠错\s+(\S+)\s+(.+)$", text, re.DOTALL)
+        if m:
+            return self._record_feedback(m.group(1).strip(), m.group(2).strip())
+        if re.match(r"^纠错\s*\S*$", text):
+            return "用法：纠错 对象 错误内容\n例：纠错 比亚迪 销量应该是38万不是41万"
+
         m = re.match(r"^监控\s*(.+)$", text)
         if m:
             return self._add_watch(m.group(1).strip())
@@ -211,6 +229,32 @@ class FeishuBot:
             reply(card or "产业链复盘失败（可能候选行情数据不足）")
             return
         reply(f"未找到「{raw}」的个股或产业链分析记录")
+
+    def _record_feedback(self, target: str, content: str) -> str:
+        """记录用户纠错：解析代码、关联最近快照，下次分析该标的时自动注入"""
+        from tools.company_code_validator import find_stock_code, find_company_name
+
+        code, name = None, target
+        try:
+            if re.match(r"^\d{6}$", target):
+                code, name = target, find_company_name(target) or target
+            else:
+                found = find_stock_code(target)
+                if found:
+                    code, name = found, find_company_name(found) or target
+        except Exception as e:
+            logger.warning(f"[飞书] 纠错解析代码失败（按行业名记录）: {e}")
+
+        snapshot_id = None
+        if code:
+            snap = self.db.get_latest_snapshot(code)
+            snapshot_id = snap["id"] if snap else None
+
+        self.db.save_user_feedback(target_name=name, content=content,
+                                   code=code, snapshot_id=snapshot_id)
+        tag = f"{name}({code})" if code else f"{name}【按行业记录】"
+        return (f"✅ 已记录纠错：{tag}\n「{content[:100]}」\n"
+                f"下次分析该对象时会注入这条纠错，要求不得再犯；复盘时也会对账是否复发")
 
     def _add_watch(self, raw: str) -> str:
         """添加监控：优先按公司解析代码，解析不到按行业"""

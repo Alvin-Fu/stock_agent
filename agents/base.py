@@ -11,6 +11,11 @@ import operator
 from utils.constants import IntentType, AgentName
 
 
+def _keep_last(a, b):
+    """并行分支同时写入时的合并器：保留最新的非空值（error 等标量字段用）"""
+    return b or a
+
+
 class AgentState(TypedDict):
     """
     多 Agent 系统的共享状态定义
@@ -50,6 +55,6 @@ class AgentState(TypedDict):
     intermediate_steps: Annotated[List[tuple], operator.add]
     next_agents: List[str]
     confidence: Optional[float]
-    error: Optional[str]
+    error: Annotated[Optional[str], _keep_last]
 
 

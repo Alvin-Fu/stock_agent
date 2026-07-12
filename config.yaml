@@ -74,6 +74,9 @@ agents:
   #   model: "deepseek-v4-flash"
   # technical:
   #   model: "deepseek-reasoner"
+  # monitor:                       # 监控类短任务（新闻评估/快照抽取/触发核对），全天高频跑，
+  #   model: "deepseek-v4-flash"   # 适合配便宜快的模型
+
 
 # 工具配置（tushare token 读的是 tools.stock.tushare_token）
 tools:

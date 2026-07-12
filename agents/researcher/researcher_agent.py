@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from agents.base import AgentState
+from agents.prompts_common import INTERMEDIATE_PRODUCT_NOTE
 from core.llm import get_agent_llm
 from .web_search_tool import web_search
 from tools.company_code_validator import find_stock_code, find_company_name
@@ -181,6 +182,32 @@ def format_ranking_table(ranked: List[Dict[str, Any]], name_of=None) -> str:
     return "\n".join(lines)
 
 
+def parse_company_triggers(summary: str) -> List[Dict[str, str]]:
+    """
+    从个股研究输出末尾抽取公司级重估触发条件 JSON（纯函数）。
+    返回 [{"trigger_type":"news","description":...,"keywords":...}]，最多4条；解析失败返回 []。
+    """
+    import json as _json
+    import re as _re
+    try:
+        m = _re.search(r'\{\s*"company_triggers"', summary or "")
+        if not m:
+            return []
+        extracted, _ = _json.JSONDecoder().raw_decode(summary[m.start():])
+        out = []
+        for t in (extracted.get("company_triggers") or [])[:4]:
+            if not isinstance(t, dict):
+                continue
+            desc = str(t.get("trigger") or "").strip()
+            if not desc:
+                continue
+            out.append({"trigger_type": "news", "description": desc,
+                        "keywords": str(t.get("keywords") or "").strip()})
+        return out
+    except (ValueError, TypeError):
+        return []
+
+
 class ResearcherAgent:
     """研究 Agent：个股模式 + 产业链公司筛选与基本面分析"""
 
@@ -227,6 +254,8 @@ class ResearcherAgent:
         today = date.today().strftime("%Y-%m-%d")
         return f"""你是一个专业的股票信息研究员和分析师。今天的日期是 {today}，请以此为时间基准判断"近期/最新"。
 
+{INTERMEDIATE_PRODUCT_NOTE}
+
 请基于下方搜索结果，对该公司的以下维度进行客观分析并给出核心结论：
 
 1. **公司公告与重大事项**：近期是否有重大公告及影响
@@ -254,6 +283,15 @@ class ResearcherAgent:
    - 飞轮效应：判断各业务之间是否共享技术/产能/渠道/品牌而相互强化，
      成立则写出具体传导链条（如"A业务的规模摊薄B业务的核心部件成本"）；
      不成立或证据不足要明说"未见明显飞轮"，禁止强行升华
+9. **情景推演与重估触发**：
+   - 给出 乐观/基准/悲观 三情景，每个情景必须包含：
+     触发条件（具体可验证：指标+阈值或事件，如"单月销量同比转正""毛利率环比回升超1pct"
+     "海外反补贴关税落地"）、传导路径（条件→业务→财务指标的方向变化）、
+     可能性档位（只用 高/中/低，禁止编造百分比）。情景是推演不是预测，禁止写目标价
+   - 在输出最末尾附一段纯JSON（不要markdown包裹）：
+     {{"company_triggers": [{{"trigger": "重估触发条件（可被公开新闻验证的具体事件）",
+       "keywords": "盯梢关键词 空格分隔"}}, ...]}}
+     取三情景中最关键的1-4条可验证触发条件（利多利空都要有）；没有就给 []
 
 【风险对称要求】
 - 每条高影响力利好必须检查并列出对应风险（如：出口高增→关税/反补贴调查风险；大客户订单→客户集中度风险）
@@ -459,6 +497,8 @@ class ResearcherAgent:
             f"{industry} 资金流向 主力资金 北向资金 机构持仓 {today.year}",
             # 催化剂时间轴：机会有时间属性，招标/投产/发射/政策窗口是"什么时候涨"的依据
             f"{industry} 催化剂 招标 投产 量产 发射 时间表 {today.year}下半年 {today.year + 1}",
+            # 近期重大事件：技术里程碑/政策落地/大额融资，标题往往不带行业名，单独搜
+            f"{industry} 重大进展 里程碑 首次 成功 突破 {recent_period}",
             # 景气拐点与利润迁移：渗透率斜率、涨价传导、瓶颈环节=定价权所在
             f"{industry} 渗透率 行业增速 拐点 订单 排产 {recent_period}",
             f"{industry} 涨价 供需缺口 瓶颈环节 价格传导 利润分配 {recent_period}",
@@ -491,6 +531,8 @@ class ResearcherAgent:
         gate_desc = "；".join(f"{label}≥{gate:g}分" for _, gate, label in STAGE_GATES[stage])
         return f"""你是一个顶级的产业链研究专家，擅长挖掘投资机会。你的任务是从产业链中筛选出所有关键公司（含特精专新企业），分析其基本面、边际变化、护城河、资金偏好，并输出清晰的候选公司清单（含股票代码），供下游技术分析 Agent 使用。
 
+{INTERMEDIATE_PRODUCT_NOTE}
+
 本行业已判定为【{stage}】{f'（{stage_reason}）' if stage_reason else ''}。
 评分权重与准入门槛随阶段切换（程序执行）：本次权重为
 业务{w['business']:.0%}+基本面{w['fundamental']:.0%}+护城河{w['moat']:.0%}+边际变化{w['momentum']:.0%}，
@@ -521,6 +563,12 @@ class ResearcherAgent:
 - momentum（边际变化分）打分证据**只认近2个季度/近3个月的增量事实**：
   增速拐点、新订单/新客户导入、产能爬坡、毛利率环比回升、渗透率斜率变化；
   存量优势（多年积累的技术/份额）不算边际变化，那是 moat 的事
+- 打分锚点（四个分项通用；准入门槛在7/6/5分档，锚点直接决定进池出池，必须校准）：
+  5=行业平均/无差异化证据；6-7=有明确公开证据的相对优势；8=显著领先且证据充分；
+  9-10=近乎垄断或爆发式增量；3以下=明显劣势。每个分数必须能对应写出证据，
+  写不出证据就往5分靠，禁止靠印象给7分以上
+- momentum 锚点举例：单季营收/订单同比+50%且已兑现=8；毛利率环比回升+新客户开始量产=7；
+  仅增速企稳无新增量=5~6；增速下滑=3~4
 - reeval_triggers：1-4 条"若发生XX则值得重新评估该行业"的具体条件（如"某公司砷化镓电池收入占比超20%"
   "可回收火箭完成商业化首飞"），必须可被公开新闻验证，程序会自动盯梢；没有就给空数组
 
@@ -559,6 +607,9 @@ class ResearcherAgent:
   打分必须严格基于搜索证据（独有技术/专利/牌照/垄断地位的具体事实；
   边际变化则要有近2季/近3月的增量事实），禁止为照顾公司入围而抬分；
   找不到证据就给低分，宁缺毋滥
+- 证据分级：打分的关键依据（如"出货量第一""市占率XX%"）若仅来自媒体报道、
+  未见财报/公司公告佐证，必须在依据后标注「未经财报验证」，且不可替代性
+  单项不得给满分——一个只有传闻支撑的地位撑不起满分护城河
 
 ## 五、评分依据说明
 逐公司用一两句话说明四项分项分数的打分依据（业务经营/基本面/不可替代与溢价/边际变化），
@@ -574,7 +625,18 @@ class ResearcherAgent:
 ## 七、催化剂时间轴（未来3-6个月）
 机会有时间属性。用列表按时间先后列出可能的催化事件：
 - 每条格式：预计时间 | 事件（招标/发射/投产/量产/政策落地/财报窗口）| 影响的环节或公司 | 出处
+- 出处必须写具体来源（媒体名/公司公告/政府文件，尽量带日期），禁止笼统写
+  「搜索数据」「搜索结果」——无法说出具体来源的事件视为依据不足，不列
 - 只列搜索结果里有明确依据的事件，禁止编造时间；没有就明写「未发现明确催化剂」
+
+## 八、行业近况与重大事件（近1-3个月已发生）
+催化剂时间轴看未来，本节看已经发生的行情驱动：
+- 技术里程碑（如"国产火箭回收试验成功"）、重要政策落地、大额融资/订单、事故与挫折，
+  每条带日期与出处，并说明它是哪个环节的确认信号或风险信号
+- 提供了【行业指数表现】时必须引用其近5/20/60日涨幅原数，与大事件对照解读
+  （大事件出现后指数是否已经兑现了一波=当前介入的赔率基础）；
+  指数与候选个股走势背离时必须点破（指数涨个股不涨=个股问题，反之=行业beta拉动）
+- 没有重大事件就明写「近期无重大事件」，禁止拿日常新闻凑数
 
 【重要原则】
 - 候选公司清单 JSON 必须是输出的第一部分（输出过长被截断时后面的段落可丢，JSON 不能丢）
@@ -682,6 +744,21 @@ class ResearcherAgent:
         response = self.llm.invoke(messages)
         summary = response.content if hasattr(response, 'content') else str(response)
 
+        # 情景推演的重估触发条件落库：以公司名为 key 复用行业触发表，
+        # 公司加入监控清单后由新闻扫描自动盯梢（同一链路，无需新增机制）
+        try:
+            triggers = parse_company_triggers(summary)
+            if triggers:
+                from storage.sqlite.stock_storage import get_db
+                key = company_name or stock_code
+                get_db().save_industry_triggers(key, triggers)
+                summary += (f"\n\n【重估触发条件（{len(triggers)}条已登记；"
+                            f"发送「监控 {key}」加入监控后，新闻命中会自动推送提醒）】\n"
+                            + "\n".join(f"- {t['description']}" for t in triggers))
+                logger.info(f"[个股触发] {key} 登记 {len(triggers)} 条重估触发条件")
+        except Exception as e:
+            logger.warning(f"[个股触发] 落库失败（不影响分析）: {e}")
+
         return {
             "messages": [response],
             "research_result": {"summary": summary, "sources": queries},
@@ -731,11 +808,30 @@ class ResearcherAgent:
                 if snippet:
                     chain_summary += f"  搜索摘要: {snippet}\n"
 
-        # 行业相关的财联社快讯（结构化信源，含政策面）
+        # 行业相关的财联社快讯（结构化信源，含政策面）。
+        # 关键词扩展到各环节名：行业大事往往不带行业名（"XX火箭完成回收试验"这类
+        # 标题里没有"商业航天"），只用行业名过滤会整体漏掉里程碑事件
         from tools.info_sources import fetch_cls_telegraph, format_info_block
+        segment_kws = []
+        for level in ["upstream", "midstream", "downstream", "niche_innovators"]:
+            for seg_data in chain.get(level, []):
+                seg = str(seg_data.get("segment") or "").strip()
+                if seg and seg not in segment_kws:
+                    segment_kws.append(seg)
         cls_block = format_info_block(
-            "财联社快讯（含该行业关键词的条目，政策/宏观第一手来源）",
-            fetch_cls_telegraph(keywords=[industry_name], limit=15))
+            "财联社快讯（含该行业/各环节关键词的条目，政策与重大事件第一手来源）",
+            fetch_cls_telegraph(keywords=[industry_name] + segment_kws[:10], limit=15))
+
+        # 行业指数表现（东财概念/行业板块）：行业 beta 的权威事实，
+        # 候选池只有两三家时拿池子代理行业会失真，指数不会
+        index_block = ""
+        industry_index = None
+        try:
+            from tools.industry_index import fetch_industry_index_metrics, format_industry_index
+            industry_index = fetch_industry_index_metrics(industry_name)
+            index_block = format_industry_index(industry_index)
+        except Exception as e:
+            logger.warning(f"行业指数获取失败（不影响分析主流程）: {e}")
 
         # 行业估值与位置（程序计算，用龙头池做行业代理样本）——回调风险分析的量化锚
         from tools.industry_metrics import collect_industry_valuation, format_industry_valuation
@@ -774,6 +870,8 @@ class ResearcherAgent:
 
 {cls_block if cls_block else ''}
 
+{index_block if index_block else ''}
+
 {valuation_block if valuation_block else ''}
 
 ========== 产业链结构（上中下游+特精专新+细分领域+龙一龙二） ==========
@@ -788,7 +886,7 @@ class ResearcherAgent:
 请按结构输出：〇、JSON 候选清单+分项评分+重估触发条件（放最前）→ 一、全景筛选
 → 二、业务拆解与经营数据（优先引用主营构成数据的占比/毛利率原数）→ 三、基本面评分
 → 四、护城河分析（重点关注特精专新）→ 五、评分依据说明
-→ 六、环节利润迁移判断 → 七、催化剂时间轴。
+→ 六、环节利润迁移判断 → 七、催化剂时间轴 → 八、行业近况与重大事件。
 资金偏好只在搜索结果里有北向/龙虎榜/机构调研等公开证据时标注并写明出处，
 无证据写「无公开数据」，禁止凭板块印象填"主力/游资"。"""),
         ]
@@ -908,6 +1006,7 @@ class ResearcherAgent:
             "messages": [response],
             "research_result": {"summary": summary, "sources": all_queries,
                                 "industry_valuation": industry_valuation,
+                                "industry_index": industry_index,
                                 "industry_stage": stage},
             "chain_leaders": chain,
             "stock_code": ",".join(verified_codes) if verified_codes else "",

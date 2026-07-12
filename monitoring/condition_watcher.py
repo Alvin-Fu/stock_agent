@@ -123,8 +123,12 @@ class ConditionWatcher:
             except Exception as e:
                 logger.error(f"[条件盯盘] {t['name']} 失败: {e}")
 
-        # 行业重估触发条件（valuation 型）：估值分位回落是程序可判定的重估信号
+        # 行业重估触发条件（valuation 型）：估值分位回落是程序可判定的重估信号；
+        # 扫描前先清掉超过180天的陈旧触发条件（重估条件有时效，永不过期误报率会上升）
         try:
+            expired = self.db.expire_stale_industry_triggers(days=180)
+            if expired:
+                logger.info(f"[条件盯盘] 自动过期 {expired} 条陈旧行业触发条件")
             pushed += self.scan_industry_valuation_triggers()
         except Exception as e:
             logger.error(f"[条件盯盘] 行业估值触发扫描失败: {e}")

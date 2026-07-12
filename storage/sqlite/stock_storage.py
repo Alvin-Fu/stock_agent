@@ -1092,6 +1092,32 @@ class IndustryReview(Base):
         }
 
 
+class UserFeedback(Base):
+    """
+    用户纠错记录：使用者对分析报告指出的错误（飞书「纠错 XX 内容」命令写入）。
+    用途：①下次分析同一标的时注入 prompt「严禁再犯」；②复盘时对账该错误是否复发。
+    个股用 code 关联，行业/产业链只有 target_name。
+    """
+    __tablename__ = 'user_feedback'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    target_name = Column(String(50), nullable=False, index=True)  # 用户说的对象名（公司/行业）
+    code = Column(String(10), index=True)  # 解析到的股票代码（行业为空）
+    content = Column(String(500), nullable=False)  # 纠错内容原文
+    snapshot_id = Column(Integer)  # 关联的最近一次分析快照 id（可空）
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'target_name': self.target_name,
+            'code': self.code,
+            'content': self.content,
+            'snapshot_id': self.snapshot_id,
+            'created_at': self.created_at,
+        }
+
+
 class IndustryReevalTrigger(Base):
     """
     行业重估触发条件：产业链分析给出"不参与/暂不参与"结论时留下的重估钩子。
@@ -4199,6 +4225,29 @@ class DatabaseManager:
                 session.rollback()
                 raise
 
+    def expire_stale_industry_triggers(self, days: int = 180) -> int:
+        """
+        触发条件自动过期：重估条件是有时效的（半年后行业格局早换了故事），
+        永不过期会让监控清单越积越多、误报率上升。返回本次置为过期的条数。
+        """
+        with self.get_session() as session:
+            try:
+                cutoff = datetime.now() - timedelta(days=days)
+                stale = session.execute(
+                    select(IndustryReevalTrigger).where(
+                        and_(IndustryReevalTrigger.status == 'active',
+                             IndustryReevalTrigger.created_at <= cutoff)
+                    )
+                ).scalars().all()
+                for t in stale:
+                    t.status = 'expired'
+                    t.hit_note = f'超过{days}天未命中，自动过期'
+                session.commit()
+                return len(stale)
+            except Exception:
+                session.rollback()
+                raise
+
     # ===== 分析快照 / 复盘 ==================================================
 
     def save_analysis_snapshot(self, **kwargs) -> int:
@@ -4327,6 +4376,47 @@ class DatabaseManager:
             except Exception:
                 session.rollback()
                 raise
+
+    # ===== 用户纠错记录 =====================================================
+
+    def save_user_feedback(self, target_name: str, content: str,
+                           code: str = None, snapshot_id: int = None) -> int:
+        """保存一条用户纠错记录，返回 id"""
+        with self.get_session() as session:
+            try:
+                record = UserFeedback(target_name=target_name, content=content,
+                                      code=code, snapshot_id=snapshot_id)
+                session.add(record)
+                session.commit()
+                return record.id
+            except Exception:
+                session.rollback()
+                raise
+
+    def get_feedback_for_target(self, code: str = None, name: str = None,
+                                limit: int = 8) -> List[Dict[str, Any]]:
+        """按代码或对象名取纠错记录（新→旧），供分析注入与复盘对账"""
+        if not code and not name:
+            return []
+        with self.get_session() as session:
+            conds = []
+            if code:
+                conds.append(UserFeedback.code == code)
+            if name:
+                conds.append(UserFeedback.target_name.like(f"%{name}%"))
+            results = session.execute(
+                select(UserFeedback).where(or_(*conds))
+                .order_by(desc(UserFeedback.created_at)).limit(limit)
+            ).scalars().all()
+            return [r.to_dict() for r in results]
+
+    def list_recent_feedback(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """最近的纠错记录（飞书「纠错列表」用）"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(UserFeedback).order_by(desc(UserFeedback.created_at)).limit(limit)
+            ).scalars().all()
+            return [r.to_dict() for r in results]
 
     def get_industry_track_record(self, recent_n: int = 20) -> Dict[str, Any]:
         """产业链选股成绩单：组合跑赢次数 / 排名有效次数"""

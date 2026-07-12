@@ -86,8 +86,8 @@ def snapshot_analysis(stock_code: str, question: str, final_answer: str,
         return None
     try:
         db = get_db()
-        from core.llm import get_default_llm
-        response = get_default_llm().invoke(_EXTRACT_PROMPT.format(report=final_answer[:6000]))
+        from core.llm import get_agent_llm
+        response = get_agent_llm("monitor").invoke(_EXTRACT_PROMPT.format(report=final_answer[:6000]))
         raw = response.content if hasattr(response, "content") else str(response)
         judgement = _parse_judgement(raw)
         if judgement is None:
@@ -252,8 +252,8 @@ def snapshot_industry_analysis(industry_name: str, question: str, final_answer: 
         return None
     try:
         db = get_db()
-        from core.llm import get_default_llm
-        response = get_default_llm().invoke(_INDUSTRY_EXTRACT_PROMPT.format(
+        from core.llm import get_agent_llm
+        response = get_agent_llm("monitor").invoke(_INDUSTRY_EXTRACT_PROMPT.format(
             codes=",".join(candidate_codes), report=final_answer[:6000]))
         raw = response.content if hasattr(response, "content") else str(response)
 
@@ -332,8 +332,8 @@ class ReviewRunner:
 
     def _get_llm(self):
         if self._llm is None:
-            from core.llm import get_default_llm
-            self._llm = get_default_llm()
+            from core.llm import get_agent_llm
+            self._llm = get_agent_llm("monitor")
         return self._llm
 
     def review_snapshot(self, snap: Dict[str, Any], push: bool = True) -> Optional[str]:
@@ -384,6 +384,31 @@ class ReviewRunner:
             except Exception:
                 pass
 
+            # 用户纠错对账：分析前已有的纠错=本次分析本应避免；分析后新增的=针对本次报告的新错
+            feedback_block = ""
+            try:
+                fb = self.db.get_feedback_for_target(code=code, name=snap.get("name"))
+                if fb:
+                    snap_dt = snap["created_at"] if isinstance(snap["created_at"], datetime) else None
+                    before, after = [], []
+                    for r in fb:
+                        line = f"[{str(r['created_at'])[:10]}] {r['content']}"
+                        if snap_dt and isinstance(r.get("created_at"), datetime) and r["created_at"] > snap_dt:
+                            after.append(line)
+                        else:
+                            before.append(line)
+                    seg = ["\n【用户纠错对账】"]
+                    if before:
+                        seg.append("分析前已存在的纠错（该次分析本应避免）：" + "；".join(before))
+                    if after:
+                        seg.append("分析后用户新指出的错误（说明该次报告仍有错）：" + "；".join(after))
+                    feedback_block = "\n".join(seg)
+            except Exception:
+                pass
+
+            feedback_template_line = "\n纠错对账：用户指出过的错误该次是否复发（复发⚠️/已避免✅/无法判断⏸）" \
+                if feedback_block else ""
+
             prompt = f"""你是复盘助手。对之前的一次股票分析做简短复盘，检验**当时推理的质量**。
 
 【硬性规则】
@@ -402,11 +427,12 @@ class ReviewRunner:
 - 方向对账（程序判定）：{verdict}
 - 关键价位检验（程序判定）：{'；'.join(level_notes) if level_notes else '当时未给出具体价位'}
 - 期间相关新闻：{'；'.join(news_titles) if news_titles else '无记录'}
+{feedback_block}
 
 【输出模板】
 判断结果：一句话（引用程序判定）
 理由核验：当时的核心理由逐条标注 兑现✅/未兑现❌/无新信息⏸
-教训：一两句（没有就写"无明显误判"；区分误判与新信息）"""
+教训：一两句（没有就写"无明显误判"；区分误判与新信息）{feedback_template_line}"""
 
             response = self._get_llm().invoke(prompt)
             content = response.content if hasattr(response, "content") else str(response)

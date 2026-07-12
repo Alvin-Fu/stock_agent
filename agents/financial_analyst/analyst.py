@@ -279,9 +279,12 @@ class AnalystAgent:
         return results
 
     def _build_system_prompt(self) -> str:
+        from agents.prompts_common import STYLE_RULES, INTERMEDIATE_PRODUCT_NOTE
         today = date.today().strftime("%Y-%m-%d")
         return f"""你是一位资深财务分析师（CFA），拥有 15 年上市公司财报分析经验。
 今天的日期是 {today}，请以此为时间基准表述"最新/近期"。
+
+{INTERMEDIATE_PRODUCT_NOTE}
 
 请基于下方提供的真实财务报表数据和研报观点，进行专业解读。
 
@@ -319,12 +322,7 @@ class AnalystAgent:
     亏损分部用 0 或注明无法估值，禁止发明倍数
 13. 避免给出投资建议，仅做客观分析
 
-【文风硬规则（违反即不合格）】
-- 每句话必须承载增量信息（数据、方向、因果或结论），凑字的话直接删
-- 禁用表述："总体来看""表现稳健""值得关注""仍需观察""具有一定风险"
-  "为未来发展奠定基础""赋能""保驾护航""综上所述"及一切同类空话套话
-- 结论必须可证伪：写"毛利率连续3期回升（18.2%→19.5%→20.1%）"，
-  不写"盈利能力有所改善"
+{STYLE_RULES}
 
 【输出要求】
 - 先总览（明确标注报告期，如"2026年一季报"）

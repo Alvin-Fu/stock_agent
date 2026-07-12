@@ -33,8 +33,8 @@ class NewsMonitor:
 
     def _get_llm(self):
         if self._llm is None:
-            from core.llm import get_default_llm
-            self._llm = get_default_llm()
+            from core.llm import get_agent_llm
+            self._llm = get_agent_llm("monitor")
         return self._llm
 
     # ---------- 数据源（统一走 tools.info_sources） ----------
@@ -139,7 +139,8 @@ class NewsMonitor:
         logger.info(f"[监控] 新闻扫描完成：{len(targets)} 个标的，"
                     f"本轮推送 {self.db.count_events_pushed_today() - pushed_before} 条")
 
-    def _check_reeval_triggers(self, industry: str, items: List[Dict[str, str]]) -> None:
+    def _check_reeval_triggers(self, industry: str, items: List[Dict[str, str]],
+                               is_company: bool = False) -> None:
         """
         对照行业新闻核对 news 型重估触发条件（valuation 型由 condition_watcher 程序判定）。
         命中 → 标记 hit + 推送提醒 +（注入了 analysis_runner 时）自动触发产业链重分析。
@@ -164,8 +165,9 @@ class NewsMonitor:
 {news_lines}
 
 只输出JSON数组（不要markdown包裹），只包含命中的条件：
-[{{"trigger_id": 条件ID, "evidence": "命中依据（引用新闻标题，40字内）"}}, ...]
-没有命中输出 []。宁可漏判不可误判。"""
+[{{"trigger_id": 条件ID, "news_index": 支撑该命中的新闻编号, "evidence": "命中依据（40字内）"}}, ...]
+news_index 必须是上面新闻列表里真实存在的编号——防止凭空命中；没有命中输出 []。
+宁可漏判不可误判。"""
         try:
             response = self._get_llm().invoke(prompt)
             raw = response.content if hasattr(response, "content") else str(response)
@@ -184,7 +186,17 @@ class NewsMonitor:
             trig = valid_ids.get(tid)
             if not trig:
                 continue
-            evidence = str(h.get("evidence") or "")[:200]
+            # 证据必须锚定到真实新闻编号，否则视为幻觉命中丢弃
+            try:
+                idx = int(h.get("news_index")) - 1
+            except (TypeError, ValueError):
+                logger.warning(f"[监控] {industry} 触发 #{tid} 未给出 news_index，按幻觉丢弃")
+                continue
+            if not (0 <= idx < len(items[:15])):
+                logger.warning(f"[监控] {industry} 触发 #{tid} news_index={idx + 1} 越界，按幻觉丢弃")
+                continue
+            news_title = str(items[idx].get("title") or "")[:60]
+            evidence = f"新闻{idx + 1}「{news_title}」：{str(h.get('evidence') or '')}"[:200]
             # mark 内部只对 active 生效，天然防重复推送
             if not self.db.mark_industry_trigger_hit(tid, evidence):
                 continue
@@ -194,15 +206,20 @@ class NewsMonitor:
                 title=f"重估触发：{trig['description']}",
                 content=evidence, importance="高", pushed=True,
             )
-            self.notifier.send(f"🔁 行业重估触发 | {industry}\n"
+            self.notifier.send(f"🔁 重估触发 | {industry}\n"
                                f"条件：{trig['description']}\n依据：{evidence}\n"
-                               + ("已自动触发产业链重新分析" if self.analysis_runner
-                                  else f"可发送「分析{industry}产业链」重新评估"))
+                               + ("已自动触发重新分析" if self.analysis_runner
+                                  else f"可发送「分析 {industry}」重新评估"))
             logger.info(f"[监控] {industry} 重估触发条件命中 #{tid}: {evidence}")
             if self.analysis_runner:
                 try:
-                    self.analysis_runner(f"分析{industry}产业链上下游，筛选出所有关键公司，"
-                                         f"对比技术面和基本面，选出最值得投资的股票（重估触发：{trig['description']}）")
+                    if is_company:
+                        question = (f"分析{industry}，重点评估该重估触发条件的影响并更新操作参考"
+                                    f"（重估触发：{trig['description']}）")
+                    else:
+                        question = (f"分析{industry}产业链上下游，筛选出所有关键公司，"
+                                    f"对比技术面和基本面，选出最值得投资的股票（重估触发：{trig['description']}）")
+                    self.analysis_runner(question)
                 except Exception as e:
                     logger.error(f"[监控] {industry} 重估触发重分析失败: {e}")
 
@@ -242,7 +259,8 @@ class NewsMonitor:
             items = self._fetch_industry_news(name, target.get("keywords") or "")
             # 行业标的顺带核对重估触发条件（产业链分析留下的"若发生XX则重估"钩子）
             try:
-                self._check_reeval_triggers(name, items)
+                self._check_reeval_triggers(
+                    name, items, is_company=(target["target_type"] == "company"))
             except Exception as e:
                 logger.error(f"[监控] {name} 重估触发条件核对失败: {e}")
 

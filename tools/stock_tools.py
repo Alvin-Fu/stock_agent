@@ -890,9 +890,13 @@ def _build_kline_summary(df: pd.DataFrame, stock_code: str, freq_label: str,
     obv_trend = "-"
     if "obv" in df.columns and len(df) > 20 and not pd.isna(latest.get("obv")):
         obv_trend = "上升" if latest["obv"] > df.iloc[20]["obv"] else "下降"
+    # 年内位置只在日线展示：周/月线用的是周期收盘价区间（月线会抹掉日间低点），
+    # 同名指标在不同周期算出两个数（如日线31.8% vs 月线5.4%），报告里必然自相矛盾
+    pos_seg = ""
+    if freq_label == "日线":
+        pos_seg = f"| 年内位置={_fmt(g('pos_52w'), 1)}%（0=年内最低,100=年内最高，按日收盘计） "
     lines.append(
-        f"  ATR14={_fmt(g('atr14'), 3)} | 年内位置={_fmt(g('pos_52w'), 1)}%（0=年内最低,100=年内最高） "
-        f"| OBV近20根趋势: {obv_trend}"
+        f"  ATR14={_fmt(g('atr14'), 3)} {pos_seg}| OBV近20根趋势: {obv_trend}"
     )
     if rs_text:
         lines.append(f"【相对强弱】{rs_text}")

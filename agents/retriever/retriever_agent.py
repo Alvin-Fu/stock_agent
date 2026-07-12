@@ -61,6 +61,15 @@ class RetrieverAgent:
         question = state.get("question", "")
         logger.info(f"开始检索，原始问题: {question[:80]}...")
 
+        # 知识库为空时直接跳过：不浪费一次查询改写 LLM 调用和向量检索
+        try:
+            if self.vector_store is None or not (self.vector_store._collection.count() or 0):
+                logger.info("知识库为空，跳过检索（喂入文档后自动恢复）")
+                return {"documents": [],
+                        "intermediate_steps": [("retrieve", {"skipped": "知识库为空"})]}
+        except Exception:
+            pass  # 计数接口不可用时照常走检索流程
+
         try:
             # 1. 查询改写/扩展（可选）
             queries = [question]
