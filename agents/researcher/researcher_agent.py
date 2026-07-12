@@ -18,6 +18,62 @@ from tools.company_code_validator import find_stock_code, find_company_name
 from utils.logger import logger
 
 
+# 综合评分权重：业务经营 20% + 基本面 30% + 不可替代与溢价 50%
+COMPOSITE_WEIGHTS = {"business": 0.2, "fundamental": 0.3, "moat": 0.5}
+
+
+def compute_composite_ranking(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    程序计算综合评分与排名（LLM 只提供分项分数，加权与排序不交给它心算）。
+    分项缺失/非法时按 5.0 中性分处理并标注。
+    返回按综合分降序的列表：[{code, business, fundamental, moat, composite, rank, note}]
+    """
+    ranked = []
+    for c in candidates or []:
+        code = str(c.get("code", "")).strip()
+        if not code:
+            continue
+        scores, missing = {}, []
+        for key in COMPOSITE_WEIGHTS:
+            try:
+                v = float(c.get(key))
+                if not (0 <= v <= 10):
+                    raise ValueError
+                scores[key] = round(v, 1)
+            except (TypeError, ValueError):
+                scores[key] = 5.0
+                missing.append(key)
+        composite = round(sum(scores[k] * w for k, w in COMPOSITE_WEIGHTS.items()), 2)
+        ranked.append({
+            "code": code, **scores, "composite": composite,
+            "note": "分项缺失按5分中性处理" if missing else "",
+        })
+    ranked.sort(key=lambda x: x["composite"], reverse=True)
+    for i, item in enumerate(ranked, 1):
+        item["rank"] = i
+    return ranked
+
+
+def format_ranking_table(ranked: List[Dict[str, Any]], name_of=None) -> str:
+    """排名表文本（附在报告末尾，供 responder 展示与复盘留档抽取）"""
+    if not ranked:
+        return ""
+    lines = ["【综合排名（程序按 业务20%+基本面30%+不可替代50% 加权计算）】"]
+    for item in ranked:
+        label = item["code"]
+        if name_of:
+            try:
+                name = name_of(item["code"])
+                if name:
+                    label = f"{name}({item['code']})"
+            except Exception:
+                pass
+        note = f"（{item['note']}）" if item.get("note") else ""
+        lines.append(f"{item['rank']}. {label} 综合{item['composite']} "
+                     f"= 业务{item['business']} 基本面{item['fundamental']} 护城河{item['moat']}{note}")
+    return "\n".join(lines)
+
+
 class ResearcherAgent:
     """研究 Agent：个股模式 + 产业链公司筛选与基本面分析"""
 
@@ -274,11 +330,16 @@ class ResearcherAgent:
 
 请严格按照以下结构输出：
 
-## 〇、候选公司清单（必须放在最前面输出，供下游技术分析用）
+## 〇、候选公司清单与分项评分（必须放在最前面输出，供下游程序计算排名）
 纯JSON格式（不要markdown包裹）：
 {
-  "candidate_codes": ["代码1", "代码2", ...]
+  "candidates": [
+    {"code": "股票代码", "business": 业务经营分0-10, "fundamental": 基本面分0-10, "moat": 不可替代与溢价分0-10},
+    ...
+  ]
 }
+说明：只给分项分数，**不要自行计算加权总分或排名**——综合排名由程序按
+「业务20% + 基本面30% + 不可替代与溢价50%」权重精确计算，避免心算误差。
 
 ## 一、产业链公司全景筛选
 - 用表格列出产业链上中下游 + 特精专新共筛选出的所有公司
@@ -312,12 +373,14 @@ class ResearcherAgent:
 - 溢价能力（0-5 分）：毛利率水平？对上游议价能力？对下游定价权？品牌/专利/牌照壁垒？成本转嫁能力？
 - 特别关注特精专新企业，它们在某些环节可能具有极高的不可替代性
 
-## 五、综合排名（业务+基本面+护城河）
-用表格按"业务经营20% + 基本面30% + 不可替代性&溢价50%"权重降序：
-表头：排名 | 公司 | 代码 | 业务经营 | 基本面 | 不可替代&溢价 | 综合分 | 所处环节 | 资金偏好
+## 五、评分依据说明
+逐公司用一两句话说明三项分项分数的打分依据（业务经营/基本面/不可替代与溢价），
+**不要给出加权总分和名次**（由程序计算后附在报告末尾）
 
 【重要原则】
 - 候选公司清单 JSON 必须是输出的第一部分（输出过长被截断时后面的段落可丢，JSON 不能丢）
+- 最后必须附「行业风险」小节：行业周期位置、政策与地缘风险、估值水位，各一两句，
+  每条高影响力利好须对应检查风险（如国产替代→下游资本开支放缓风险）
 - 所有结论必须基于搜索结果，不足处标注「信息不足」
 - 业务拆解数据是评估公司质量和成长性的核心，请尽可能详细
 - 资金偏好标签必须依据搜索数据中提及的资金类型判断，不可凭空猜测
@@ -458,18 +521,36 @@ class ResearcherAgent:
         summary = response.content if hasattr(response, 'content') else str(response)
         logger.info(f"产业链分析完成，长度: {len(summary)}")
 
-        # 从 LLM 输出中提取 candidate_codes，供下游 technical_agent 使用
+        # 从 LLM 输出中提取候选与分项评分，综合排名由程序计算
         import json, re
         candidate_codes = list(all_leader_codes)  # fallback：龙头搜索阶段已验证过的代码
-        json_match = re.search(r'\{[^{}]*"candidate_codes"[^{}]*\}', summary, re.DOTALL)
+        ranked = []
+        json_match = re.search(r'\{\s*"candidates"\s*:\s*\[.*?\]\s*\}', summary, re.DOTALL)
         if json_match:
             try:
                 extracted = json.loads(json_match.group(0))
-                if extracted.get("candidate_codes"):
-                    candidate_codes = extracted["candidate_codes"]
-                    logger.info(f"从 LLM 输出中提取候选代码: {candidate_codes}")
+                ranked = compute_composite_ranking(extracted.get("candidates") or [])
+                if ranked:
+                    candidate_codes = [item["code"] for item in ranked]
+                    logger.info(f"程序计算综合排名完成: "
+                                f"{[(i['code'], i['composite']) for i in ranked]}")
             except json.JSONDecodeError:
                 pass
+        if not ranked:
+            # 兼容旧格式 candidate_codes（无分项分数时不产生排名）
+            old_match = re.search(r'\{[^{}]*"candidate_codes"[^{}]*\}', summary, re.DOTALL)
+            if old_match:
+                try:
+                    extracted = json.loads(old_match.group(0))
+                    if extracted.get("candidate_codes"):
+                        candidate_codes = extracted["candidate_codes"]
+                except json.JSONDecodeError:
+                    pass
+
+        # 程序算的排名表附到报告末尾（responder 展示与复盘留档都以此为准）
+        if ranked:
+            summary = summary + "\n\n" + format_ranking_table(
+                ranked, name_of=lambda c: find_company_name(c))
 
         # 出口统一验证：只把能在股票基础表反查到的代码交给 technical_agent
         verified_codes = []

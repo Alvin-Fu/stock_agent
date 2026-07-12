@@ -22,6 +22,7 @@ KLINE_DATA_NOTES = """【数据说明（重要）】
    RSI(6/12/24)、KDJ(K/D/J)、BOLL上中下轨、ATR14、年内位置(0=年内最低,100=年内最高)、OBV趋势
 2. 近20根K线信号：金叉/死叉、均线形态、放量/缩量、跳空缺口——**这些信号已由程序精确判定，
    请直接引用解读，禁止自行从数字推算交叉**
+   公司名称以数据中提供的为准，**禁止凭记忆推断代码对应的公司名**（未提供名称时只写代码）
 3. 信号历史胜率：该股全部历史上同类信号出现后 N 根K线的涨跌统计（胜率/均值/中位数/样本数）。
    使用规则：这是历史条件频率，**不是对未来的预测**，表述时只能说"历史胜率"，禁止说"上涨概率"；
    胜率在45%~55%区间视为信号意义有限；标注"样本偏少"的仅作弱参考；除此之外禁止编造任何概率数字
@@ -99,6 +100,15 @@ class TechnicalAgent:
             logger.error(f"工具 {tool_name}({stock_code}) 执行失败: {e}")
             return f"获取失败: {e}"
 
+    @staticmethod
+    def _resolve_name(code: str) -> str:
+        """从股票基础表反查公司名（查不到返回空串，绝不让 LLM 自行猜名）"""
+        try:
+            from tools.company_code_validator import find_company_name
+            return find_company_name(code) or ""
+        except Exception:
+            return ""
+
     def _fetch_kline(self, code: str) -> str:
         """拉取单只股票的日线/周线/月线，拼成文本"""
         parts = []
@@ -140,10 +150,12 @@ class TechnicalAgent:
         logger.info(f"技术分析（单股模式），股票: {code}")
 
         kline_text = self._fetch_kline(code)
+        name = self._resolve_name(code)
+        label = f"{name}({code})" if name else code
 
         messages = [
             SystemMessage(content=self._build_single_prompt()),
-            HumanMessage(content=f"""请分析股票 {code} 的技术指标。
+            HumanMessage(content=f"""请分析股票 {label} 的技术指标。
 
 【用户问题】{question}
 
@@ -172,8 +184,11 @@ class TechnicalAgent:
         per_stock_budget = max(4000, 25000 // len(codes))
         all_kline = ""
         for code in codes:
+            # 附上验证过的公司名，防止 LLM 凭记忆给代码配错名字（如把鼎龙股份写成别家）
+            name = self._resolve_name(code)
+            label = f"{name}({code})" if name else code
             kline = self._fetch_kline(code)[:per_stock_budget]
-            all_kline += f"\n{'#'*60}\n### 股票 {code}\n{kline}\n"
+            all_kline += f"\n{'#'*60}\n### 股票 {label}\n{kline}\n"
 
         messages = [
             SystemMessage(content=self._build_chain_prompt()),
