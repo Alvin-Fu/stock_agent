@@ -68,10 +68,10 @@ tools:
 database:
   sqlite_path: "./data/sqlite/stock.db"
 
-# 联网搜索（填了 tavily_api_key 用 Tavily，否则用 DuckDuckGo）
+# 联网搜索（填了 tavily_api_key 用 Tavily，否则用 DuckDuckGo；
+# 结构化信源——东财新闻/巨潮公告/财联社快讯——走 akshare 免 key，自动启用）
 search:
   tavily_api_key: ""
-  serpapi_api_key: ""
 
 # 飞书机器人（python feishu_bot.py 启动；长连接模式，无需公网地址）
 feishu:

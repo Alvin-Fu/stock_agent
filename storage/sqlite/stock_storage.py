@@ -1007,6 +1007,7 @@ class IndustrySnapshot(Base):
     candidates = Column(Text)  # JSON: [{"code","name","price","rank"}]，rank 从 1 开始
     top_pick = Column(String(10))  # 技术面最强的股票代码
     industry_view = Column(String(10))  # 行业判断：偏多/中性/偏空
+    valuation = Column(Text)  # 行业估值与位置指标 JSON（含 overall 标签，复盘对账用）
     benchmark_price = Column(Float)  # 沪深300 当时点位
     review_done = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.now, index=True)
@@ -1019,6 +1020,7 @@ class IndustrySnapshot(Base):
             'candidates': self.candidates,
             'top_pick': self.top_pick,
             'industry_view': self.industry_view,
+            'valuation': self.valuation,
             'benchmark_price': self.benchmark_price,
             'review_done': bool(self.review_done),
             'created_at': self.created_at,
@@ -1371,6 +1373,14 @@ class DatabaseManager:
                             conn.commit()
                             logger.info("检测到 daily_forecast 旧表（单列 unique 约束），已删除待重建")
                             break
+
+                # industry_snapshot：旧表缺 valuation 列时补齐
+                if 'industry_snapshot' in table_names:
+                    snap_cols = [c['name'] for c in inspector.get_columns('industry_snapshot')]
+                    if 'valuation' not in snap_cols:
+                        conn.execute(text('ALTER TABLE industry_snapshot ADD COLUMN valuation TEXT'))
+                        conn.commit()
+                        logger.info("industry_snapshot 表补充 valuation 列（行业估值指标 JSON）")
 
                 # stock_income：旧表缺四项费用列时用 ALTER TABLE 补齐（有数据不能 DROP 重建）
                 if 'stock_income' in table_names:

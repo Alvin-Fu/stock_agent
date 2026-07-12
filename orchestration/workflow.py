@@ -85,10 +85,13 @@ class WorkflowExecutor:
                         from monitoring.review import snapshot_industry_analysis_async
                         codes = [c.strip() for c in snap_code.split(",") if c.strip()]
                         # 产业链复盘要看候选与技术面全文，把两份摘要拼给抽取器
-                        research = (final_state.get("research_result") or {}).get("summary", "")
+                        research_result = final_state.get("research_result") or {}
+                        research = research_result.get("summary", "")
                         technical = (final_state.get("technical_result") or {}).get("summary", "")
                         full_report = f"{snap_answer}\n\n{research[-3000:]}\n\n{technical[-2000:]}"
-                        snapshot_industry_analysis_async(snap_industry, question, full_report, codes)
+                        snapshot_industry_analysis_async(
+                            snap_industry, question, full_report, codes,
+                            valuation=research_result.get("industry_valuation"))
             except Exception as e:
                 logger.warning(f"分析快照留档触发失败（不影响本次回答）: {e}")
 

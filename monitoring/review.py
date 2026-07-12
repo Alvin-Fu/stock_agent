@@ -232,7 +232,8 @@ _INDUSTRY_EXTRACT_PROMPT = """从以下产业链分析报告中抽取可检验�
 
 
 def snapshot_industry_analysis(industry_name: str, question: str, final_answer: str,
-                               candidate_codes: List[str]) -> Optional[int]:
+                               candidate_codes: List[str],
+                               valuation: Optional[Dict[str, Any]] = None) -> Optional[int]:
     """产业链分析完成后留档（同步实现，调用方用线程异步跑）"""
     if not industry_name or not candidate_codes:
         return None
@@ -289,6 +290,7 @@ def snapshot_industry_analysis(industry_name: str, question: str, final_answer: 
             industry_name=industry_name[:100], question=(question or "")[:500],
             candidates=json.dumps(candidates, ensure_ascii=False),
             top_pick=top_pick, industry_view=industry_view,
+            valuation=json.dumps(valuation, ensure_ascii=False) if valuation else None,
             benchmark_price=benchmark_price,
         )
         logger.info(f"[复盘] 产业链快照已留档 #{snapshot_id}：{industry_name}，"
@@ -300,10 +302,11 @@ def snapshot_industry_analysis(industry_name: str, question: str, final_answer: 
 
 
 def snapshot_industry_analysis_async(industry_name: str, question: str, final_answer: str,
-                                     candidate_codes: List[str]) -> None:
+                                     candidate_codes: List[str],
+                                     valuation: Optional[Dict[str, Any]] = None) -> None:
     threading.Thread(
         target=snapshot_industry_analysis,
-        args=(industry_name, question, final_answer, candidate_codes),
+        args=(industry_name, question, final_answer, candidate_codes, valuation),
         name="industry-snapshot", daemon=True,
     ).start()
 
@@ -494,6 +497,23 @@ class ReviewRunner:
                 performance, snap.get("benchmark_price"), self._current_benchmark_price(),
                 snap.get("top_pick"), snap.get("industry_view"))
 
+            # 当时的估值/回调提示对账（代码判定）
+            risk_note = ""
+            try:
+                valuation = json.loads(snap.get("valuation") or "null")
+                if valuation and valuation.get("overall"):
+                    overall = valuation["overall"]
+                    if overall == "过热警示":
+                        hit = verdicts["portfolio_return"] < 0
+                        risk_note = (f"当时程序标签「过热警示」→ 组合实际 "
+                                     f"{verdicts['portfolio_return']:+.2f}%，回调提示{'兑现' if hit else '未兑现'}")
+                    elif overall == "低位区域":
+                        hit = verdicts["portfolio_return"] > 0
+                        risk_note = (f"当时程序标签「低位区域」→ 组合实际 "
+                                     f"{verdicts['portfolio_return']:+.2f}%，低位判断{'兑现' if hit else '未兑现'}")
+            except (json.JSONDecodeError, TypeError):
+                pass
+
             perf_sorted = sorted(performance, key=lambda x: x["pct"], reverse=True)
             perf_lines = "\n".join(
                 f"  综合排名{p.get('rank', '?')} {p['name']}({p['code']}): {p['pct']:+.2f}%"
@@ -515,6 +535,7 @@ class ReviewRunner:
   → 程序判定：{verdicts['rank_effective']}
 - 技术面首选实际涨幅名次：{verdicts['top_pick_rank']}
 - 行业方向对账：{verdicts['direction_verdict']}
+{f'- 估值/回调提示对账（程序判定）：{risk_note}' if risk_note else ''}
 【逐只表现】
 {perf_lines}
 

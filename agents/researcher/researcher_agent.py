@@ -433,6 +433,26 @@ class ResearcherAgent:
         question = state.get("question", "")
         logger.info(f"研究 Agent（个股模式），股票: {stock_code}")
 
+        # ---- 结构化信源（主）：东财新闻 / 巨潮公告 / 财联社快讯 ----
+        from tools.info_sources import (
+            fetch_stock_news, fetch_stock_announcements, fetch_cls_telegraph, format_info_block)
+        try:
+            company_name = find_company_name(stock_code) or ""
+        except Exception:
+            company_name = ""
+        structured_blocks = []
+        for block in (
+            format_info_block("巨潮公告（最近30天，重大事项第一手来源）",
+                              fetch_stock_announcements(stock_code), with_content=False),
+            format_info_block("东财个股新闻（最新15条）", fetch_stock_news(stock_code)),
+            format_info_block("财联社快讯（含该公司的条目）",
+                              fetch_cls_telegraph(keywords=[company_name] if company_name else None, limit=10)),
+        ):
+            if block:
+                structured_blocks.append(block)
+        structured_text = "\n\n".join(structured_blocks) if structured_blocks else "（结构化信源暂无数据）"
+
+        # ---- 网页搜索（补充） ----
         queries = self._build_stock_queries(stock_code)
         all_results = self._do_search(queries)
         search_text = self._search_text(all_results)
@@ -440,9 +460,13 @@ class ResearcherAgent:
         messages = [
             SystemMessage(content=self._build_stock_system_prompt()),
             HumanMessage(content=f"""用户问题：{question}
-股票代码：{stock_code}
-========== 全网搜索结果 ==========
-{search_text[:12000]}
+股票代码：{stock_code}{f'（{company_name}）' if company_name else ''}
+
+========== 结构化信源（公告/新闻/快讯，可信度高，与搜索结果冲突时以此为准） ==========
+{structured_text[:8000]}
+
+========== 全网搜索结果（补充信息） ==========
+{search_text[:10000]}
 请基于以上信息进行全面分析。"""),
         ]
 
@@ -497,6 +521,23 @@ class ResearcherAgent:
                 if snippet:
                     chain_summary += f"  搜索摘要: {snippet}\n"
 
+        # 行业相关的财联社快讯（结构化信源，含政策面）
+        from tools.info_sources import fetch_cls_telegraph, format_info_block
+        cls_block = format_info_block(
+            "财联社快讯（含该行业关键词的条目，政策/宏观第一手来源）",
+            fetch_cls_telegraph(keywords=[industry_name], limit=15))
+
+        # 行业估值与位置（程序计算，用龙头池做行业代理样本）——回调风险分析的量化锚
+        from tools.industry_metrics import collect_industry_valuation, format_industry_valuation
+        industry_valuation = None
+        try:
+            if all_leader_codes:
+                logger.info(f"计算行业估值与位置（样本 {len(all_leader_codes)} 只）...")
+                industry_valuation = collect_industry_valuation(sorted(all_leader_codes))
+        except Exception as e:
+            logger.warning(f"行业估值计算失败（不影响分析主流程）: {e}")
+        valuation_block = format_industry_valuation(industry_valuation)
+
         # 全景搜索（含不可替代性/溢价能力维度）
         all_queries = self._build_chain_queries(industry_name, chain)
         all_results = self._do_search(all_queries)
@@ -506,6 +547,10 @@ class ResearcherAgent:
             SystemMessage(content=self._build_chain_system_prompt()),
             HumanMessage(content=f"""用户问题：{question}
 目标行业：{industry_name}
+
+{cls_block if cls_block else ''}
+
+{valuation_block if valuation_block else ''}
 
 ========== 产业链结构（上中下游+特精专新+细分领域+龙一龙二） ==========
 {chain_summary}
@@ -568,7 +613,8 @@ class ResearcherAgent:
 
         return {
             "messages": [response],
-            "research_result": {"summary": summary, "sources": all_queries},
+            "research_result": {"summary": summary, "sources": all_queries,
+                                "industry_valuation": industry_valuation},
             "chain_leaders": chain,
             "stock_code": ",".join(verified_codes) if verified_codes else "",
             "intermediate_steps": [("researcher", {"mode": "chain", "industry": industry_name, "segments": sum(len(chain.get(k,[])) for k in ["upstream","midstream","downstream","niche_innovators"]), "candidates": len(verified_codes), "queries": len(all_queries)})],

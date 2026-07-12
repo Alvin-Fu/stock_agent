@@ -144,6 +144,32 @@ class TechnicalAgent:
                 "intermediate_steps": [("technical_analyze", {"error": str(e)})],
             }
 
+    def _build_trade_plan(self, code: str) -> tuple:
+        """拉三周期 df，程序计算操作参考计划；返回 (plan_dict, plan_text)"""
+        try:
+            from tools.stock_tools import stock_tool_instance, _ensure_indicators
+            from tools.trade_plan import build_trade_plan, format_trade_plan
+
+            def _latest_row(fetch_fn, freq):
+                df = fetch_fn(code)
+                if df is None or df.empty:
+                    return None, None
+                df = _ensure_indicators(df, freq)
+                return df, df.iloc[0].to_dict()
+
+            df_d, daily_row = _latest_row(stock_tool_instance.fetch_and_save_stock_daily_data, "daily")
+            _, weekly_row = _latest_row(stock_tool_instance.fetch_and_save_stock_weekly_data, "week")
+            _, monthly_row = _latest_row(stock_tool_instance.fetch_and_save_stock_monthly_data, "month")
+            if daily_row is None:
+                return None, ""
+            recent_low20 = float(df_d.head(20)["low"].min()) if "low" in df_d.columns else None
+            recent_high60 = float(df_d.head(60)["high"].max()) if "high" in df_d.columns else None
+            plan = build_trade_plan(daily_row, weekly_row, monthly_row, recent_low20, recent_high60)
+            return plan, format_trade_plan(plan)
+        except Exception as e:
+            logger.warning(f"操作参考计划计算失败（不影响技术分析）: {e}")
+            return None, ""
+
     def _analyze_single(self, state: AgentState, code: str) -> Dict[str, Any]:
         """单股技术分析"""
         question = state.get("question", "")
@@ -152,6 +178,7 @@ class TechnicalAgent:
         kline_text = self._fetch_kline(code)
         name = self._resolve_name(code)
         label = f"{name}({code})" if name else code
+        plan, plan_text = self._build_trade_plan(code)
 
         messages = [
             SystemMessage(content=self._build_single_prompt()),
@@ -159,10 +186,13 @@ class TechnicalAgent:
 
 【用户问题】{question}
 
+{plan_text if plan_text else ''}
+
 ========== K线数据 ==========
 {kline_text}
 
-请按日线→周线→月线→综合研判顺序分析。"""),
+请按日线→周线→月线→综合研判顺序分析；若上方提供了【操作参考】，
+在"技术面总结与风险提示"中原样引用其方向/价位/仓位数字并解释依据，禁止修改数字。"""),
         ]
 
         response = self.llm.invoke(messages)
@@ -171,7 +201,8 @@ class TechnicalAgent:
 
         return {
             "messages": [response],
-            "technical_result": {"summary": summary, "mode": "single", "code": code},
+            "technical_result": {"summary": summary, "mode": "single", "code": code,
+                                 "trade_plan": plan, "trade_plan_text": plan_text},
             "intermediate_steps": [("technical_analyze", {"mode": "single", "code": code})],
         }
 

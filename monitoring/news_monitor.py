@@ -35,33 +35,31 @@ class NewsMonitor:
             self._llm = get_default_llm()
         return self._llm
 
-    # ---------- 数据源 ----------
+    # ---------- 数据源（统一走 tools.info_sources） ----------
 
     @staticmethod
     def _fetch_company_news(code: str) -> List[Dict[str, str]]:
-        """东财个股新闻（约最近100条，取最新20条足够增量用）"""
-        import akshare as ak
-        df = ak.stock_news_em(symbol=code)
-        items = []
-        for _, row in df.head(20).iterrows():
-            items.append({
-                "title": str(row.get("新闻标题", "")).strip(),
-                "content": str(row.get("新闻内容", "")).strip()[:500],
-                "url": str(row.get("新闻链接", "")).strip(),
-                "time": str(row.get("发布时间", "")).strip(),
-            })
-        return items
+        """东财个股新闻（结构化主源）"""
+        from tools.info_sources import fetch_stock_news
+        return fetch_stock_news(code, limit=20)
 
     @staticmethod
     def _fetch_industry_news(name: str, keywords: str) -> List[Dict[str, str]]:
-        """行业/宏观政策：联网搜索（复用 researcher 的搜索工具）"""
+        """行业/宏观政策：财联社快讯按关键词过滤（主源）；无命中时联网搜索兜底"""
+        from tools.info_sources import fetch_cls_telegraph
+        kws = [name] + [k.strip() for k in (keywords or "").split() if k.strip()]
+        items = fetch_cls_telegraph(keywords=kws, limit=10)
+        if items:
+            # 快讯没有链接，用标题+时间做去重键（fetch 层已带 time/title）
+            return [{**it, "url": ""} for it in items]
+
+        # 兜底：联网搜索（整体作为一条候选，按天去重）
         from agents.researcher.web_search_tool import web_search
         query = f"{name} {keywords or ''} 政策 新闻 最新 {date.today().strftime('%Y年%m月')}".strip()
         result = web_search.invoke({"query": query})
         text = str(result)
         if not text or text.startswith("搜索失败"):
             return []
-        # 搜索结果整体作为一条候选，标题带日期戳按天去重
         return [{
             "title": f"{name} 行业动态/政策（{date.today()}）",
             "content": text[:1500],
