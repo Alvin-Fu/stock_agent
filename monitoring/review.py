@@ -28,11 +28,14 @@ _EXTRACT_PROMPT = """从以下股票分析报告中抽取可检验的核心判�
   "mid_term_view": "偏多/中性/偏空",
   "support": [支撑位价格数字, ...],
   "resistance": [压力位价格数字, ...],
-  "key_reasons": ["核心理由1", "核心理由2", "核心理由3"]
+  "key_reasons": ["核心理由1", "核心理由2", "核心理由3"],
+  "moat_view": "护城河评级及一句依据（如：高——星载T/R芯片唯一上市标的）",
+  "flywheel_view": "飞轮判断及一句依据（如：未见明显飞轮——各业务相互独立）"
 }}
 
 规则：报告没有明确给出的项用 null（数组给 []）；support/resistance 只要具体价格数字；
-key_reasons 最多3条、每条20字内，只选支撑最终结论的关键依据。
+key_reasons 最多3条、每条20字内，只选支撑最终结论的关键依据；
+moat_view/flywheel_view 各 40 字内，报告没提就 null。
 
 分析报告：
 {report}"""
@@ -57,12 +60,16 @@ def _parse_judgement(raw: str) -> Optional[Dict[str, Any]]:
                 except (TypeError, ValueError):
                     continue
             return out[:4]
+        def _text(v, limit=80):
+            return str(v)[:limit] if v else None
         return {
             "short_term_view": _view(data.get("short_term_view")),
             "mid_term_view": _view(data.get("mid_term_view")),
             "support": _prices(data.get("support")),
             "resistance": _prices(data.get("resistance")),
             "key_reasons": [str(r)[:40] for r in (data.get("key_reasons") or [])[:3]],
+            "moat_view": _text(data.get("moat_view")),
+            "flywheel_view": _text(data.get("flywheel_view")),
         }
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
@@ -115,6 +122,8 @@ def snapshot_analysis(stock_code: str, question: str, final_answer: str,
             key_reasons=json.dumps(judgement["key_reasons"], ensure_ascii=False),
             indicators=json.dumps(indicators, ensure_ascii=False, default=str),
             trade_plan=json.dumps(trade_plan, ensure_ascii=False, default=str) if trade_plan else None,
+            moat_view=judgement.get("moat_view"),
+            flywheel_view=judgement.get("flywheel_view"),
         )
         logger.info(f"[复盘] {stock_code} 分析快照已留档 #{snapshot_id}"
                     f"（短期{judgement['short_term_view']}，价 {price}）")

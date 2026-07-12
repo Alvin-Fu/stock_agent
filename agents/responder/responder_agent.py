@@ -90,6 +90,11 @@ class ResponderAgent:
   资金/机构动向只在有公开证据（北向/龙虎榜/机构调研）时标注并写出处，无证据不填；
   某个环节没筛出上市候选时必须明写「该环节未筛出候选」，禁止静默省略整层
 - 说明候选池全貌：共筛出几家、详细分析了哪几家、取舍标准是什么
+- 技术分析材料标注「未执行/skipped」时，必须表述为"全部候选未过护城河门槛，
+  未执行技术分析"，禁止写成"技术面因无数据不可参考"这类数据缺失表述，
+  也不得把它列为利空或"不具备介入条件"的证据——它只是流程性跳过
+- 行业估值样本不足5只时，禁止使用「板块/行业 PE 中位数/历史分位」措辞，
+  只能表述为"候选池N只样本的估值参考"，且必须带上样本数
 - 必须包含独立的行业风险一节（周期位置/政策与地缘/估值水位等），
   管线数据问题（如信息矛盾）单独列，不得用它替代行业风险
 - **报告必须以「⭐ 最值得投资标的」一节收尾（TOP1-3，按综合排名+技术面选）**，每家给：
@@ -139,6 +144,15 @@ class ResponderAgent:
             parts.append(f"时间：{created}，当时价格：{snap.get('price_at_analysis')}，"
                          f"短期判断：{snap.get('short_term_view') or '未明确'}，"
                          f"中期判断：{snap.get('mid_term_view') or '未明确'}")
+            # 定性判断延续：飞轮/护城河这类结论不允许在两次分析间无理由翻转
+            qual = []
+            if snap.get("moat_view"):
+                qual.append(f"护城河：{snap['moat_view']}")
+            if snap.get("flywheel_view"):
+                qual.append(f"飞轮：{snap['flywheel_view']}")
+            if qual:
+                parts.append("上次定性判断（" + "；".join(qual) + "）——本次要么延续该判断，"
+                             "要么明确写出改判依据（出现了什么新证据），禁止无说明地翻转结论")
             review = db.get_last_review_for_code(stock_code)
             if review:
                 parts.append(f"最近一次复盘结论（{str(review.get('created_at'))[:10]}，"

@@ -78,6 +78,32 @@ class MonitorScheduler:
         except Exception as e:
             logger.error(f"[复盘] 定时复盘异常: {e}")
 
+    def _run_backup(self):
+        """每日备份主库（快照/复盘/监控历史都在里面），保留最近 7 份"""
+        try:
+            import glob
+            import os
+            import sqlite3
+            from utils.config import load_config
+            raw = str((load_config().get("database") or {}).get("sqlite_path", "./data/sqlite/stock.db"))
+            path = raw.replace("sqlite:///", "")
+            if not os.path.exists(path):
+                return
+            bdir = os.path.join(os.path.dirname(path) or ".", "backup")
+            os.makedirs(bdir, exist_ok=True)
+            dest = os.path.join(bdir, f"stock-{date.today().strftime('%Y%m%d')}.db")
+            src = sqlite3.connect(path)
+            dst = sqlite3.connect(dest)
+            with dst:
+                src.backup(dst)  # sqlite 在线备份 API，写入中也能安全拷贝
+            src.close()
+            dst.close()
+            for old in sorted(glob.glob(os.path.join(bdir, "stock-*.db")))[:-7]:
+                os.remove(old)
+            logger.info(f"[备份] 数据库已备份: {dest}（保留最近7份）")
+        except Exception as e:
+            logger.error(f"[备份] 数据库备份失败: {e}")
+
     # ---------- 生命周期 ----------
 
     def start(self):
@@ -89,6 +115,7 @@ class MonitorScheduler:
         self._schedule.every().day.at(self.signal_scan_time).do(self._run_signal_scan)
         self._schedule.every(self.news_interval).minutes.do(self._run_news_scan)
         self._schedule.every().day.at(self.review_time).do(self._run_reviews)
+        self._schedule.every().day.at("22:30").do(self._run_backup)
 
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="monitor-scheduler", daemon=True)

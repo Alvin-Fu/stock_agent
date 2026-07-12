@@ -39,6 +39,8 @@ def _make_checkpointer():
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # 分析在工作线程里跑，必须放开 same_thread 限制（SqliteSaver 内部有锁）
         conn = sqlite3.connect(path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         logger.info(f"对话记忆使用 SQLite 持久化: {path}")
         return SqliteSaver(conn)
     except Exception as e:

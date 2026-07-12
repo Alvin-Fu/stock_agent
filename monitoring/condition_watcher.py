@@ -55,6 +55,33 @@ class ConditionWatcher:
     # ---------- 条件判定（纯代码） ----------
 
     @staticmethod
+    def price_drifted(daily_df, snap_created, snap_price,
+                      tolerance_pct: float = 2.0) -> Optional[bool]:
+        """
+        除权漂移检测：分红/送股后前复权序列整体平移，快照里的价位条件会全部错位。
+        对比快照当日（或其前最近交易日）在当前序列中的收盘价与快照记录的价格：
+        偏差超过 tolerance_pct 判定漂移。无法核对（缺数据）返回 None。
+        """
+        try:
+            from utils.common import parse_row_date
+            if snap_price is None or daily_df is None or daily_df.empty:
+                return None
+            snap_date = parse_row_date(str(snap_created)[:10])
+            if snap_date is None:
+                return None
+            for _, row in daily_df.iterrows():  # 降序：从最新往回找快照日或其前最近交易日
+                d = parse_row_date(row.get("date"))
+                if d is None or d > snap_date:
+                    continue
+                close_then = row.get("close")
+                if close_then is None:
+                    return None
+                return abs(float(close_then) / float(snap_price) - 1) * 100 > tolerance_pct
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
     def check_conditions(plan: Dict, close: float,
                          new_direction: Optional[str] = None) -> List[Dict[str, str]]:
         """
@@ -121,8 +148,22 @@ class ConditionWatcher:
             return 0
 
         new_plan = self._current_direction(daily_df, daily_row, weekly_row, monthly_row)
-        hits = self.check_conditions(plan, close,
-                                     new_direction=new_plan.get("direction") if new_plan else None)
+        new_direction = new_plan.get("direction") if new_plan else None
+
+        # 除权漂移：旧价位条件全部作废（只提醒一次），方向翻转判断不受影响
+        drifted = self.price_drifted(daily_df, snap.get("created_at"), snap.get("price_at_analysis"))
+        if drifted:
+            key = f"cond:{code}:{snap['id']}:drift"
+            if self.db.save_monitor_event(target=name, event_type="condition", dedup_key=key,
+                                          title="检测到除权/复权调整", importance="高", pushed=True):
+                self.notifier.send(
+                    f"⚠️ 价位条件失效 | {name}({code})\n"
+                    f"检测到除权/复权调整，{str(snap.get('created_at'))[:10]} 分析留档的"
+                    f"买卖/止损价位已不可比，建议重新发送「分析 {name}」刷新操作参考")
+            hits = self.check_conditions({"direction": plan.get("direction")}, close,
+                                         new_direction=new_direction)  # 只保留方向翻转判断
+        else:
+            hits = self.check_conditions(plan, close, new_direction=new_direction)
         count = 0
         for h in hits:
             dedup_key = f"cond:{code}:{snap['id']}:{h['key']}"

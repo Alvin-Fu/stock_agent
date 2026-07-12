@@ -275,6 +275,21 @@ class ResearcherAgent:
 
                 leaders = self._extract_leaders_from_text(str(result), seg_name, level)
 
+                # 保底重试：首搜零候选时换一条更直白的查询再试一次，
+                # 避免整个环节（乃至整层中游/下游）静默为空、候选池塌缩
+                if not leaders:
+                    retry_query = f"{industry} {seg_name} 上市公司 A股 龙头 股票代码"
+                    logger.info(f"[{level}/{seg_name}] 首搜零候选，重试: {retry_query[:50]}...")
+                    try:
+                        retry_result = web_search.invoke({"query": retry_query})
+                        leaders = self._extract_leaders_from_text(str(retry_result), seg_name, level)
+                        if leaders:
+                            result = retry_result
+                    except Exception as e:
+                        logger.warning(f"细分领域重试搜索失败 [{seg_name}]: {e}")
+                if not leaders:
+                    logger.warning(f"[{level}/{seg_name}] 两次搜索均未筛出上市候选，该环节将标记为空")
+
                 level_leaders.append({
                     "segment": seg_name,
                     "leaders": leaders,

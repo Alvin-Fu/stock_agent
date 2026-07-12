@@ -59,6 +59,8 @@ def split_report(text: str, limit: int = 4000) -> list:
 
 HELP_TEXT = """🤖 股票分析助手使用说明
 · 直接提问：如「分析比亚迪」「600519 技术面怎么样」「白酒产业链有哪些机会」
+· 一条消息可以带多个对象：如「分析比亚迪和宁德时代」「看看比亚迪，再看看半导体产业链」
+  （自动拆开逐个分析，最多4个，最后附组合速览）
 · 监控 比亚迪 —— 加入监控清单（公司名或6位代码；识别不到代码时按行业监控）
 · 取消监控 比亚迪
 · 监控列表
@@ -88,16 +90,56 @@ class FeishuBot:
             self._executor = WorkflowExecutor(enable_memory=True)
         return self._executor
 
+    @staticmethod
+    def _send_answer(answer: str, reply):
+        """超长报告按章节边界切段发送（不在表格/句子中间截断），多段带序号"""
+        chunks = split_report(answer)
+        total = len(chunks)
+        for i, chunk in enumerate(chunks, 1):
+            reply(f"({i}/{total})\n{chunk}" if total > 1 else chunk)
+
     def _run_analysis(self, question: str, thread_id: str, reply):
         try:
             executor = self._get_workflow()
-            state = executor.run_sync(question, thread_id=thread_id)
-            answer = executor.get_final_answer(state)
-            # 超长报告按章节边界切段发送（不在表格/句子中间截断），多段带序号
-            chunks = split_report(answer)
-            total = len(chunks)
-            for i, chunk in enumerate(chunks, 1):
-                reply(f"({i}/{total})\n{chunk}" if total > 1 else chunk)
+
+            # 入口任务拆解：一条消息里含多个公司/行业时逐个分析（拆解失败自动回落单任务）
+            from orchestration.task_splitter import split_tasks
+            tasks = split_tasks(question)
+
+            if len(tasks) <= 1:
+                state = executor.run_sync(question, thread_id=thread_id)
+                self._send_answer(executor.get_final_answer(state), reply)
+                return
+
+            names = "、".join(t["target"] or f"对象{i}" for i, t in enumerate(tasks, 1))
+            reply(f"🧩 识别到 {len(tasks)} 个分析对象：{names}\n将逐个完整分析（每个约3-10分钟），完成一个回一个")
+
+            plans = []
+            for i, t in enumerate(tasks, 1):
+                label = t["target"] or f"对象{i}"
+                reply(f"▶ ({i}/{len(tasks)}) 开始分析 {label} …")
+                try:
+                    # 每个对象独立会话，互不污染对话记忆
+                    state = executor.run_sync(t["question"], thread_id=f"{thread_id}:{label}")
+                    answer = executor.get_final_answer(state)
+                    self._send_answer(f"【{label}】\n{answer}", reply)
+                    plan = (state.get("technical_result") or {}).get("trade_plan")
+                    if plan:
+                        plans.append((label, plan))
+                except Exception as e:
+                    logger.error(f"[飞书] 子任务 {label} 分析失败: {e}\n{traceback.format_exc()}")
+                    reply(f"❌ {label} 分析失败：{e}（继续下一个）")
+
+            # 组合速览卡：程序数字直接拼，不经 LLM
+            if len(plans) >= 2:
+                lines = ["📋 组合速览（程序操作参考对比）"]
+                for label, p in plans:
+                    seg = f"· {label}：{p.get('direction')} | 现价{p.get('close')} | 仓位{p.get('position')}成"
+                    if p.get("risk_reward") is not None:
+                        seg += f" | 盈亏比{p.get('risk_reward')}"
+                    lines.append(seg)
+                lines.append("（详情见各标的报告；仅罗列程序数字，非组合配置建议）")
+                reply("\n".join(lines))
         except Exception as e:
             logger.error(f"[飞书] 分析失败: {e}\n{traceback.format_exc()}")
             reply(f"❌ 分析出错了：{e}")
@@ -239,7 +281,7 @@ class FeishuBot:
                 return
 
             # 走完整分析流程
-            reply("📊 收到，分析中（约2-5分钟，完成后回复）…")
+            reply("📊 收到，分析中（个股约3-6分钟，产业链10分钟以上），完成后回复…")
             thread_id = sender_open_id if chat_type == "p2p" else message.chat_id
             self.pool.submit(self._run_analysis, text, thread_id, reply)
 

@@ -131,6 +131,20 @@ class TechnicalAgent:
             # 判断是单股还是多股（产业链）场景
             codes = [c.strip() for c in stock_code.split(",") if c.strip()] if stock_code else []
 
+            # 空代码早退：候选池被护城河门槛清空（或问题里没识别出股票代码）时，
+            # 不能拿空串去拉K线——那会产生"技术面无数据"的假象，混进投资结论里
+            if not codes:
+                logger.info("技术分析跳过：候选池为空（护城河门槛剔除全部候选或未识别出股票代码）")
+                return {
+                    "messages": [],
+                    "technical_result": {
+                        "summary": "未执行技术分析：候选池为空（全部候选被护城河门槛剔除，或问题中未识别出股票代码）。"
+                                   "这是流程性跳过，不是行情数据缺失，不得作为利空证据引用。",
+                        "mode": "skipped",
+                    },
+                    "intermediate_steps": [("technical_analyze", {"mode": "skipped", "reason": "empty_codes"})],
+                }
+
             if len(codes) > 1:
                 return self._analyze_chain(state, codes)
             else:

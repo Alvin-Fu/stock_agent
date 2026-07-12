@@ -139,7 +139,12 @@ def format_industry_valuation(metrics: Optional[Dict[str, Any]]) -> str:
     """格式化为 prompt 文本块；无数据返回空串"""
     if not metrics:
         return ""
-    lines = [f"【行业估值与位置（程序按 {metrics['sample_count']} 只龙头样本计算，仅供风险评估参考）】"]
+    n = metrics["sample_count"]
+    # 样本不足5只时中位数没有板块代表性（薄利股的失真PE会主导结果），标题降级并明示
+    if n < 5:
+        lines = [f"【候选池估值参考（程序按 {n} 只样本计算——样本不足，不代表板块/行业水位，仅供参考）】"]
+    else:
+        lines = [f"【行业估值与位置（程序按 {n} 只龙头样本计算，仅供风险评估参考）】"]
     if metrics.get("pe_median") is not None:
         pct = f"，PE历史分位中位数 {metrics['pe_percentile_median']}%" \
             if metrics.get("pe_percentile_median") is not None else ""
@@ -152,7 +157,10 @@ def format_industry_valuation(metrics: Optional[Dict[str, Any]]) -> str:
         lines.append(f"  乖离：收盘相对MA20平均乖离 {metrics['bias_ma20_avg']}%")
     lines.append(f"  程序参考标签：{metrics['overall']}（{'、'.join(metrics['labels'])}）")
     lines.append("  ⚠️ 使用规则：以上为历史/当前状态的量化描述，回调风险分析须基于这些数字展开，"
-                 "禁止在此之外编造估值或概率数字")
+                 "禁止在此之外编造估值或概率数字；乖离为负=价格已回落到MA20下方（回调已发生），"
+                 "禁止表述为'即将回落/存在回落压力'")
+    if n < 5:
+        lines.append(f"  ⚠️ 样本仅 {n} 只：禁止称'板块/行业中位数'，引用时必须写明样本数")
     return "\n".join(lines)
 
 

@@ -966,6 +966,8 @@ class AnalysisSnapshot(Base):
     key_reasons = Column(Text)  # 核心理由列表 JSON
     indicators = Column(Text)  # 当时关键指标快照 JSON（ma_pattern/rsi6/pos_52w等）
     trade_plan = Column(Text)  # 当时的程序操作参考 JSON（方向/观察区/止损/目标），条件触发提醒用
+    moat_view = Column(String(100))      # 当时的护城河评级及依据（定性判断延续用）
+    flywheel_view = Column(String(100))  # 当时的飞轮判断及依据（定性判断延续用）
     review_done = Column(Integer, nullable=False, default=0)  # 是否已自动复盘
     created_at = Column(DateTime, default=datetime.now, index=True)
 
@@ -983,6 +985,8 @@ class AnalysisSnapshot(Base):
             'key_reasons': self.key_reasons,
             'indicators': self.indicators,
             'trade_plan': self.trade_plan,
+            'moat_view': self.moat_view,
+            'flywheel_view': self.flywheel_view,
             'review_done': bool(self.review_done),
             'created_at': self.created_at,
         }
@@ -1331,6 +1335,18 @@ class DatabaseManager:
             pool_pre_ping=True,  # 连接健康检查（推荐开启）
         )
 
+        # SQLite 并发保护：飞书工作线程/监控调度线程/快照异步线程会同时写库，
+        # WAL 允许读写并发，busy_timeout 让写锁竞争时等待而不是立刻报 database is locked
+        if db_url.startswith("sqlite"):
+            from sqlalchemy import event as _sa_event
+
+            @_sa_event.listens_for(self._engine, "connect")
+            def _set_sqlite_pragma(dbapi_conn, _record):
+                cursor = dbapi_conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=5000")
+                cursor.close()
+
         # 步骤3：创建会话工厂
         # sessionmaker 是一个工厂函数，用于创建新的Session对象
         # 配置说明：
@@ -1404,13 +1420,17 @@ class DatabaseManager:
                         conn.commit()
                         logger.info("industry_snapshot 表补充 valuation 列（行业估值指标 JSON）")
 
-                # analysis_snapshot：旧表缺 trade_plan 列时补齐（条件触发提醒用）
+                # analysis_snapshot：旧表缺列时补齐（trade_plan=条件触发；moat/flywheel=定性延续）
                 if 'analysis_snapshot' in table_names:
                     asnap_cols = [c['name'] for c in inspector.get_columns('analysis_snapshot')]
-                    if 'trade_plan' not in asnap_cols:
-                        conn.execute(text('ALTER TABLE analysis_snapshot ADD COLUMN trade_plan TEXT'))
-                        conn.commit()
-                        logger.info("analysis_snapshot 表补充 trade_plan 列（程序操作参考 JSON）")
+                    for col_name, col_type, col_desc in (
+                            ('trade_plan', 'TEXT', '程序操作参考 JSON'),
+                            ('moat_view', 'VARCHAR(100)', '护城河评级'),
+                            ('flywheel_view', 'VARCHAR(100)', '飞轮判断')):
+                        if col_name not in asnap_cols:
+                            conn.execute(text(f'ALTER TABLE analysis_snapshot ADD COLUMN {col_name} {col_type}'))
+                            conn.commit()
+                            logger.info(f"analysis_snapshot 表补充 {col_name} 列（{col_desc}）")
 
                 # stock_income：旧表缺四项费用列时用 ALTER TABLE 补齐（有数据不能 DROP 重建）
                 if 'stock_income' in table_names:
