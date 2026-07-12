@@ -988,7 +988,7 @@ class ResearcherAgent:
                 _db.save_industry_triggers(industry_name, reeval_triggers)
                 kw = " ".join(t.get("keywords") or "" for t in reeval_triggers).strip()
                 _db.add_watch_target(name=industry_name, target_type="industry",
-                                     keywords=kw[:200] if kw else None)
+                                     keywords=kw[:200] if kw else None, source="auto")
                 trig_lines = ["【重估触发条件（已落库，监控任务自动盯梢，命中会推送提醒）】"]
                 trig_lines += [f"- [{t['trigger_type']}] {t['description']}" for t in reeval_triggers]
                 summary = summary + "\n\n" + "\n".join(trig_lines)

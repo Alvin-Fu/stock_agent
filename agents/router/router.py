@@ -166,13 +166,17 @@ class RouterAgent:
             }
 
         if is_stock_analysis:
-            next_agents = ["retriever"]
+            # retriever 不进默认队列：知识库是可选能力（当前未灌文档），
+            # 财报/新闻/公告由 analyst 和 researcher 实时获取
+            next_agents = []
             if has_financial:
                 next_agents.append("analyst")
             if has_technical:
                 next_agents.append("technical")
             if has_realtime:
                 next_agents.append("researcher")
+            if not next_agents:
+                next_agents = ["analyst", "technical", "researcher"]
             return {
                 "intent": IntentType.FINANCIAL_ANALYSIS if has_financial
                 else IntentType.TECHNICAL_ANALYSIS if has_technical

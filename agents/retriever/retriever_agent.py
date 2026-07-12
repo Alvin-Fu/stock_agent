@@ -38,14 +38,18 @@ class RetrieverAgent:
         self.graph = self._build_graph()
     
     def _load_vector_store(self):
-        """加载向量存储"""
+        """
+        加载向量存储。失败返回 None 而不是 raise——Chroma 是可选的远程服务
+        （Docker 127.0.0.1:8000），不在线时 raise 会把整个工作流图的构建炸掉；
+        检索节点自身已能处理 vector_store=None（跳过检索返回空文档）。
+        """
         try:
             vector_store = get_remote_chroma_client(self.collection_name, self.embeddings)
             logger.info(f"✅ 成功加载向量存储：{self.collection_name}")
             return vector_store
         except Exception as e:
-            logger.error(f"❌ 加载向量存储失败：{e}")
-            raise
+            logger.warning(f"向量存储不可用（Chroma 服务未启动或未初始化），检索将跳过：{e}")
+            return None
 
     def _build_graph(self) -> CompiledStateGraph:
         """构建状态图"""
@@ -65,6 +69,11 @@ class RetrieverAgent:
         try:
             if self.vector_store is None or not (self.vector_store._collection.count() or 0):
                 logger.info("知识库为空，跳过检索（喂入文档后自动恢复）")
+                try:
+                    from tools.source_health import report_source
+                    report_source("知识库", False, "Chroma不可用或未灌入文档")
+                except Exception:
+                    pass
                 return {"documents": [],
                         "intermediate_steps": [("retrieve", {"skipped": "知识库为空"})]}
         except Exception:

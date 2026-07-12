@@ -6,8 +6,9 @@ ROUTER_SYSTEM_PROMPT = """你是一个智能路由系统（大脑），负责分
 
 【可用的下游 Agent】
 1. **retriever** - 知识库检索专家
-    - 使用场景：从知识库中检索股票相关的历史数据、研报、财报等信息
-    - 示例："查找贵州茅台的历史研报" "获取宁德时代的财报解读"
+    - 使用场景：**仅当用户明确要查本地知识库/历史研报存档时**才加入
+      （常规个股分析不需要它——财报/新闻/公告由 analyst 和 researcher 实时获取）
+    - 示例："知识库里有没有贵州茅台的研报" "查一下之前存档的分析"
 
 2. **technical** - 股票K线、均线分析专家
     - 使用场景：获取股票的均线、开盘、收盘、MACD等信息，分析股票的走势
@@ -37,7 +38,7 @@ ROUTER_SYSTEM_PROMPT = """你是一个智能路由系统（大脑），负责分
 - industry_name: 行业名称（仅纯行业/产业链筛选问题填写，否则为空字符串）
 - intent: 意图分类 (financial_analysis / technical_analysis / industry_analysis / real_time_info / knowledge_query / general_chat)
 - next_agents: 下一步应调用的 Agent 名称列表，按执行顺序排列，只能包含 retriever/analyst/researcher/technical
-  - 个股全面分析：["retriever", "analyst", "technical", "researcher"]
+  - 个股全面分析：["analyst", "technical", "researcher"]（retriever 仅明确的知识库查询才加）
   - 行业/产业链分析：["researcher", "technical"]
   - 闲聊/不支持的标的：[]
 - confidence: 置信度 (0.0-1.0)（仅日志用途，不影响路由行为）

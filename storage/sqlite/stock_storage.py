@@ -886,6 +886,7 @@ class WatchTarget(Base):
     name = Column(String(50), nullable=False)  # 公司名/行业名
     keywords = Column(String(200))  # 额外搜索关键词（可选）
     enabled = Column(Integer, nullable=False, default=1)  # 1=启用 0=停用
+    source = Column(String(10), nullable=False, default='manual')  # manual=用户手动 / auto=分析流程自动
     created_at = Column(DateTime, default=datetime.now)
 
     __table_args__ = (
@@ -900,6 +901,7 @@ class WatchTarget(Base):
             'name': self.name,
             'keywords': self.keywords,
             'enabled': bool(self.enabled),
+            'source': self.source,
         }
 
 
@@ -1496,6 +1498,15 @@ class DatabaseManager:
                             conn.execute(text(f'ALTER TABLE industry_snapshot ADD COLUMN {col_name} TEXT'))
                             conn.commit()
                             logger.info(f"industry_snapshot 表补充 {col_name} 列（{col_desc}）")
+
+                # watch_target：旧表缺 source 列时补齐（区分手动/自动加入，自动过期只碰 auto）
+                if 'watch_target' in table_names:
+                    wt_cols = [c['name'] for c in inspector.get_columns('watch_target')]
+                    if 'source' not in wt_cols:
+                        conn.execute(text("ALTER TABLE watch_target ADD COLUMN source VARCHAR(10) "
+                                          "NOT NULL DEFAULT 'manual'"))
+                        conn.commit()
+                        logger.info("watch_target 表补充 source 列（manual/auto，自动过期只处理 auto）")
 
                 # industry_review：旧表缺剔除组收益列时补齐（门槛有效性对账用）
                 if 'industry_review' in table_names:
@@ -4068,8 +4079,13 @@ class DatabaseManager:
     # ===== 监控清单 / 监控事件 ============================================
 
     def add_watch_target(self, name: str, target_type: str = 'company',
-                         code: str = None, keywords: str = None) -> Dict[str, Any]:
-        """添加监控标的（同名已存在则重新启用并更新代码/关键词）"""
+                         code: str = None, keywords: str = None,
+                         source: str = 'manual') -> Dict[str, Any]:
+        """
+        添加监控标的（同名已存在则重新启用并更新代码/关键词）。
+        source: manual=用户手动加（永不自动停用）/ auto=分析流程自动加（跟随触发条件生命周期）。
+        用户手动加过的标的即使后来被分析流程再加一次，也保持 manual 不降级。
+        """
         with self.get_session() as session:
             try:
                 existing = session.execute(
@@ -4083,12 +4099,44 @@ class DatabaseManager:
                         existing.code = code
                     if keywords:
                         existing.keywords = keywords
+                    if source == 'manual':
+                        existing.source = 'manual'  # 手动加入优先级更高，只升不降
                     session.commit()
                     return existing.to_dict()
-                record = WatchTarget(target_type=target_type, code=code, name=name, keywords=keywords)
+                record = WatchTarget(target_type=target_type, code=code, name=name,
+                                     keywords=keywords, source=source)
                 session.add(record)
                 session.commit()
                 return record.to_dict()
+            except Exception:
+                session.rollback()
+                raise
+
+    def disable_stale_auto_industry_targets(self) -> int:
+        """
+        自动停用"没有存活触发条件"的 auto 行业监控标的：
+        分析流程加入的行业监控只为盯重估触发条件，条件全部命中/过期后继续每天
+        扫新闻+LLM 评估纯属烧钱。手动（manual）加入的永不动。返回停用条数。
+        """
+        with self.get_session() as session:
+            try:
+                active_industries = set(session.execute(
+                    select(IndustryReevalTrigger.industry).where(
+                        IndustryReevalTrigger.status == 'active')
+                ).scalars().all())
+                targets = session.execute(
+                    select(WatchTarget).where(and_(
+                        WatchTarget.target_type == 'industry',
+                        WatchTarget.source == 'auto',
+                        WatchTarget.enabled == 1))
+                ).scalars().all()
+                count = 0
+                for t in targets:
+                    if t.name not in active_industries:
+                        t.enabled = 0
+                        count += 1
+                session.commit()
+                return count
             except Exception:
                 session.rollback()
                 raise

@@ -101,7 +101,17 @@ class MultiAgentGraph:
 
         # ---------- 注册节点 ----------
         workflow.add_node("router", create_router_node())
-        workflow.add_node("retriever", create_retriever_node())
+        # retriever 依赖可选的远程 Chroma + embedding，构造失败不能拖垮整张图：
+        # 兜底注册一个返回空文档的节点，其余分析链路照常
+        try:
+            retriever_node = create_retriever_node()
+        except Exception as e:
+            logger.warning(f"retriever 节点构造失败（Chroma/embedding 不可用），注册空节点兜底: {e}")
+
+            def retriever_node(state):
+                return {"documents": [],
+                        "intermediate_steps": [("retrieve", {"skipped": "retriever 不可用"})]}
+        workflow.add_node("retriever", retriever_node)
         workflow.add_node("analyst", create_analyst_node())
         workflow.add_node("researcher", create_researcher_node())
         workflow.add_node("technical", create_technical_node())

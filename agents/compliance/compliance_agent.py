@@ -19,13 +19,9 @@ from utils.logger import logger
 
 DISCLAIMER = "以上内容基于公开信息整理，不构成投资建议。"
 
-# 文风禁用词（程序扫描，比靠 LLM 自觉硬得多）
-BANNED_PHRASES = ("总体来看", "表现稳健", "值得关注", "仍需观察", "具有一定风险",
-                  "为未来发展奠定基础", "赋能", "保驾护航", "综上所述")
-
-# 来源表述封闭枚举（responder 规则的程序化镜像）
-ALLOWED_SOURCES = ("根据财务报表数据", "根据技术分析", "根据网络研究信息",
-                   "根据知识库检索", "根据公司公告")
+# 文风禁用词与来源枚举：与 prompt 共用同一份定义（agents/prompts_common.py 单点维护），
+# 改那边的常量，prompt 文本和这里的程序检查同时生效
+from agents.prompts_common import ALLOWED_SOURCES, BANNED_PHRASES  # noqa: E402
 
 # 趋势句附近应出现的期间标记
 _PERIOD_MARK = re.compile(r"(20\d{2}|Q[1-4]|[一二三四]季|季报|年报|半年|全年|H[12]|同期|上年|去年|环比|近\d)")

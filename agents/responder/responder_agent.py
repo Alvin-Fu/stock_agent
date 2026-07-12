@@ -9,7 +9,7 @@ from typing import Dict, Any
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from agents.base import AgentState
-from agents.prompts_common import STYLE_RULES
+from agents.prompts_common import ALLOWED_SOURCES_TEXT, STYLE_RULES
 from core.llm import get_responder_llm
 from utils.logger import logger
 
@@ -23,9 +23,9 @@ _COMMON_RULES = """你是一位专业的财经顾问，请根据提供的资料�
 
 【回答要求】
 1. 语言专业、清晰、简洁
-2. 数据来源只允许使用以下五种表述（封闭枚举，禁止发明"业务数据"等新来源名）：
-   「根据财务报表数据」「根据技术分析」「根据网络研究信息」「根据知识库检索」
-   「根据公司公告」（产销快报/定期报告等公告原文的数字用这个）；
+2. 数据来源只允许使用以下表述（封闭枚举，禁止发明"业务数据"等新来源名）：
+   {source_enum}
+   （产销快报/定期报告等公告原文的数字用「根据公司公告」）；
    不要编造更具体的来源（如具体研报名、公告编号），参考资料里没有就不写；
    销量数字若材料中标注来自产销快报公告，必须优先引用且标「根据公司公告」，
    禁止用搜索转述的销量数字覆盖公告数字
@@ -152,7 +152,8 @@ class ResponderAgent:
     def _build_system_prompt(state: AgentState) -> str:
         """按本次模式拼装规则：通用段 + 个股段或产业链段（互斥，不给无关规则）"""
         prompt = _COMMON_RULES.format(today=date.today().strftime('%Y-%m-%d'),
-                                      style_rules=STYLE_RULES)
+                                      style_rules=STYLE_RULES,
+                                      source_enum=ALLOWED_SOURCES_TEXT)
         stock_code = state.get("stock_code") or ""
         if state.get("industry_name") or "," in stock_code:
             prompt += _INDUSTRY_RULES
