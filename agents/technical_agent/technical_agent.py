@@ -149,6 +149,7 @@ class TechnicalAgent:
         try:
             from tools.stock_tools import stock_tool_instance, _ensure_indicators
             from tools.trade_plan import build_trade_plan, format_trade_plan
+            from tools.support_resistance import compute_sr_levels, format_sr_levels
 
             def _latest_row(fetch_fn, freq):
                 df = fetch_fn(code)
@@ -164,8 +165,19 @@ class TechnicalAgent:
                 return None, ""
             recent_low20 = float(df_d.head(20)["low"].min()) if "low" in df_d.columns else None
             recent_high60 = float(df_d.head(60)["high"].max()) if "high" in df_d.columns else None
-            plan = build_trade_plan(daily_row, weekly_row, monthly_row, recent_low20, recent_high60)
-            return plan, format_trade_plan(plan)
+
+            # 程序关键位：摆动点聚类+成交密集区（内部已容错，失败返回 None）
+            sr = compute_sr_levels(df_d)
+            sr_sups = [c["price"] for c in sr["supports"]] if sr else None
+            sr_ress = [c["price"] for c in sr["resistances"]] if sr else None
+
+            plan = build_trade_plan(daily_row, weekly_row, monthly_row, recent_low20, recent_high60,
+                                    sr_supports=sr_sups, sr_resistances=sr_ress)
+            plan_text = format_trade_plan(plan)
+            sr_text = format_sr_levels(sr)
+            if sr_text:
+                plan_text = f"{plan_text}\n{sr_text}" if plan_text else sr_text
+            return plan, plan_text
         except Exception as e:
             logger.warning(f"操作参考计划计算失败（不影响技术分析）: {e}")
             return None, ""

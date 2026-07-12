@@ -33,10 +33,13 @@ def build_trade_plan(daily_row: Dict[str, Any],
                      weekly_row: Optional[Dict[str, Any]] = None,
                      monthly_row: Optional[Dict[str, Any]] = None,
                      recent_low20: Optional[float] = None,
-                     recent_high60: Optional[float] = None) -> Optional[Dict[str, Any]]:
+                     recent_high60: Optional[float] = None,
+                     sr_supports: Optional[list] = None,
+                     sr_resistances: Optional[list] = None) -> Optional[Dict[str, Any]]:
     """
     输入：三周期最新指标行（dict，含 close/ma20/ma_pattern/DIF/DEA/rsi6/pos_52w/
          boll_upper/boll_mid/boll_lower/atr14）+ 近20日最低价、近60日最高价
+         + 可选的程序关键位（support_resistance 模块算出的支撑/压力价位列表）
     输出：操作参考计划 dict；日线数据不足时返回 None
     """
     close = _num(daily_row, "close")
@@ -94,6 +97,15 @@ def build_trade_plan(daily_row: Dict[str, Any],
 
     support = max(x for x in (ma20, boll_mid, boll_lower) if x is not None) \
         if any(x is not None for x in (ma20, boll_mid, boll_lower)) else None
+    support_label = "MA20/BOLL中轨"
+
+    # 程序关键位：现价下方最近的摆动/密集支撑，比"跟随价格移动的均线"更硬；
+    # 若它比均线支撑更贴近现价，用它作为买入区锚点
+    sr_sup = max((p for p in (sr_supports or []) if p and p < close), default=None)
+    if sr_sup is not None and (support is None or sr_sup > support):
+        support = sr_sup
+        support_label = "程序关键位"
+
     if recent_low20 is not None:
         support_floor = min(recent_low20, support) if support else recent_low20
     else:
@@ -104,20 +116,29 @@ def build_trade_plan(daily_row: Dict[str, Any],
     if support:
         if close >= support:
             entry_zone = (round(support, 2), round(min(close, support * 1.03), 2))
-            entry_note = f"回踩支撑区（MA20/BOLL中轨 {round(support, 2)} 附近）"
+            entry_note = f"回踩支撑区（{support_label} {round(support, 2)} 附近）"
         else:
             entry_zone = None
-            entry_note = f"现价已跌破 MA20({round(support, 2)})，站回其上方再考虑介入"
+            entry_note = f"现价已跌破{support_label}({round(support, 2)})，站回其上方再考虑介入"
 
     stop_loss = round(support_floor - atr, 2) if support_floor else round(close - 2 * atr, 2)
     stop_pct = round((stop_loss / close - 1) * 100, 1)
 
-    targets = []
+    # 目标位候选：最近的程序压力位（历史博弈位，优先）→ BOLL上轨 → 近60日高点；
+    # 相互距离 1% 内视为同一位，去重后取最近两档
+    target_candidates = []
+    sr_res = min((p for p in (sr_resistances or []) if p and p > close * 1.005), default=None)
+    if sr_res is not None:
+        target_candidates.append(round(sr_res, 2))
     if boll_upper and boll_upper > close:
-        targets.append(round(boll_upper, 2))
-    if recent_high60 and recent_high60 > close and (not targets or abs(recent_high60 - targets[0]) / close > 0.01):
-        targets.append(round(recent_high60, 2))
-    targets = sorted(targets)[:2]
+        target_candidates.append(round(boll_upper, 2))
+    if recent_high60 and recent_high60 > close:
+        target_candidates.append(round(recent_high60, 2))
+    targets = []
+    for t in sorted(target_candidates):
+        if not targets or abs(t - targets[-1]) / close > 0.01:
+            targets.append(t)
+    targets = targets[:2]
 
     # ---------- 3. 参考仓位（0~3成，规则降档） ----------
     position, pos_notes = 0, []

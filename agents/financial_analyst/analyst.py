@@ -87,12 +87,19 @@ class AnalystAgent:
         from tools.main_business import fetch_main_business_text
         result["main_business"] = fetch_main_business_text(stock_code)
 
-        # 财报趋势：多期同比/利润率序列+单季拆分，数字全由代码算好
+        # 财报趋势：利润同比/利润率/单季拆分 + 费用率 + 现金流净现比，数字全由代码算好
         try:
             income_df = self.db.get_stock_income(stock_code)
             if income_df is not None and not income_df.empty:
-                from .trend import build_income_trend
-                result["trend"] = build_income_trend(income_df.to_dict("records"))
+                from .trend import build_full_trend
+                cash_records = None
+                try:
+                    cash_df = self.db.get_stock_cashflow(stock_code)
+                    if cash_df is not None and not cash_df.empty:
+                        cash_records = cash_df.to_dict("records")
+                except Exception:
+                    pass
+                result["trend"] = build_full_trend(income_df.to_dict("records"), cash_records)
         except Exception as e:
             logger.warning(f"构建财报趋势失败（不影响其余分析）: {e}")
 

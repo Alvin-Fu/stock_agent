@@ -147,3 +147,119 @@ def build_income_trend(records: List[Dict], max_periods: int = 6) -> str:
         lines.append("单季拆分（累计差分）：" + "；".join(sq_lines))
 
     return "\n".join(lines)
+
+
+def build_expense_trend(records: List[Dict], max_periods: int = 5) -> str:
+    """费用率趋势：销售/管理/研发/财务费用占营收比多期序列 + 摊薄/抬升判读"""
+    rows = []
+    seen = set()
+    for r in records:
+        d = str(r.get("report_date") or "")[:10]
+        rev = _f(r.get("total_revenue"))
+        if len(d) != 10 or d in seen or not rev:
+            continue
+        seen.add(d)
+        item = {"date": d}
+        total = 0.0
+        has_any = False
+        for key, name in (("sell_exp", "sell"), ("admin_exp", "admin"),
+                          ("rd_exp", "rd"), ("fin_exp", "fin")):
+            v = _f(r.get(key))
+            if v is not None:
+                item[name] = v / rev * 100
+                total += item[name]
+                has_any = True
+            else:
+                item[name] = None
+        if not has_any:
+            continue
+        item["total"] = total
+        rows.append(item)
+    rows.sort(key=lambda x: x["date"], reverse=True)
+    if len(rows) < 2:
+        return ""
+
+    def _c(v):
+        return f"{v:.1f}" if v is not None else "-"
+
+    lines = ["【费用率趋势（占营收比%，累计口径）】",
+             "报告期 | 销售 | 管理 | 研发 | 财务 | 合计"]
+    for r in rows[:max_periods]:
+        lines.append(f"{r['date']} | {_c(r['sell'])} | {_c(r['admin'])} | "
+                     f"{_c(r['rd'])} | {_c(r['fin'])} | {_c(r['total'])}")
+
+    latest = rows[0]
+    by_date = {r["date"]: r for r in rows}
+    yoy = by_date.get(f"{int(latest['date'][:4]) - 1}{latest['date'][4:]}")
+    if yoy:
+        diff = latest["total"] - yoy["total"]
+        word = "摊薄（规模效应显现）" if diff < -0.3 else ("抬升（费用增速快于营收）" if diff > 0.3 else "基本持平")
+        lines.append(f"程序判读：期间费用率较上年同期 {_sign(diff)}pct，{word}"
+                     f"（{yoy['total']:.1f}%→{latest['total']:.1f}%）")
+    return "\n".join(lines)
+
+
+def build_cashflow_trend(cash_records: List[Dict], income_records: List[Dict],
+                         max_periods: int = 5) -> str:
+    """现金流趋势：经营现金流/净利润（净现比=利润的现金含量）多期序列 + 判读"""
+    np_by_date = {}
+    for r in income_records:
+        d = str(r.get("report_date") or "")[:10]
+        v = _f(r.get("net_profit"))
+        if len(d) == 10 and v is not None:
+            np_by_date[d] = v / 1e8
+    rows, seen = [], set()
+    for r in cash_records:
+        d = str(r.get("report_date") or "")[:10]
+        ocf = _f(r.get("operating_cashflow"))
+        if len(d) != 10 or d in seen or ocf is None:
+            continue
+        seen.add(d)
+        np_ = np_by_date.get(d)
+        capex = _f(r.get("capex"))
+        rows.append({
+            "date": d,
+            "ocf": ocf / 1e8,
+            "np": np_,
+            "ratio": ocf / 1e8 / np_ if np_ and np_ > 0 else None,  # 净现比
+            "capex": capex / 1e8 if capex is not None else None,
+        })
+    rows.sort(key=lambda x: x["date"], reverse=True)
+    if len(rows) < 2:
+        return ""
+
+    def _c(v, nd=1):
+        return f"{v:.{nd}f}" if v is not None else "-"
+
+    lines = ["【现金流趋势（累计口径，净现比=经营现金流/净利润，利润的现金含量）】",
+             "报告期 | 经营现金流(亿) | 净利(亿) | 净现比 | 资本开支(亿)"]
+    for r in rows[:max_periods]:
+        lines.append(f"{r['date']} | {_c(r['ocf'])} | {_c(r['np'])} | "
+                     f"{_c(r['ratio'], 2)} | {_c(r['capex'])}")
+
+    verdicts = []
+    latest = rows[0]
+    by_date = {r["date"]: r for r in rows}
+    yoy = by_date.get(f"{int(latest['date'][:4]) - 1}{latest['date'][4:]}")
+    if latest["ratio"] is not None and yoy and yoy.get("ratio") is not None:
+        diff = latest["ratio"] - yoy["ratio"]
+        word = "改善" if diff > 0.05 else ("恶化" if diff < -0.05 else "基本持平")
+        verdicts.append(f"净现比较上年同期 {yoy['ratio']:.2f}→{latest['ratio']:.2f}，{word}")
+    low_ratio = [r for r in rows[:3] if r["ratio"] is not None and r["ratio"] < 0.8]
+    if len(low_ratio) >= 2:
+        verdicts.append("⚠️ 净现比连续多期低于0.8，利润的现金含量偏低，警惕应收/存货占用")
+    if latest["ocf"] < 0:
+        verdicts.append("⚠️ 最新一期经营现金流为负")
+    if verdicts:
+        lines.append("程序判读：" + "；".join(verdicts))
+    return "\n".join(lines)
+
+
+def build_full_trend(income_records: List[Dict],
+                     cash_records: Optional[List[Dict]] = None) -> str:
+    """组合：利润趋势 + 费用率趋势 + 现金流趋势（缺哪块跳哪块）"""
+    blocks = [build_income_trend(income_records),
+              build_expense_trend(income_records)]
+    if cash_records:
+        blocks.append(build_cashflow_trend(cash_records, income_records))
+    return "\n\n".join(b for b in blocks if b)

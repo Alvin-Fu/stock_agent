@@ -1,43 +1,51 @@
-# 核心依赖
-langchain
-langchain-core
-langchain-community
-langchain-text-splitters
-langgraph
-langchain-openai
-langchain-ollama
-langchain-deepseek
-langchain-chroma
-langchain-tavily
+# =====================================================================
+# 依赖清单（带版本约束，防止 pip 拉最新版引入不兼容变更——
+# 2026-07 曾因未锁 pandas 装到 3.x 触发 akshare 正则不兼容）
+#
+# 建议：环境首次跑通后执行  pip freeze > requirements.lock
+# 之后重建环境用  pip install -r requirements.lock  精确复原
+# =====================================================================
+
+# 核心依赖（langchain 系列版本联动，只给下界，升级要整组一起升）
+langchain>=0.3
+langchain-core>=0.3
+langchain-community>=0.3
+langchain-text-splitters>=0.3
+langgraph>=0.2
+langchain-openai>=0.2
+langchain-ollama>=0.2
+langchain-deepseek>=0.1
+langchain-chroma>=0.1
+langchain-tavily>=0.1
 
 # 向量库 / 检索
-chromadb
-sentence-transformers   # reranker（CrossEncoder），未开启 use_reranker 时可不装
-duckduckgo-search       # DuckDuckGo 搜索（未配 Tavily key 时的兜底）
+chromadb>=0.5
+sentence-transformers>=2.5   # reranker（CrossEncoder），未开启 use_reranker 时可不装
+duckduckgo-search>=6.0       # DuckDuckGo 搜索（未配 Tavily key 时的兜底）
 
 # 数据库
-sqlalchemy
-pandas
+sqlalchemy>=2.0,<3
+pandas>=2.0,<3               # pandas 3 换 pyarrow 字符串后端，akshare 兼容性差（代码里有兼容垫片，但优先用 2.x）
+numpy>=1.26,<3
 
 # 工具
-schedule
-requests
-python-dateutil
-tenacity
-pypdf                   # PyPDFLoader 文档加载
-PyPDF2                  # 研报 PDF 解析（storage 使用）
+schedule>=1.2,<2
+requests>=2.31,<3
+python-dateutil>=2.8
+tenacity>=8.0
+pypdf>=4.0                   # PyPDFLoader 文档加载
+PyPDF2>=3.0                  # 研报 PDF 解析（storage 使用）
 
-# 数据源
-akshare
-tushare
+# 数据源（akshare 接口随上游变动快，只锁下界；出接口问题优先升级它）
+akshare>=1.16,<2
+tushare>=1.4
 
 # Web 界面
-streamlit
+streamlit>=1.30
 
 # 飞书机器人（长连接收消息 + 发消息）
-lark-oapi
+lark-oapi>=1.4,<2
 
 # 其他
-pyyaml
-Pillow
-numpy
+pyyaml>=6,<7
+Pillow>=10.0
