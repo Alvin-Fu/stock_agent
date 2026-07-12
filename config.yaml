@@ -72,3 +72,19 @@ database:
 search:
   tavily_api_key: ""
   serpapi_api_key: ""
+
+# 飞书机器人（python feishu_bot.py 启动；长连接模式，无需公网地址）
+feishu:
+  app_id: ""          # 开放平台自建应用 App ID（cli_ 开头）
+  app_secret: ""      # 应用 Secret
+  push_open_id: ""    # 监控主动推送给谁：你的 open_id（可先留空，给机器人发条消息，日志里会打印）
+  webhook_url: ""     # 群自定义机器人 webhook（可选：不建应用时的纯推送兜底）
+
+# 监控配置（watchlist 通过飞书发「监控 比亚迪」管理）
+monitor:
+  enabled: true
+  signal_scan_time: "15:10"      # 盘后信号扫描时间（交易日）
+  news_interval_minutes: 30      # 新闻/政策扫描间隔（分钟，仅 8:00-22:00 执行）
+  price_change_threshold: 5.0    # 涨跌幅提醒阈值（%）
+  daily_push_limit: 20           # 每日推送上限（防轰炸）
+  news_importance_min: "中"      # 新闻重要性达到该级别才推送（高/中/低）

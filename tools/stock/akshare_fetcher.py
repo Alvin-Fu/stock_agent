@@ -234,7 +234,7 @@ class AkshareFetcher(BaseFetcher):
     """
     
     name = "AkshareFetcher"
-    priority = 0
+    priority = 1  # 备用数据源（主源为 Tushare）
     
     def __init__(self, sleep_min: float = 10.0, sleep_max: float = 50.0):
         """
@@ -311,44 +311,52 @@ class AkshareFetcher(BaseFetcher):
         4. 调用对应的 akshare API
         5. 处理返回数据
         """
-        if freq != "daily":
+        # freq -> akshare period 参数映射（stock_zh_a_hist 原生支持日/周/月线）
+        period_map = {"daily": "daily", "week": "weekly", "month": "monthly"}
+        period = period_map.get(freq)
+        if period is None:
             raise ValueError(f"不支持的频率: {freq}")
-        # 根据代码类型选择不同的获取方法
+        # 根据代码类型选择不同的获取方法（ETF/港股暂只支持日线）
         if _is_hk_code(stock_code):
+            if freq != "daily":
+                raise ValueError(f"港股暂不支持{freq}线")
             return self._fetch_hk_data(stock_code, start_date, end_date)
         elif _is_etf_code(stock_code):
+            if freq != "daily":
+                raise ValueError(f"ETF暂不支持{freq}线")
             return self._fetch_etf_data(stock_code, start_date, end_date)
         else:
-            return self._fetch_stock_data(stock_code, start_date, end_date)
+            return self._fetch_stock_data(stock_code, start_date, end_date, period)
     
-    def _fetch_stock_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    def _fetch_stock_data(self, stock_code: str, start_date: str, end_date: str,
+                          period: str = "daily") -> pd.DataFrame:
         """
-        获取普通 A 股历史数据
-        
+        获取普通 A 股历史数据（period: daily/weekly/monthly，同一接口原生支持）
+
         数据来源：ak.stock_zh_a_hist()
         """
         import akshare as ak
 
-        
+
         # 防封禁策略 1: 随机 User-Agent
         self._set_random_user_agent()
-        
+
         # 防封禁策略 2: 强制休眠
         self._enforce_rate_limit()
-        
-        logger.info(f"[API调用] ak.stock_zh_a_hist(symbol={stock_code}, period=daily, "
+
+        logger.info(f"[API调用] ak.stock_zh_a_hist(symbol={stock_code}, period={period}, "
                    f"start_date={start_date.replace('-', '')}, end_date={end_date.replace('-', '')}, adjust=qfq)")
-        
+
         try:
-            # 调用 akshare 获取 A 股日线数据
-            # period="daily" 获取日线数据
+            # 调用 akshare 获取 A 股K线数据
+            # period: daily=日线 weekly=周线 monthly=月线
             # adjust="qfq" 获取前复权数据
             import time as _time
             api_start = _time.time()
-            
+
             df = ak.stock_zh_a_hist(
                 symbol=stock_code,
-                period="daily",
+                period=period,
                 start_date=start_date.replace('-', ''),
                 end_date=end_date.replace('-', ''),
                 adjust="qfq"  # 前复权
@@ -511,8 +519,9 @@ class AkshareFetcher(BaseFetcher):
         
         需要映射到标准列名：
         date, open, high, low, close, volume, amount, pct_chg
+        （日/周/月线的返回列结构一致，共用同一套标准化逻辑）
         """
-        if freq != "daily":
+        if freq not in ("daily", "week", "month"):
             raise ValueError(f"不支持的频率: {freq}")
 
         df = df.copy()

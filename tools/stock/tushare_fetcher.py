@@ -53,7 +53,7 @@ class TushareFetcher(BaseFetcher):
     """
     
     name = "TushareFetcher"
-    priority = 1
+    priority = 0  # 主数据源（Akshare 为备用）
 
     def __init__(self, rate_limit_per_minute: int = 80):
         """

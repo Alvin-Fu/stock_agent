@@ -31,6 +31,7 @@ from sqlalchemy import (
     delete,
     inspect,
     text,
+    or_,
 )
 from sqlalchemy.orm import (
     declarative_base,
@@ -868,6 +869,63 @@ class StockCashflow(Base):
             'free_cashflow': self.free_cashflow,
             'data_source': self.data_source,
         }
+
+class WatchTarget(Base):
+    """
+    监控清单模型：用户要求重点监控的公司/行业
+
+    target_type: company=个股（code 必填）/ industry=行业（用 name+keywords 做新闻搜索）
+    """
+    __tablename__ = 'watch_target'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    target_type = Column(String(10), nullable=False, default='company')  # company / industry
+    code = Column(String(10), index=True)  # 股票代码（行业类为空）
+    name = Column(String(50), nullable=False)  # 公司名/行业名
+    keywords = Column(String(200))  # 额外搜索关键词（可选）
+    enabled = Column(Integer, nullable=False, default=1)  # 1=启用 0=停用
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('target_type', 'name', name='uix_watch_type_name'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'target_type': self.target_type,
+            'code': self.code,
+            'name': self.name,
+            'keywords': self.keywords,
+            'enabled': bool(self.enabled),
+        }
+
+
+class MonitorEvent(Base):
+    """
+    监控事件模型：已产生/已推送的监控事件，dedup_key 唯一约束防重复推送
+    """
+    __tablename__ = 'monitor_event'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    target = Column(String(50), nullable=False, index=True)  # 关联的监控标的（名字或代码）
+    event_type = Column(String(20), nullable=False)  # signal / news / policy
+    dedup_key = Column(String(128), nullable=False, unique=True)  # 去重键
+    title = Column(String(300))
+    content = Column(Text)
+    importance = Column(String(10))  # 高 / 中 / 低
+    pushed_at = Column(DateTime)  # 实际推送时间（未推送为空）
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'target': self.target,
+            'event_type': self.event_type,
+            'title': self.title,
+            'importance': self.importance,
+            'pushed_at': self.pushed_at,
+        }
+
 
 class StockResearchReport(Base):
     """
@@ -3696,6 +3754,97 @@ class DatabaseManager:
                 data_list['code'] = data_list['code'].astype(str)
 
             return data_list
+
+    # ===== 监控清单 / 监控事件 ============================================
+
+    def add_watch_target(self, name: str, target_type: str = 'company',
+                         code: str = None, keywords: str = None) -> Dict[str, Any]:
+        """添加监控标的（同名已存在则重新启用并更新代码/关键词）"""
+        with self.get_session() as session:
+            try:
+                existing = session.execute(
+                    select(WatchTarget).where(
+                        and_(WatchTarget.target_type == target_type, WatchTarget.name == name)
+                    )
+                ).scalar_one_or_none()
+                if existing:
+                    existing.enabled = 1
+                    if code:
+                        existing.code = code
+                    if keywords:
+                        existing.keywords = keywords
+                    session.commit()
+                    return existing.to_dict()
+                record = WatchTarget(target_type=target_type, code=code, name=name, keywords=keywords)
+                session.add(record)
+                session.commit()
+                return record.to_dict()
+            except Exception:
+                session.rollback()
+                raise
+
+    def remove_watch_target(self, name_or_code: str) -> bool:
+        """按名字或代码停用监控标的，返回是否找到"""
+        with self.get_session() as session:
+            try:
+                targets = session.execute(
+                    select(WatchTarget).where(
+                        or_(WatchTarget.name == name_or_code, WatchTarget.code == name_or_code)
+                    )
+                ).scalars().all()
+                if not targets:
+                    return False
+                for t in targets:
+                    t.enabled = 0
+                session.commit()
+                return True
+            except Exception:
+                session.rollback()
+                raise
+
+    def get_watch_targets(self, enabled_only: bool = True) -> List[Dict[str, Any]]:
+        """获取监控清单"""
+        with self.get_session() as session:
+            stmt = select(WatchTarget)
+            if enabled_only:
+                stmt = stmt.where(WatchTarget.enabled == 1)
+            results = session.execute(stmt.order_by(WatchTarget.created_at)).scalars().all()
+            return [t.to_dict() for t in results]
+
+    def monitor_event_exists(self, dedup_key: str) -> bool:
+        """检查监控事件是否已存在（去重）"""
+        with self.get_session() as session:
+            found = session.execute(
+                select(MonitorEvent.id).where(MonitorEvent.dedup_key == dedup_key)
+            ).scalar_one_or_none()
+            return found is not None
+
+    def save_monitor_event(self, target: str, event_type: str, dedup_key: str,
+                           title: str = None, content: str = None,
+                           importance: str = None, pushed: bool = False) -> bool:
+        """保存监控事件；dedup_key 冲突（已存在）返回 False"""
+        with self.get_session() as session:
+            try:
+                record = MonitorEvent(
+                    target=target, event_type=event_type, dedup_key=dedup_key,
+                    title=(title or '')[:300], content=content, importance=importance,
+                    pushed_at=datetime.now() if pushed else None,
+                )
+                session.add(record)
+                session.commit()
+                return True
+            except Exception:
+                session.rollback()
+                return False
+
+    def count_events_pushed_today(self) -> int:
+        """今日已推送事件数（用于日推送上限）"""
+        with self.get_session() as session:
+            today_start = datetime.combine(date.today(), datetime.min.time())
+            results = session.execute(
+                select(MonitorEvent.id).where(MonitorEvent.pushed_at >= today_start)
+            ).scalars().all()
+            return len(results)
 
 # ===== 便捷函数 (Convenience Function) ====================================
 

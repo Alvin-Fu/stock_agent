@@ -385,7 +385,11 @@ class BaseFetcher(ABC):
                 data_type=freq,
                 error_message=str(e)
             )
-            logger.error(f"[{self.name}] 获取 {stock_code} 失败: {str(e)} {traceback.format_exc()}")
+            if isinstance(e, ValueError) and "不支持" in str(e):
+                # 数据源能力不支持属于预期内降级，简短提示即可，不打 traceback
+                logger.warning(f"[{self.name}] {stock_code}: {str(e)}，跳过该数据源")
+            else:
+                logger.error(f"[{self.name}] 获取 {stock_code} 失败: {str(e)} {traceback.format_exc()}")
             performance_logger.end_timer(f"get_{freq}_data_{stock_code}", perf_start)
             raise DataFetchError(f"[{self.name}] {stock_code}: {str(e)} ") from e
 
@@ -668,8 +672,8 @@ class DataFetcherManager:
         初始化默认数据源列表
 
         按优先级排序：
-        0. AkshareFetcher (Priority 0) - 主源
-        1. TushareFetcher (Priority 1) - 备用
+        0. TushareFetcher (Priority 0) - 主源
+        1. AkshareFetcher (Priority 1) - 备用
         """
         from .akshare_fetcher import AkshareFetcher
         from .tushare_fetcher import TushareFetcher

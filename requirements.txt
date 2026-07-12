@@ -34,6 +34,9 @@ tushare
 # Web 界面
 streamlit
 
+# 飞书机器人（长连接收消息 + 发消息）
+lark-oapi
+
 # 其他
 pyyaml
 Pillow
