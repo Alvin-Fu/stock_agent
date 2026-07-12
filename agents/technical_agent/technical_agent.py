@@ -224,14 +224,27 @@ class TechnicalAgent:
         logger.info(f"技术分析（产业链模式），共 {len(codes)} 只: {codes}")
 
         # 逐只拉 K 线：按股票数均分字符预算，避免从头截断把排在后面的股票整段丢掉
+        # 同时逐只算程序操作参考——否则报告在"首选标的"上没有程序数字，
+        # LLM 会在真空里自行发明止损/仓位（已发生过，禁止再现）
         per_stock_budget = max(4000, 25000 // len(codes))
         all_kline = ""
+        plans = {}
+        plan_blocks = []
         for code in codes:
             # 附上验证过的公司名，防止 LLM 凭记忆给代码配错名字（如把鼎龙股份写成别家）
             name = self._resolve_name(code)
             label = f"{name}({code})" if name else code
             kline = self._fetch_kline(code)[:per_stock_budget]
             all_kline += f"\n{'#'*60}\n### 股票 {label}\n{kline}\n"
+            plan, plan_text = self._build_trade_plan(code)
+            if plan_text:
+                plans[code] = plan
+                plan_blocks.append(f"### {label}\n{plan_text}")
+
+        plans_text = ""
+        if plan_blocks:
+            plans_text = ("【各候选操作参考（程序规则计算，与排名互相独立）】\n"
+                          + "\n\n".join(plan_blocks))
 
         messages = [
             SystemMessage(content=self._build_chain_prompt()),
@@ -241,7 +254,10 @@ class TechnicalAgent:
 
 {all_kline}
 
-请逐只打分 → 排名 → 选出技术面最强的1只。"""),
+{plans_text}
+
+请逐只打分 → 排名 → 选出技术面最强的1只；
+点评你选出的最强标的时，引用其【操作参考】的程序数字（方向/价位/盈亏比/仓位），禁止修改。"""),
         ]
 
         response = self.llm.invoke(messages)
@@ -250,7 +266,8 @@ class TechnicalAgent:
 
         return {
             "messages": [response],
-            "technical_result": {"summary": summary, "mode": "chain", "codes": codes},
+            "technical_result": {"summary": summary, "mode": "chain", "codes": codes,
+                                 "trade_plans": plans, "trade_plans_text": plans_text},
             "intermediate_steps": [("technical_analyze", {"mode": "chain", "count": len(codes)})],
         }
 

@@ -207,7 +207,9 @@ def format_trade_plan(plan: Optional[Dict[str, Any]]) -> str:
         lines.append(f"  买入参考：{plan['entry_note']}")
     lines.append(f"  止损纪律位：{plan['stop_loss']}（距现价 {plan['stop_pct']}%，跌破无条件离场）")
     if plan["targets"]:
-        lines.append(f"  目标参考位：{' / '.join(str(t) for t in plan['targets'])}（到达可分批了结）")
+        # 附带相对现价的空间百分比：这是"价位距离"不是涨幅预测，供收益空间评估
+        tgt_parts = [f"{t}(+{(t / plan['close'] - 1) * 100:.1f}%)" for t in plan["targets"]]
+        lines.append(f"  目标参考位：{' / '.join(tgt_parts)}（到达可分批了结；括号内为距现价空间，非预测）")
     if plan.get("risk_reward") is not None:
         rr = plan["risk_reward"]
         note = "达标" if rr >= 1.5 else "不足1.5，风险收益不划算，不建议参与"

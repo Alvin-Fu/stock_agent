@@ -21,6 +21,30 @@ from utils.logger import logger
 # 综合评分权重：业务经营 20% + 基本面 30% + 不可替代与溢价 50%
 COMPOSITE_WEIGHTS = {"business": 0.2, "fundamental": 0.3, "moat": 0.5}
 
+# 护城河硬性准入门槛：评分低于该值（或分项缺失=无证据）的公司直接剔除出投资池，
+# 不参与排名与技术面对比——没有护城河的公司不纳入，不是靠权重拉低了事
+MOAT_GATE = 7.0
+
+
+def apply_moat_gate(ranked: List[Dict[str, Any]], gate: float = MOAT_GATE):
+    """
+    护城河硬门槛过滤（纯函数）：返回 (passed, excluded)。
+    moat 分项缺失（被中性5分顶替）也视为未达标——证据不足不入池。
+    passed 重新编排名。
+    """
+    passed, excluded = [], []
+    for item in ranked:
+        no_evidence = "moat" in (item.get("missing") or [])
+        if item.get("moat", 0) >= gate and not no_evidence:
+            passed.append(dict(item))
+        else:
+            ex = dict(item)
+            ex["exclude_reason"] = "护城河分项缺失（无证据）" if no_evidence else f"护城河{item.get('moat')}分未达{gate:g}分门槛"
+            excluded.append(ex)
+    for i, it in enumerate(passed, 1):
+        it["rank"] = i
+    return passed, excluded
+
 
 def compute_composite_ranking(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
@@ -45,7 +69,7 @@ def compute_composite_ranking(candidates: List[Dict[str, Any]]) -> List[Dict[str
                 missing.append(key)
         composite = round(sum(scores[k] * w for k, w in COMPOSITE_WEIGHTS.items()), 2)
         ranked.append({
-            "code": code, **scores, "composite": composite,
+            "code": code, **scores, "composite": composite, "missing": missing,
             "note": "分项缺失按5分中性处理" if missing else "",
         })
     ranked.sort(key=lambda x: x["composite"], reverse=True)
@@ -110,6 +134,7 @@ class ResearcherAgent:
             f"{tag} 业务构成 收入占比 毛利占比 各板块营收拆分",
             f"{tag} 出货量 产能 新增订单 订单来源 资本开支",
             f"{tag} 技术实力 研发投入 核心技术突破 专利",
+            f"{tag} 护城河 技术壁垒 不可替代性 切换成本 市占率 竞争格局",
             f"{tag} 第二增长曲线 新业务 布局 进展 放量 {recent_period}",
             f"{tag} 产业链 上下游 市场地位 竞争格局 {recent_period}",
             f"{tag} 利好 利空 机构评级 目标价 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
@@ -131,7 +156,10 @@ class ResearcherAgent:
    （如一季报后已出的4/5/6月销量），并给出方向性前瞻：延续加速/延续放缓/出现拐点。
    前瞻只能是方向判断且必须标注"基于月度数据推断"，禁止推算具体营收利润数字
 5. **技术实力**：研发投入、核心技术突破、在研项目、专利壁垒
-6. **产业链地位**：位置、议价力、竞争格局
+6. **产业链地位与护城河评级**：位置、议价力、竞争格局；
+   必须给出护城河评级「高/中/低」+ 依据（独有技术/专利/牌照/切换成本/市占率等具体证据），
+   证据不足时评「低」并写明"未找到壁垒证据"——护城河低的公司，
+   后续所有多头结论都要显著降温（没有壁垒的景气随时会被竞争摊薄）
 7. **利好与利空分析**：分别列出利好和利空条目，每条标注影响力(高/中/低)及依据出处；
    综合判断只用「偏多/中性/偏空」三档，禁止编造精确百分比
 8. **利润驱动与飞轮（三段论）**：
@@ -396,6 +424,9 @@ class ResearcherAgent:
 - 不可替代性（0-5 分）：核心技术是否独有？供应链是否存在单一依赖？切换成本？在产业链中是否"卡脖子"环节？
 - 溢价能力（0-5 分）：毛利率水平？对上游议价能力？对下游定价权？品牌/专利/牌照壁垒？成本转嫁能力？
 - 特别关注特精专新企业，它们在某些环节可能具有极高的不可替代性
+- ⚠️ 护城河是硬性准入门槛：程序会把该项低于7分的公司剔除出投资池。
+  打分必须严格基于搜索证据（独有技术/专利/牌照/垄断地位的具体事实），
+  禁止为照顾公司入围而抬分；找不到壁垒证据就给低分，宁缺毋滥
 
 ## 五、评分依据说明
 逐公司用一两句话说明三项分项分数的打分依据（业务经营/基本面/不可替代与溢价），
@@ -564,6 +595,20 @@ class ResearcherAgent:
             logger.warning(f"行业估值计算失败（不影响分析主流程）: {e}")
         valuation_block = format_industry_valuation(industry_valuation)
 
+        # 候选公司主营构成（程序拉取）：当前利润驱动的数字底座，
+        # 没有这块 LLM 只能写"未提供主营构成数据"
+        mb_text = ""
+        try:
+            from tools.main_business import fetch_main_business_text
+            mb_blocks = []
+            for c in sorted(all_leader_codes)[:10]:
+                t = fetch_main_business_text(c)
+                if t:
+                    mb_blocks.append(f"◇ 候选 {c}\n{t}")
+            mb_text = "\n\n".join(mb_blocks)
+        except Exception as e:
+            logger.warning(f"候选主营构成拉取失败（不影响分析）: {e}")
+
         # 全景搜索（含不可替代性/溢价能力维度）
         all_queries = self._build_chain_queries(industry_name, chain)
         all_results = self._do_search(all_queries)
@@ -581,10 +626,17 @@ class ResearcherAgent:
 ========== 产业链结构（上中下游+特精专新+细分领域+龙一龙二） ==========
 {chain_summary}
 
-========== 全网搜索结果（含经营/竞争力/业务拆解/收入毛利占比/出货量/资本开支/新增订单/技术突破/护城河/溢价/资金偏好） ==========
+========== 候选公司主营业务构成（程序拉取，各业务收入/利润占比与毛利率，当前利润驱动依据） ==========
+{mb_text[:8000] if mb_text else '（未获取到，业务拆解只能依据搜索结果，缺数据处标注「信息不足」）'}
+
+========== 全网搜索结果（含经营/竞争力/业务拆解/收入毛利占比/出货量/资本开支/新增订单/技术突破/护城河） ==========
 {search_text[:15000]}
 
-请按结构输出：〇、JSON 候选代码清单（放最前）→ 一、全景筛选（含资金偏好标签） → 二、业务拆解与经营数据（收入毛利占比/出货量/资本开支/新增订单/技术突破） → 三、基本面评分 → 四、护城河分析（重点关注特精专新） → 五、综合排名"""),
+请按结构输出：〇、JSON 候选代码清单（放最前）→ 一、全景筛选 → 二、业务拆解与经营数据
+（优先引用主营构成数据的占比/毛利率原数）→ 三、基本面评分 → 四、护城河分析（重点关注特精专新）
+→ 五、综合排名。
+资金偏好只在搜索结果里有北向/龙虎榜/机构调研等公开证据时标注并写明出处，
+无证据写「无公开数据」，禁止凭板块印象填"主力/游资"。"""),
         ]
 
         logger.info("LLM 产业链分析中...")
@@ -596,14 +648,17 @@ class ResearcherAgent:
         import json, re
         candidate_codes = list(all_leader_codes)  # fallback：龙头搜索阶段已验证过的代码
         ranked = []
+        moat_excluded = []
         json_match = re.search(r'\{\s*"candidates"\s*:\s*\[.*?\]\s*\}', summary, re.DOTALL)
         if json_match:
             try:
                 extracted = json.loads(json_match.group(0))
                 ranked = compute_composite_ranking(extracted.get("candidates") or [])
                 if ranked:
+                    # 护城河硬门槛：未达标的直接剔除出投资池，不进排名与技术对比
+                    ranked, moat_excluded = apply_moat_gate(ranked)
                     candidate_codes = [item["code"] for item in ranked]
-                    logger.info(f"程序计算综合排名完成: "
+                    logger.info(f"程序计算综合排名完成（护城河门槛剔除 {len(moat_excluded)} 家）: "
                                 f"{[(i['code'], i['composite']) for i in ranked]}")
             except json.JSONDecodeError:
                 pass
@@ -619,9 +674,23 @@ class ResearcherAgent:
                     pass
 
         # 程序算的排名表附到报告末尾（responder 展示与复盘留档都以此为准）
+        def _safe_name(c):
+            try:
+                return find_company_name(c)
+            except Exception:
+                return None
+
         if ranked:
-            summary = summary + "\n\n" + format_ranking_table(
-                ranked, name_of=lambda c: find_company_name(c))
+            summary = summary + "\n\n" + format_ranking_table(ranked, name_of=_safe_name)
+        if moat_excluded:
+            ex_lines = [f"【护城河门槛剔除（评分<{MOAT_GATE:g}分或无打分证据，不入投资池，仅列示供了解全貌）】"]
+            for it in moat_excluded:
+                nm = _safe_name(it["code"])
+                label = f"{nm}({it['code']})" if nm else it["code"]
+                ex_lines.append(f"- {label}：{it['exclude_reason']}")
+            summary = summary + "\n\n" + "\n".join(ex_lines)
+        if not ranked and moat_excluded:
+            summary += "\n\n⚠️ 本次全部候选的护城河评分均未达标，无投资池标的——以下内容仅作行业观察，不给介入建议"
 
         # 出口统一验证：只把能在股票基础表反查到的代码交给 technical_agent
         verified_codes = []
