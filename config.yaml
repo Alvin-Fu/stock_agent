@@ -54,11 +54,26 @@ knowledge_bases:
     chunk_size: 600
     chunk_overlap: 60
 
-# 多Agent配置
+# =====================================================================
+# 多Agent模型配置（真实生效）：
+# - defaults：所有 agent 的默认 LLM 参数
+# - 按 agent 名单独覆盖（不写的项回落 defaults）：
+#   router（大脑路由）/ analyst（财务）/ researcher（联网研究）/
+#   technical（技术面）/ responder（报告生成）/ compliance（合规）/ retriever（检索改写）
+# - 可覆盖项：provider（deepseek/ollama）、model、temperature、max_tokens
+# =====================================================================
 agents:
-  router_agent:
-    name: "路由智能体"
-    description: "大脑：任务拆解与分派"
+  defaults:
+    provider: "deepseek"
+    model: "deepseek-v4-flash"
+    temperature: 0.1
+  # 示例：让报告生成表达更自然、路由换更便宜的模型（按需取消注释）
+  # responder:
+  #   temperature: 0.3
+  # router:
+  #   model: "deepseek-v4-flash"
+  # technical:
+  #   model: "deepseek-reasoner"
 
 # 工具配置（tushare token 读的是 tools.stock.tushare_token）
 tools:

@@ -78,7 +78,7 @@ class ResearcherAgent:
     """研究 Agent：个股模式 + 产业链公司筛选与基本面分析"""
 
     def __init__(self):
-        self.llm = get_default_llm()
+        self.llm = get_agent_llm("researcher")
 
     # ========== 个股搜索模式 ==========
 

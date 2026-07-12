@@ -83,16 +83,26 @@ def get_all_agent_config() -> Dict[str, Any]:
     config = load_config()
     return config.get("agents", {})
 
-def get_agent_config(agent_id: str) -> Dict[str, Any]:
+# 各 Agent LLM 的代码内兜底默认值（配置文件缺失时也能跑）
+_AGENT_LLM_DEFAULTS: Dict[str, Any] = {
+    "provider": "deepseek",
+    "model": "deepseek-v4-flash",
+    "temperature": 0.1,
+    "max_tokens": None,
+}
+
+def get_agent_llm_config(agent_name: str) -> Dict[str, Any]:
     """
-    根据ID获取单个Agent配置
-    :param agent_id: AgentID（如 qa_agent）
+    获取指定 Agent 的 LLM 配置，三层合并（后者覆盖前者）：
+    代码内兜底默认 ← agents.defaults ← agents.<agent_name>
+    agent_name 传 "default" 时只应用全局默认（供未单列的组件使用）
     """
-    all_agent = get_all_agent_config()
-    agent_config = all_agent.get(agent_id)
-    if not agent_config:
-        raise ValueError(f"不存在该Agent配置：{agent_id}")
-    return agent_config
+    agents_cfg = get_all_agent_config() or {}
+    merged = dict(_AGENT_LLM_DEFAULTS)
+    merged.update(agents_cfg.get("defaults") or {})
+    if agent_name != "default":
+        merged.update(agents_cfg.get(agent_name) or {})
+    return merged
 
 def get_db_config() -> Dict[str, Any]:
     """获取数据库配置"""

@@ -4,7 +4,6 @@ from langchain_openai import ChatOpenAI
 from utils.config import get_model_config, get_llm_model_config, get_deepseek_model_config, get_embedding_model_config, get_openai_model_config
 import os
 from typing import Optional, Dict, Any, Union
-from functools import lru_cache
 from utils.logger import logger
 
 from langchain_core.language_models import BaseChatModel
@@ -219,31 +218,46 @@ class LLMFactory:
         return len(cls._instances)
 
 
-# 便捷函数，直接获取默认 LLM 实例
-@lru_cache(maxsize=1)
-def get_default_llm() -> BaseChatModel:
-    """获取系统默认的 LLM 实例（基于配置文件）"""
-    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model=DeepseekFlashModule)
+# ---------------------------------------------------------------
+# 按 Agent 读取配置的统一入口：config.yaml 的 agents 段可按 agent 覆盖
+# provider/model/temperature/max_tokens（LLMFactory 内部按参数缓存实例，
+# 相同配置的多个 agent 共享同一实例，不会重复建连接）
+# ---------------------------------------------------------------
+def get_agent_llm(agent_name: str) -> BaseChatModel:
+    """按 agents.<agent_name> 配置创建 LLM（缺失项依次回落 agents.defaults → 代码默认）"""
+    from utils.config import get_agent_llm_config
+    cfg = get_agent_llm_config(agent_name)
+    return LLMFactory.get_llm(
+        provider=str(cfg.get("provider") or LLMFactory.PROVIDER_DEEPSEEK),
+        model=cfg.get("model"),
+        temperature=float(cfg.get("temperature", 0.1)),
+        max_tokens=cfg.get("max_tokens"),
+    )
 
-# 为不同 Agent 预设特定参数的便捷函数
+
+def get_default_llm() -> BaseChatModel:
+    """获取系统默认的 LLM 实例（agents.defaults 配置，供未单列的组件使用）"""
+    return get_agent_llm("default")
+
+# 为不同 Agent 预设的便捷函数（模型/温度均可在 config 的 agents 段覆盖）
 def get_router_llm() -> BaseChatModel:
-    """获取路由 Agent 专用的 LLM（低温度，更确定性）"""
-    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model=DeepseekProModule)
+    """路由 Agent（大脑）专用 LLM"""
+    return get_agent_llm("router")
 
 
 def get_analyst_llm() -> BaseChatModel:
-    """获取财务分析 Agent 专用的 LLM（更强大的推理模型）"""
-    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model=DeepseekFlashModule)
+    """财务分析 Agent 专用 LLM"""
+    return get_agent_llm("analyst")
 
 
 def get_technical_llm() -> BaseChatModel:
-    """获取技术分析 Agent 专用的 LLM（适合技术分析推理）"""
-    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model=DeepseekFlashModule)
+    """技术分析 Agent 专用 LLM"""
+    return get_agent_llm("technical")
 
 
 def get_responder_llm() -> BaseChatModel:
-    """获取回答生成 Agent 专用的 LLM（适中温度，表达自然）"""
-    return LLMFactory.get_llm(provider=LLMFactory.PROVIDER_DEEPSEEK, temperature=0.1, model=DeepseekFlashModule)
+    """回答生成 Agent 专用 LLM"""
+    return get_agent_llm("responder")
 
 
 def get_local_fast_llm() -> BaseChatModel:

@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-from agents.registry import AgentRegistry
-from knowledge_bases.registry import KnowledgeRegistry
 from utils.logger import logger
-import traceback
-from tools.stock import DataFetcherManager
 from tools.stock_tools import stock_tool_instance
 
 if __name__ == "__main__":

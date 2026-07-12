@@ -14,7 +14,7 @@ from typing import Dict, Any
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from agents.base import AgentState
-from core.llm import get_default_llm
+from core.llm import get_agent_llm
 from utils.logger import logger
 
 DISCLAIMER = "以上内容基于公开信息整理，不构成投资建议。"
@@ -22,7 +22,7 @@ DISCLAIMER = "以上内容基于公开信息整理，不构成投资建议。"
 
 class ComplianceAgent:
     def __init__(self):
-        self.llm = get_default_llm()
+        self.llm = get_agent_llm("compliance")
 
     def review_node(self, state: AgentState) -> Dict[str, Any]:
         final_answer = state.get("final_answer") or ""

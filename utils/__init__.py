@@ -11,7 +11,7 @@ from .config import (
     get_all_kb_config,
     get_kb_config,
     get_all_agent_config,
-    get_agent_config,
+    get_agent_llm_config,
     get_db_config,
     get_stock_tools_config,
     get_search_config,
@@ -30,7 +30,7 @@ __all__ = [
     "get_all_kb_config",
     "get_kb_config",
     "get_all_agent_config",
-    "get_agent_config",
+    "get_agent_llm_config",
     # 工具相关
     "get_db_config",
     "get_stock_tools_config",

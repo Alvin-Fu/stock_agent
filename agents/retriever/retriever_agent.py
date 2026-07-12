@@ -14,7 +14,6 @@ from core import get_embeddings
 from core.vector_store import get_remote_chroma_client
 from .query_rewriter import QueryRewriter
 from .reranker import Reranker
-from core.llm import get_default_llm
 from utils.logger import logger
 from utils.config import get_retriever_config
 from functools import partial

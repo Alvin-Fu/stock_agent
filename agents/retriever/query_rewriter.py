@@ -3,7 +3,7 @@
 """
 
 from langchain_core.messages import SystemMessage, HumanMessage
-from core.llm import get_default_llm
+from core.llm import get_agent_llm
 
 REWRITE_PROMPT = """你是一个查询改写专家。将用户关于财经的问题改写为更适合向量检索的关键词短语。
 规则：
@@ -17,7 +17,7 @@ REWRITE_PROMPT = """你是一个查询改写专家。将用户关于财经的问
 
 class QueryRewriter:
     def __init__(self):
-        self.llm = get_default_llm()
+        self.llm = get_agent_llm("retriever")
 
     def rewrite(self, question: str) -> str:
         prompt = REWRITE_PROMPT.format(question=question)
