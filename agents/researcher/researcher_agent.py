@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from agents.base import AgentState
-from core.llm import get_default_llm
+from core.llm import get_agent_llm
 from .web_search_tool import web_search
 from tools.company_code_validator import find_stock_code, find_company_name
 from utils.logger import logger
