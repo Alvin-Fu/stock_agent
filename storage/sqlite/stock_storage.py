@@ -927,6 +927,26 @@ class MonitorEvent(Base):
         }
 
 
+class AnnouncementText(Base):
+    """
+    公告正文缓存：产销快报等公告 PDF 抽出的文本，按 (code, title) 唯一。
+    同一份公告只从巨潮下载一次，之后直接读库。
+    """
+    __tablename__ = 'announcement_text'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    title = Column(String(300), nullable=False)
+    ann_time = Column(String(30))   # 公告时间（原文格式）
+    url = Column(String(500))
+    content = Column(Text)          # PDF 抽取的正文
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'title', name='uix_ann_code_title'),
+    )
+
+
 class AnalysisSnapshot(Base):
     """
     分析快照：每次个股分析完成后留档的「可检验判断」，复盘的对账依据
@@ -4000,6 +4020,33 @@ class DatabaseManager:
                 select(MonitorEvent.id).where(MonitorEvent.pushed_at >= today_start)
             ).scalars().all()
             return len(results)
+
+    # ===== 公告正文缓存 =====================================================
+
+    def get_announcement_text(self, code: str, title: str) -> Optional[str]:
+        """按 (code, title) 取缓存的公告正文；无缓存返回 None"""
+        with self.get_session() as session:
+            found = session.execute(
+                select(AnnouncementText.content).where(
+                    and_(AnnouncementText.code == code,
+                         AnnouncementText.title == title[:300]))
+            ).scalar_one_or_none()
+            return found
+
+    def save_announcement_text(self, code: str, title: str,
+                               ann_time: str = None, url: str = None,
+                               content: str = None) -> bool:
+        """缓存公告正文；(code, title) 已存在返回 False（不覆盖）"""
+        with self.get_session() as session:
+            try:
+                session.add(AnnouncementText(
+                    code=code, title=(title or '')[:300],
+                    ann_time=ann_time, url=(url or '')[:500], content=content))
+                session.commit()
+                return True
+            except Exception:
+                session.rollback()
+                return False
 
     # ===== 分析快照 / 复盘 ==================================================
 

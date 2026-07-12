@@ -496,8 +496,10 @@ class ResearcherAgent:
         except Exception:
             company_name = ""
         from tools.main_business import fetch_main_business_text
+        from tools.info_sources import fetch_sales_flash_text
         structured_blocks = []
         for block in (
+            fetch_sales_flash_text(stock_code),
             fetch_main_business_text(stock_code),
             format_info_block("巨潮公告（最近30天，重大事项第一手来源）",
                               fetch_stock_announcements(stock_code), with_content=False),
@@ -524,7 +526,10 @@ class ResearcherAgent:
 
 ========== 全网搜索结果（补充信息） ==========
 {search_text[:10000]}
-请基于以上信息进行全面分析。"""),
+请基于以上信息进行全面分析。
+销量/产销类数字的引用规则：提供了【产销快报公告原文】时**只能引用该原文的数字**并注明
+"根据公司公告"；搜索结果里与之冲突的销量数字一律弃用；未提供该块时才可引用搜索结果的
+销量数字，且必须注明具体出处与统计口径（乘用车/含商用车/单月/累计）。"""),
         ]
 
         logger.info("LLM 综合分析中...")

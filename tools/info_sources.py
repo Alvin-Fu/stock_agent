@@ -65,6 +65,79 @@ def fetch_stock_announcements(code: str, days: int = 30, limit: int = 15) -> Lis
         return []
 
 
+# 产销快报类公告标题特征（排除取消/更正前的旧版）
+_SALES_TITLE = None  # 延迟编译
+
+
+def _pick_sales_flash(announcements: List[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """从公告列表挑最新一份产销快报（纯函数，便于测试）"""
+    import re
+    global _SALES_TITLE
+    if _SALES_TITLE is None:
+        _SALES_TITLE = (re.compile(r"(产销快报|产销数据|销量快报|产销情况|产销.*自愿性信息披露)"),
+                        re.compile(r"(取消|更正前|英文)"))
+    want, block = _SALES_TITLE
+    for it in announcements:  # 上游已按时间倒序
+        title = it.get("title", "")
+        if want.search(title) and not block.search(title):
+            return it
+    return None
+
+
+def _download_pdf_text(url: str, max_pages: int = 4) -> str:
+    """下载公告 PDF 并抽取文本；任何失败返回空串"""
+    try:
+        import io
+        import requests
+        from PyPDF2 import PdfReader
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        reader = PdfReader(io.BytesIO(resp.content))
+        pages = [p.extract_text() or "" for p in reader.pages[:max_pages]]
+        return "\n".join(pages).strip()
+    except Exception as e:
+        logger.warning(f"[信源] 产销快报 PDF 抽取失败 {url}: {e}")
+        return ""
+
+
+def fetch_sales_flash_text(code: str, days: int = 40) -> str:
+    """
+    最近一期产销快报公告原文（权威销量口径）。
+    搜索引擎转述的销量数字口径混乱（含不含商用车/媒体笔误），
+    产销快报是上市公司公告，数字必须以此为准。失败返回空串不阻断。
+    正文按 (code, 标题) 落库缓存：同一份公告的 PDF 只从巨潮下载一次，
+    公告列表仍每次拉取（轻量，用于发现新一期）。
+    """
+    try:
+        ann = _pick_sales_flash(fetch_stock_announcements(code, days=days, limit=30))
+        if not ann or not ann.get("url"):
+            return ""
+
+        db = None
+        text = None
+        try:
+            from storage.sqlite.stock_storage import get_db
+            db = get_db()
+            text = db.get_announcement_text(code, ann["title"])
+        except Exception as e:
+            logger.warning(f"[信源] 公告缓存读取失败（改为直接下载）: {e}")
+
+        if not text:
+            text = _download_pdf_text(ann["url"])
+            if not text:
+                return ""
+            if db is not None:
+                db.save_announcement_text(code, ann["title"], ann_time=ann.get("time"),
+                                          url=ann.get("url"), content=text)
+                logger.info(f"[信源] 产销快报正文已缓存: {code} {ann['title']}")
+
+        return (f"【产销快报公告原文（{ann['title']}，{ann.get('time', '')}，权威口径，"
+                f"销量数字以此为准）】\n{text[:2500]}")
+    except Exception as e:
+        logger.warning(f"[信源] 产销快报获取失败 {code}: {e}")
+        return ""
+
+
 def _load_cls_telegraph() -> List[Dict[str, str]]:
     """拉财联社电报全量快讯（10分钟内存缓存）"""
     now = time.time()
