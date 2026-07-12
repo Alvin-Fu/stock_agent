@@ -38,10 +38,17 @@ class NewsMonitor:
     # ---------- 数据源（统一走 tools.info_sources） ----------
 
     @staticmethod
-    def _fetch_company_news(code: str) -> List[Dict[str, str]]:
-        """东财个股新闻（结构化主源）"""
-        from tools.info_sources import fetch_stock_news
-        return fetch_stock_news(code, limit=20)
+    def _fetch_company_news(code: str, name: str) -> List[Dict[str, str]]:
+        """东财个股新闻（结构化主源）；失败/为空时退财联社快讯按公司名过滤"""
+        from tools.info_sources import fetch_stock_news, fetch_cls_telegraph
+        items = fetch_stock_news(code, limit=20)
+        if items:
+            return items
+        if not name:
+            return []
+        logger.info(f"[监控] {name}({code}) 东财新闻无数据，改用财联社快讯按名称过滤")
+        # 快讯没有链接，去重键回落到标题+时间（_dedup_key 已处理）
+        return [{**it, "url": ""} for it in fetch_cls_telegraph(keywords=[name], limit=10)]
 
     @staticmethod
     def _fetch_industry_news(name: str, keywords: str) -> List[Dict[str, str]]:
@@ -121,16 +128,19 @@ class NewsMonitor:
             return
         logger.info(f"[监控] 新闻扫描开始，共 {len(targets)} 个标的")
 
+        pushed_before = self.db.count_events_pushed_today()
         for t in targets:
             try:
                 self._scan_one(t)
             except Exception as e:
                 logger.error(f"[监控] {t['name']} 新闻扫描失败: {e}")
+        logger.info(f"[监控] 新闻扫描完成：{len(targets)} 个标的，"
+                    f"本轮推送 {self.db.count_events_pushed_today() - pushed_before} 条")
 
     def _scan_one(self, target: Dict[str, Any]) -> None:
         name = target["name"]
         if target["target_type"] == "company" and target.get("code"):
-            items = self._fetch_company_news(target["code"])
+            items = self._fetch_company_news(target["code"], name)
         else:
             items = self._fetch_industry_news(name, target.get("keywords") or "")
 

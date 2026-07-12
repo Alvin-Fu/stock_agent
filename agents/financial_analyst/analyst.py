@@ -53,7 +53,7 @@ class AnalystAgent:
 
     def _fetch_real_financial_data(self, stock_code: str) -> Dict[str, Any]:
         """从数据库/Tushare 拉取真实财务报表数据"""
-        result = {"income": "", "balance_sheet": "", "cashflow": "", "parsed": {}}
+        result = {"income": "", "balance_sheet": "", "cashflow": "", "main_business": "", "trend": "", "parsed": {}}
 
         # 先更新每日指标（PE/PB/市值），估值比率依赖它；失败不阻断其余分析
         try:
@@ -82,6 +82,19 @@ class AnalystAgent:
                 result["cashflow"] = cashflow_text
         except Exception as e:
             logger.error(f"获取现金流量表失败 {stock_code}: {e}")
+
+        # 主营业务构成：利润驱动分析的数字底座（内部已容错，失败返回空串）
+        from tools.main_business import fetch_main_business_text
+        result["main_business"] = fetch_main_business_text(stock_code)
+
+        # 财报趋势：多期同比/利润率序列+单季拆分，数字全由代码算好
+        try:
+            income_df = self.db.get_stock_income(stock_code)
+            if income_df is not None and not income_df.empty:
+                from .trend import build_income_trend
+                result["trend"] = build_income_trend(income_df.to_dict("records"))
+        except Exception as e:
+            logger.warning(f"构建财报趋势失败（不影响其余分析）: {e}")
 
         result["parsed"] = self._parse_latest_financial_data()
         return result
@@ -211,11 +224,26 @@ class AnalystAgent:
 6. 数据中标注"缺少XX数据"的项：直接说明缺失，禁止估算或用行业均值代替
 7. 每个定性结论必须有对应数据支撑，禁止使用与数据矛盾的模板化表述
    （例如：单车均价上涨时不得使用"以价换量"的说法）
-8. 避免给出投资建议，仅做客观分析
+8. 利润驱动结构：如提供了主营业务构成数据，必须回答"利润主要靠什么业务赚"——
+   引用各业务的收入/利润占比与毛利率原数；重点关注占比同比明显提升的业务
+   （正在放量的第二曲线）和占比萎缩的业务（旧驱动衰减）；按地区维度的海外
+   占比变化直接反映出海驱动。没有该数据时标注"缺主营构成数据"，禁止凭印象拆分
+9. 趋势优先于绝对值：股价的支撑来自"变化"而非"存量"。所有盈利结论必须落在
+   改善/恶化/加速/放缓上，并引用【财报趋势】表中程序算好的同比序列、利润率变化、
+   单季拆分数字；禁止自行心算趋势，禁止只报单期绝对值就下结论；
+   财务趋势要与主营构成占比变化、研报中的销量/出货量数据互相印证
+10. 避免给出投资建议，仅做客观分析
+
+【文风硬规则（违反即不合格）】
+- 每句话必须承载增量信息（数据、方向、因果或结论），凑字的话直接删
+- 禁用表述："总体来看""表现稳健""值得关注""仍需观察""具有一定风险"
+  "为未来发展奠定基础""赋能""保驾护航""综上所述"及一切同类空话套话
+- 结论必须可证伪：写"毛利率连续3期回升（18.2%→19.5%→20.1%）"，
+  不写"盈利能力有所改善"
 
 【输出要求】
 - 先总览（明确标注报告期，如"2026年一季报"）
-- 再逐项解读：盈利能力、偿债能力、成长能力、运营效率、现金流质量
+- 再逐项解读：盈利能力、偿债能力、成长能力、运营效率、现金流质量、利润驱动结构
 - 结合研报观点做定性补充
 - 最后给出总结性观点"""
 
@@ -235,6 +263,8 @@ class AnalystAgent:
             income_text = real_data["income"]
             balance_text = real_data["balance_sheet"]
             cashflow_text = real_data["cashflow"]
+            main_business_text = real_data["main_business"]
+            trend_text = real_data["trend"]
 
             logger.info("获取研报作为定性补充...")
             report_text = self._fetch_report(stock_code)
@@ -261,6 +291,12 @@ class AnalystAgent:
 
 ========== 真实现金流量表数据 ==========
 {cashflow_text if cashflow_text else '未获取到现金流量表数据'}
+
+========== 财报趋势（程序计算：同比序列/利润率变化/单季拆分） ==========
+{trend_text if trend_text else '历史期数不足，无法给趋势（只有单期数据时禁止下趋势结论）'}
+
+========== 主营业务构成（利润驱动结构） ==========
+{main_business_text if main_business_text else '缺主营构成数据'}
 
 ========== 最新一期财务数据(单位：亿元) ==========
 {financial_data}

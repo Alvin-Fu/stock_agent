@@ -1,0 +1,149 @@
+# -*- coding: utf-8 -*-
+"""
+财报趋势构建（纯函数，数字全部由代码算，LLM 只解读）：
+- 近 N 期营收/净利的同比序列（A股财报是累计口径，绝对值跨期不可比，
+  同比序列才是趋势信号）
+- 毛利率/净利率序列 + 与上年同期的变化（利润率改善/恶化）
+- 单季拆分：同年相邻累计期差分出真实单季营收/净利，并算单季同比
+- 程序判读：加速/放缓/改善/回落 由代码判定后写进文本，LLM 禁止另行心算
+"""
+
+from typing import Dict, List, Optional
+
+
+def _f(v) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        x = float(v)
+        return None if x != x else x
+    except (TypeError, ValueError):
+        return None
+
+
+def _sign(v: float) -> str:
+    return f"+{v:.1f}" if v >= 0 else f"{v:.1f}"
+
+
+def _norm_rows(records: List[Dict]) -> List[Dict]:
+    seen, rows = set(), []
+    for r in records:
+        d = str(r.get("report_date") or "")[:10]
+        if len(d) != 10 or d in seen:
+            continue
+        seen.add(d)
+        rev, np_ = _f(r.get("total_revenue")), _f(r.get("net_profit"))
+        rows.append({
+            "date": d,
+            "rev": rev / 1e8 if rev is not None else None,       # 亿
+            "np": np_ / 1e8 if np_ is not None else None,        # 亿
+            "rev_yoy": _f(r.get("revenue_growth")),
+            "np_yoy": _f(r.get("profit_growth")),
+            "gm": _f(r.get("gross_margin")),
+            "nm": np_ / rev * 100 if (rev and np_ is not None) else None,  # 净利率
+        })
+    rows.sort(key=lambda x: x["date"], reverse=True)
+    return rows
+
+
+def _trend_word(latest: float, prev: float, up: str, down: str, flat_eps: float = 0.5) -> str:
+    diff = latest - prev
+    if abs(diff) < flat_eps:
+        return "基本持平"
+    return up if diff > 0 else down
+
+
+def _quarter_label(d: str) -> str:
+    q = {"03-31": "Q1", "06-30": "Q2", "09-30": "Q3", "12-31": "Q4"}.get(d[5:])
+    return f"{d[:4]}{q}" if q else d
+
+
+def _single_quarters(rows: List[Dict]) -> List[Dict]:
+    """同年相邻累计期差分出单季营收/净利；Q1 累计即单季"""
+    by_date = {r["date"]: r for r in rows}
+    prev_q = {"06-30": "03-31", "09-30": "06-30", "12-31": "09-30"}
+    singles = []
+    for r in rows:
+        md = r["date"][5:]
+        if md == "03-31":
+            base = {"rev": 0.0, "np": 0.0}
+        else:
+            prev_md = prev_q.get(md)
+            base = by_date.get(f"{r['date'][:4]}-{prev_md}") if prev_md else None
+            if not base or base.get("rev") is None or base.get("np") is None:
+                continue
+        if r.get("rev") is None or r.get("np") is None:
+            continue
+        singles.append({
+            "date": r["date"],
+            "label": _quarter_label(r["date"]),
+            "rev": r["rev"] - base["rev"],
+            "np": r["np"] - base["np"],
+        })
+    # 单季同比：对上一年同一单季
+    by_label_md = {(s["date"][:4], s["date"][5:]): s for s in singles}
+    for s in singles:
+        last = by_label_md.get((str(int(s["date"][:4]) - 1), s["date"][5:]))
+        s["rev_yoy"] = (s["rev"] / last["rev"] - 1) * 100 if last and last["rev"] else None
+        s["np_yoy"] = (s["np"] / last["np"] - 1) * 100 if last and last["np"] and last["np"] > 0 else None
+    return singles
+
+
+def build_income_trend(records: List[Dict], max_periods: int = 6) -> str:
+    """输入 get_stock_income 的记录列表，输出趋势文本块；数据不足两期返回空串"""
+    rows = _norm_rows(records)
+    if len(rows) < 2:
+        return ""
+    shown = rows[:max_periods]
+
+    lines = ["【财报趋势（程序计算，累计口径：绝对值跨期不可比，看同比列与利润率列）】",
+             "报告期 | 营收(亿) | 营收同比% | 净利(亿) | 净利同比% | 毛利率% | 净利率%"]
+    for r in shown:
+        def _c(v, nd=1):
+            return f"{v:.{nd}f}" if v is not None else "-"
+        lines.append(f"{r['date']} | {_c(r['rev'])} | {_c(r['rev_yoy'])} | "
+                     f"{_c(r['np'])} | {_c(r['np_yoy'])} | {_c(r['gm'])} | {_c(r['nm'])}")
+
+    # ---- 程序判读 ----
+    verdicts = []
+    latest = shown[0]
+    prev = shown[1]
+    for key, name in (("rev_yoy", "营收同比"), ("np_yoy", "净利同比")):
+        a, b = latest.get(key), prev.get(key)
+        if a is not None and b is not None:
+            word = _trend_word(a, b, "加速", "放缓")
+            verdicts.append(f"{name} {_sign(b)}%→{_sign(a)}%，{word}")
+
+    # 利润率：优先对上年同期（同 MM-DD），口径干净
+    by_date = {r["date"]: r for r in rows}
+    yoy_row = by_date.get(f"{int(latest['date'][:4]) - 1}{latest['date'][4:]}")
+    for key, name in (("gm", "毛利率"), ("nm", "净利率")):
+        a = latest.get(key)
+        if a is None:
+            continue
+        if yoy_row and yoy_row.get(key) is not None:
+            diff = a - yoy_row[key]
+            word = "改善" if diff > 0.3 else ("回落" if diff < -0.3 else "基本持平")
+            verdicts.append(f"{name}较上年同期 {_sign(diff)}pct，{word}（{yoy_row[key]:.1f}%→{a:.1f}%）")
+        elif prev.get(key) is not None:
+            diff = a - prev[key]
+            verdicts.append(f"{name}较上一期 {_sign(diff)}pct（相邻累计期口径，仅作参考）")
+    if verdicts:
+        lines.append("程序判读：" + "；".join(verdicts))
+
+    # ---- 单季拆分 ----
+    singles = [s for s in _single_quarters(rows) if s.get("rev") is not None]
+    singles.sort(key=lambda s: s["date"], reverse=True)
+    if singles:
+        sq_lines = []
+        for s in singles[:4]:
+            seg = f"{s['label']} 营收{s['rev']:.1f}亿"
+            if s.get("rev_yoy") is not None:
+                seg += f"(同比{_sign(s['rev_yoy'])}%)"
+            seg += f" 净利{s['np']:.1f}亿"
+            if s.get("np_yoy") is not None:
+                seg += f"(同比{_sign(s['np_yoy'])}%)"
+            sq_lines.append(seg)
+        lines.append("单季拆分（累计差分）：" + "；".join(sq_lines))
+
+    return "\n".join(lines)
