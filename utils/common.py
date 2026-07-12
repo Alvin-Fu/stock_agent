@@ -2,6 +2,21 @@ import unicodedata
 from datetime import datetime
 import pandas as pd
 
+# pandas 3 兼容：新版默认字符串列用 pyarrow 后端，其正则走 RE2 引擎，
+# 而 akshare 内部大量正则模式含 \u3000 这类 \u 转义的清洗代码 RE2 不支持，
+# 会报 "Invalid regular expression: invalid escape sequence: \u"
+# （东财新闻等一批接口都会炸）。这里强制回退 Python 字符串后端（走 re 引擎，
+# 即 pandas 2 的老默认行为）。本模块被 utils 包入口加载，进程内先于 akshare 生效。
+try:
+    pd.set_option("mode.string_storage", "python")
+except Exception:
+    pass
+try:
+    # pandas 2.1~2.2 的实验开关（3.0 已移除，报错忽略即可）
+    pd.set_option("future.infer_string", False)
+except Exception:
+    pass
+
 TASK_NAME_DAILY_TASK = "daily_task"
 
 
