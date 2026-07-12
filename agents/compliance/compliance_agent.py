@@ -49,9 +49,10 @@ def run_quality_checks(text: str) -> list:
     issues = []
     text = text or ""
 
-    # 1) 估值分位必须带窗口：覆盖三种语序——"历史78%分位"/"78%分位"/"历史分位78%"，
+    # 1) 估值分位必须带窗口：覆盖四种语序——"历史78%分位"/"78%历史分位"/"78%分位"/"历史分位78%"，
     #    前文没有"近N年/近N个交易日"即违规
     for m in re.finditer(r"历史\s*\d+(?:\.\d+)?%?\s*分位"
+                         r"|\d+(?:\.\d+)?%\s*历史\s*分位"
                          r"|\d+(?:\.\d+)?%\s*分位"
                          r"|分位[从至为约]?\s*\d+(?:\.\d+)?%", text):
         ctx = text[max(0, m.start() - 12):m.start()]
@@ -81,6 +82,27 @@ def run_quality_checks(text: str) -> list:
     return issues
 
 
+def check_conclusion_skeleton(text: str, mode: str) -> list:
+    """
+    「📌 结论」骨架完整性检查（纯函数）：行名固定的填空模板，缺行=违规。
+    mode: "stock" / "industry" / ""（空=不检查）。实测 LLM 会自由发挥行名
+    （把"操作"写成"观察参考区"）或漏行（丢"大盘环境"），机械检查+修复兜底。
+    """
+    if not mode:
+        return []
+    text = text or ""
+    m = re.search(r"📌", text)
+    if not m:
+        return ["报告未以「📌 结论」固定骨架开头"]
+    tail = text[m.start():]
+    end = re.search(r"\n(?:---|## )", tail)
+    block = tail[:end.start()] if end else tail[:1500]
+    required = ["方向", "操作", "核心逻辑", "最大风险"]
+    required += ["护城河", "大盘环境"] if mode == "stock" else ["行业阶段"]
+    return [f"「📌 结论」骨架缺少「{name}」行（行名固定；对应数据在正文/材料里就搬上来，没有就填'无数据'）"
+            for name in required if name not in block]
+
+
 class ComplianceAgent:
     def __init__(self):
         self.llm = get_agent_llm("compliance")
@@ -98,6 +120,15 @@ class ComplianceAgent:
 
         # 程序质量检查（零成本、百分百执行）：分位窗口/趋势期间/来源枚举/0成句式/文风禁用词
         quality_issues = run_quality_checks(final_answer)
+        # 结论骨架完整性：按本次模式（个股/产业链）核对固定行名
+        stock_code = state.get("stock_code") or ""
+        if state.get("industry_name") or "," in stock_code:
+            mode = "industry"
+        elif stock_code:
+            mode = "stock"
+        else:
+            mode = ""
+        quality_issues += check_conclusion_skeleton(final_answer, mode)
         style_hits = scan_banned_phrases(final_answer)
         if style_hits:
             quality_issues.append("文风禁用词：" + "、".join(f"「{p}」×{n}" for p, n in style_hits))
@@ -184,6 +215,11 @@ class ComplianceAgent:
 5. 数字一致性回查：若提供了【程序数字清单】，逐一核对回答中引用的
    买卖区/止损/目标位/仓位/盈亏比数字是否与清单一致；发现数字抄错、方向词写反
    （如把"由负转正"写成"由正转负"）时，在 issues 里以"数字勘误：正确值是XX"格式列出
+6. 报告内部数字一致性（用算术互相验证，发现矛盾以"数字勘误"格式列出）：
+   - 累计同比必然介于各单月同比之间：出现"上半年同比+255%"但单月最高只有+95%这类，必为错数
+   - 派生数字要对得上：EPS×总股本≈净利润、单季利润×4与全年预测量级不能差数倍、
+     占比合计不能明显超过100%
+   - 同一指标在结论与正文出现两个值时点出，以带来源标注的为准
 
 【豁免规则】以下情况属于合规的操作参考，不算违规投资建议：
 - 条件化表述（"若选择介入"）+ 明确止损位 + 风险提示 的买卖点位与仓位参考
