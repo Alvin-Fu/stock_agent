@@ -22,6 +22,7 @@ import re
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from monitoring.notifier import FeishuNotifier
 from monitoring.scheduler import MonitorScheduler
@@ -341,6 +342,20 @@ class FeishuBot:
 
     # ---------- 启动 ----------
 
+    def _push_startup_help(self):
+        """启动时推送使用说明。10分钟内重复启动不重发——launchd 崩溃拉起时防止刷屏，
+        同时该提示缺席本身就是'进程在反复重启'的信号（正常重启一定会收到）"""
+        marker = Path("./data/.last_startup_push")
+        try:
+            if marker.exists() and time.time() - marker.stat().st_mtime < 600:
+                logger.info("[飞书] 10分钟内已推送过启动说明，跳过（崩溃拉起防刷屏）")
+                return
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+            self.notifier.send("🚀 股票分析助手已启动，监控调度运行中\n\n" + HELP_TEXT)
+        except Exception as e:
+            logger.warning(f"[飞书] 启动说明推送失败（不影响运行）: {e}")
+
     def start(self):
         # 财报发布触发的自动重分析：丢进工作线程池跑，结果推到默认通道
         self.monitor.set_analysis_runner(
@@ -349,6 +364,9 @@ class FeishuBot:
 
         # 监控调度始终启动（有 watchlist 且配了任一推送通道即可工作）
         self.monitor.start()
+
+        # 启动即推送使用说明（纯推送模式也发：webhook 通道同样能收到）
+        self._push_startup_help()
 
         if not (self.app_id and self.app_secret):
             logger.warning("[飞书] 未配置 feishu.app_id/app_secret，进入纯监控推送模式（无法对话）")
