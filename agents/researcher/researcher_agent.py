@@ -33,15 +33,24 @@ class ResearcherAgent:
         recent_period = f"{today.year}年{today.month}月"
         three_month_range = f"{three_months.strftime('%Y-%m')} {today.strftime('%Y-%m')}"
 
+        # 搜索引擎对公司名的召回远好于裸代码，先反查名字（失败则退回代码）
+        try:
+            name = find_company_name(stock_code) or stock_code
+        except Exception:
+            name = stock_code
+        tag = f"{name}" if name != stock_code else stock_code
+
         return [
-            f"{stock_code} 公司公告 重大事项 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
-            f"{stock_code} 所属行业 产业政策 发展趋势 {three_month_range}",
-            f"{stock_code} 经营状况 营收 利润 最新业绩 {recent_period}",
-            f"{stock_code} 业务构成 收入占比 毛利占比 各板块营收拆分",
-            f"{stock_code} 出货量 产能 新增订单 订单来源 资本开支",
-            f"{stock_code} 技术实力 研发投入 核心技术突破 专利",
-            f"{stock_code} 产业链 上下游 市场地位 竞争格局 {recent_period}",
-            f"{stock_code} 利好 利空 机构评级 目标价 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
+            f"{tag} 公司公告 重大事项 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
+            f"{tag} 所属行业 产业政策 发展趋势 {three_month_range}",
+            f"{tag} 经营状况 营收 利润 最新业绩 {recent_period}",
+            f"{tag} 月度产销快报 销量 环比 同比 {recent_period}",
+            f"{tag} 竞争对手 销量对比 市场份额 {today.year}",
+            f"{tag} 业务构成 收入占比 毛利占比 各板块营收拆分",
+            f"{tag} 出货量 产能 新增订单 订单来源 资本开支",
+            f"{tag} 技术实力 研发投入 核心技术突破 专利",
+            f"{tag} 产业链 上下游 市场地位 竞争格局 {recent_period}",
+            f"{tag} 利好 利空 机构评级 目标价 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
         ]
 
     def _build_stock_system_prompt(self) -> str:
@@ -57,6 +66,11 @@ class ResearcherAgent:
 5. **产业链地位**：位置、议价力、竞争格局
 6. **利好与利空分析**：分别列出利好和利空条目，每条标注影响力(高/中/低)及依据出处；
    综合判断只用「偏多/中性/偏空」三档，禁止编造精确百分比
+
+【风险对称要求】
+- 每条高影响力利好必须检查并列出对应风险（如：出口高增→关税/反补贴调查风险；大客户订单→客户集中度风险）
+- 机构评级降权处理：A股卖方几乎不出卖出评级，"N家机构全部买入"不构成有效利好，最多作为关注度参考
+- 目标价：搜索结果里有具体数字才引用，没有就不写"上涨空间较大"这类无依据表述
 
 【输出要求】每个维度给出明确结论；业务数据尽可能用数字；搜索结果中没有的信息标注「信息不足」，
 禁止用自身知识补数字；最后 3 句以内核心总结"""

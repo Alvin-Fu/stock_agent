@@ -3,6 +3,7 @@
 职责：拉取真实财务报表(利润表+资产负债表) → 调研报补充 → 计算比率 → LLM分析 → 保存到数据库
 """
 
+import pandas as pd
 from typing import Dict, Any
 from langchain_core.messages import SystemMessage, HumanMessage
 from datetime import date
@@ -21,6 +22,7 @@ from tools.stock_tools import (
     call_fetch_stock_research_report,
     call_fetch_income_data,
     call_fetch_balance_sheet_data,
+    call_fetch_cashflow_data,
 )
 from utils.logger import logger
 from storage.sqlite.stock_storage import get_db
@@ -51,7 +53,7 @@ class AnalystAgent:
 
     def _fetch_real_financial_data(self, stock_code: str) -> Dict[str, Any]:
         """从数据库/Tushare 拉取真实财务报表数据"""
-        result = {"income": "", "balance_sheet": "", "parsed": {}}
+        result = {"income": "", "balance_sheet": "", "cashflow": "", "parsed": {}}
 
         # 先更新每日指标（PE/PB/市值），估值比率依赖它；失败不阻断其余分析
         try:
@@ -73,6 +75,13 @@ class AnalystAgent:
                 result["balance_sheet"] = balance_text
         except Exception as e:
             logger.error(f"获取资产负债表失败 {stock_code}: {e}")
+
+        try:
+            cashflow_text = call_fetch_cashflow_data(stock_code)
+            if cashflow_text and "未获取到" not in cashflow_text:
+                result["cashflow"] = cashflow_text
+        except Exception as e:
+            logger.error(f"获取现金流量表失败 {stock_code}: {e}")
 
         result["parsed"] = self._parse_latest_financial_data()
         return result
@@ -133,15 +142,26 @@ class AnalystAgent:
             if parsed.get("operating_profit") is not None:
                 parsed["ebit"] = parsed["operating_profit"]
 
-            # 市值：从每日指标表取（total_mv 单位万元，转为亿元）
+            # 市值/PE/PB：从每日指标表取（total_mv 单位万元，转为亿元）
+            # 同时计算 PE/PB 在自身近3年历史中的分位数——比绝对值更有估值信息量
             try:
-                basic_df = self.db.get_latest_daily_basic_data(stock_code)
+                basic_df = self.db.get_latest_daily_basic_data(stock_code, 750)
                 if basic_df is not None and not basic_df.empty:
-                    total_mv = basic_df.iloc[0].get("total_mv")
+                    latest_basic = basic_df.iloc[0]
+                    total_mv = latest_basic.get("total_mv")
                     if total_mv:
                         parsed["market_cap"] = float(total_mv) / 1e4
+                    for col, name in [("pe_ttm", "pe_ttm"), ("pb", "pb")]:
+                        cur = latest_basic.get(col)
+                        if cur is None or pd.isna(cur):
+                            continue
+                        parsed[name] = round(float(cur), 2)
+                        hist = pd.to_numeric(basic_df[col], errors="coerce").dropna()
+                        if len(hist) >= 60:
+                            pct = float((hist < float(cur)).mean() * 100)
+                            parsed[f"{name}_历史分位"] = f"{pct:.0f}%（近{len(hist)}个交易日，越低越便宜）"
             except Exception as e:
-                logger.warning(f"获取市值数据失败（不影响其余比率）: {e}")
+                logger.warning(f"获取市值/估值数据失败（不影响其余比率）: {e}")
 
         except Exception as e:
             logger.error(f"解析最新财务数据失败: {e}")
@@ -186,14 +206,16 @@ class AnalystAgent:
    - 资产负债率要区分有息负债与经营性占款（如车企/零售的应付账款是无息占用上游资金，
      高负债率不等于高杠杆风险，不要直接定性为"高杠杆运营风险高"）
    - 金融业不适用流动比率；制造业/车企流动比率常年低于1属行业常态
-5. 数据中标注"缺少XX数据"的项：直接说明缺失，禁止估算或用行业均值代替
-6. 每个定性结论必须有对应数据支撑，禁止使用与数据矛盾的模板化表述
+5. 现金流解读：对比经营现金流净额与净利润的匹配度（现金流长期低于净利润要警惕利润质量），
+   结合资本开支规模判断扩张强度；重资产/占用供应链账期的公司，经营现金流比流动比率更能说明偿债能力
+6. 数据中标注"缺少XX数据"的项：直接说明缺失，禁止估算或用行业均值代替
+7. 每个定性结论必须有对应数据支撑，禁止使用与数据矛盾的模板化表述
    （例如：单车均价上涨时不得使用"以价换量"的说法）
-7. 避免给出投资建议，仅做客观分析
+8. 避免给出投资建议，仅做客观分析
 
 【输出要求】
 - 先总览（明确标注报告期，如"2026年一季报"）
-- 再逐项解读：盈利能力、偿债能力、成长能力、运营效率
+- 再逐项解读：盈利能力、偿债能力、成长能力、运营效率、现金流质量
 - 结合研报观点做定性补充
 - 最后给出总结性观点"""
 
@@ -212,6 +234,7 @@ class AnalystAgent:
             financial_data = real_data["parsed"]
             income_text = real_data["income"]
             balance_text = real_data["balance_sheet"]
+            cashflow_text = real_data["cashflow"]
 
             logger.info("获取研报作为定性补充...")
             report_text = self._fetch_report(stock_code)
@@ -235,6 +258,9 @@ class AnalystAgent:
 
 ========== 真实资产负债表数据 ==========
 {balance_text if balance_text else '未获取到资产负债表数据'}
+
+========== 真实现金流量表数据 ==========
+{cashflow_text if cashflow_text else '未获取到现金流量表数据'}
 
 ========== 最新一期财务数据(单位：亿元) ==========
 {financial_data}

@@ -617,10 +617,16 @@ class TushareFetcher(BaseFetcher):
         logger.info(f"stk income({ts_code}, {ts_start}, {ts_end})")
         
         try:
+            # 显式指定 fields：默认返回不保证包含四项费用（sell_exp/admin_exp/rd_exp/fin_exp），
+            # 需要显式列出才能拿到，供下游分析"利润下滑是费用吃掉的还是毛利掉了"
             df = ts.pro_api().income(
                 ts_code=ts_code,
                 start_date=ts_start,
                 end_date=ts_end,
+                fields=(
+                    "ts_code,ann_date,end_date,total_revenue,operate_profit,n_income,"
+                    "basic_eps,oper_cost,sell_exp,admin_exp,rd_exp,fin_exp,update_flag"
+                ),
             )
             if df.empty:
                 return pd.DataFrame()
@@ -631,6 +637,45 @@ class TushareFetcher(BaseFetcher):
                 logger.warning(f"Tushare 配额可能超限: {e}")
                 raise RateLimitError(f"Tushare 配额超限: {e}") from e
             raise DataFetchError(f"Tushare income err: {e}") from e
+
+    def stock_cashflow(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        获取现金流量表数据（报告期累计口径，单位：元）
+        args:
+            stock_code: 股票代码
+            start_date: 开始日期
+            end_date: 结束日期
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
+        logger.info(f"stk cashflow({ts_code}, {ts_start}, {ts_end})")
+
+        try:
+            # 显式指定 fields：经营/投资/筹资活动现金流净额、购建固定资产等支付的现金（资本开支）、
+            # 自由现金流（tushare 计算值，可能为空）；update_flag 用于同报告期多条时取最新
+            df = ts.pro_api().cashflow(
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+                fields=(
+                    "ts_code,ann_date,end_date,n_cashflow_act,n_cashflow_inv_act,"
+                    "n_cash_flows_fnc_act,c_pay_acq_const_fids,free_cashflow,update_flag"
+                ),
+            )
+            if df.empty:
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+
+            # 检测配额超限
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare 配额可能超限: {e}")
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+
+            raise DataFetchError(f"Tushare cashflow err: {e}") from e
 
     def balancesheet(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """

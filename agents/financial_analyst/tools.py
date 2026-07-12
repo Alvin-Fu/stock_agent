@@ -70,6 +70,8 @@ def calculate_profitability_ratios(financial_statements: Dict) -> Dict[str, obje
             result["ROE"] = round(net_income / total_equity * 100, 2)
         else:
             result["ROE"] = "缺少净资产/净利润数据"
+        # 利润表是累计口径：一季报时 ROE/ROA 是单季利润/期末资产，天然偏低
+        result["口径说明"] = "净利润为报告期累计值，ROE/ROA 未年化（一季报时数值约为年化的1/4）"
         return result
     except Exception as e:
         logger.error(f"计算盈利能力比率失败: {e}")
@@ -133,32 +135,34 @@ def calculate_solvency_ratios(financial_statements: Dict) -> Dict[str, object]:
 @tool(args_schema=RatioInput)
 def calculate_valuation_ratios(financial_statements: Dict) -> Dict[str, object]:
     """
-    计算估值比率（需要市值数据）
-    输入需包含：market_cap, net_income, total_equity, ebitda
+    计算估值比率。
+    优先使用每日指标表的 pe_ttm/pb（TTM 口径，正确）；
+    禁止用"市值/最新一期累计净利润"自算 PE——利润表是累计口径，
+    一季报时会把 PE 虚高约 4 倍。
     """
     try:
         fs = financial_statements
+        pe_ttm = _get(fs, "pe_ttm")
+        pb = _get(fs, "pb")
         market_cap = _get(fs, "market_cap")
-        net_income = _get(fs, "net_income")
         total_equity = _get(fs, "total_equity")
-        ebitda = _get(fs, "ebitda")
-
-        if not market_cap:
-            return {"说明": "缺少市值数据，无法计算估值比率"}
 
         result = {}
-        if net_income:
-            result["市盈率 (P/E)"] = round(market_cap / net_income, 2)
+        if pe_ttm:
+            result["市盈率 PE(TTM)"] = pe_ttm
         else:
-            result["市盈率 (P/E)"] = "净利润为零或缺失"
-        if total_equity:
-            result["市净率 (P/B)"] = round(market_cap / total_equity, 2)
+            result["市盈率 PE(TTM)"] = "缺少TTM数据（利润表累计口径不能直接算PE）"
+        if pb:
+            result["市净率 P/B"] = pb
+        elif market_cap and total_equity:
+            # PB 用时点数计算无口径问题，可以退化自算
+            result["市净率 P/B"] = round(market_cap / total_equity, 2)
         else:
-            result["市净率 (P/B)"] = "缺少净资产数据"
-        if ebitda:
-            result["EV/EBITDA"] = round(market_cap / ebitda, 2)  # 简化，未考虑净债务
-        else:
-            result["EV/EBITDA"] = "缺少EBITDA数据"
+            result["市净率 P/B"] = "缺少数据"
+        if fs.get("pe_ttm_历史分位"):
+            result["PE(TTM) 历史分位"] = fs["pe_ttm_历史分位"]
+        if fs.get("pb_历史分位"):
+            result["PB 历史分位"] = fs["pb_历史分位"]
         return result
     except Exception as e:
         logger.error(f"计算估值比率失败: {e}")
@@ -215,6 +219,7 @@ def perform_dupont_analysis(financial_statements: Dict) -> Dict[str, object]:
             "资产周转率": round(asset_turnover, 2),
             "权益乘数": round(equity_multiplier, 2),
             "ROE (杜邦)": round(roe * 100, 2),
+            "口径说明": "基于报告期累计利润，未年化",
         }
     except Exception as e:
         logger.error(f"杜邦分析失败: {e}")

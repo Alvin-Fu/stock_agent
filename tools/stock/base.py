@@ -200,7 +200,7 @@ class BaseFetcher(ABC):
             df = data_cleaner.standardize_data(df)
 
             # Step 5: 计算技术指标
-            df = self._calculate_indicators(df)
+            df = self._calculate_indicators(df, freq="daily")
 
             # Step 6: 更新缓存
             if use_cache:
@@ -335,8 +335,8 @@ class BaseFetcher(ABC):
             df = data_cleaner.remove_outliers(df)
             df = data_cleaner.standardize_data(df)
 
-            # Step 5: 计算技术指标
-            df = self._calculate_indicators(df)
+            # Step 5: 计算技术指标（52周窗口按周期折算）
+            df = self._calculate_indicators(df, freq=freq)
 
             # Step 6: 更新缓存
             if use_cache:
@@ -420,13 +420,16 @@ class BaseFetcher(ABC):
         logger.info(f"clean data success")
         return df
 
-    def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        计算技术指标
+    # 52周（一年）位置窗口：日线约244个交易日，周线52根，月线12根
+    _POS_52W_WINDOW = {"daily": 244, "week": 52, "weekly": 52, "month": 12, "monthly": 12}
 
-        计算指标：
-        - MA5, MA10, MA20: 移动平均线
-        - Volume_Ratio: 量比（今日成交量 / 5日平均成交量）
+    def _calculate_indicators(self, df: pd.DataFrame, freq: str = "daily") -> pd.DataFrame:
+        """
+        计算技术指标（全部在升序序列上计算，最后降序展示）
+
+        数值指标：MA/EMA、MACD(DIF/DEA/MACD)、量比、RSI(6/12/24)、KDJ(9,3,3)、
+                 BOLL(20,2)、ATR14、OBV、pos_52w（收盘价在近一年高低区间的位置0-100）
+        信号列（代码判定，LLM 只做解读）：macd_signal、ma_pattern、ma_cross、vol_signal、gap_signal
         """
         df = df.copy()
         # 所有指标（MACD/均线/量比）必须在按日期升序的序列上计算，
@@ -441,10 +444,128 @@ class BaseFetcher(ABC):
         df['volume_ratio'] = df['volume'] / avg_volume_5.shift(1)
         df['volume_ratio'] = df['volume_ratio'].fillna(1.0).round(2)
 
+        df = self._calculate_rsi(df)
+        df = self._calculate_kdj(df)
+        df = self._calculate_boll(df)
+        df = self._calculate_atr(df)
+        df = self._calculate_obv(df)
+        df = self._calculate_pos_52w(df, self._POS_52W_WINDOW.get(freq, 244))
+        df = self._calculate_signals(df)
+
         # 全部指标计算完成后再按日期降序排列（仅用于展示，最新数据在前）
         if 'date' in df.columns:
             df = df.sort_values(by='date', ascending=False).reset_index(drop=True)
         logger.info(f"calculate indicators success")
+        return df
+
+    @staticmethod
+    def _calculate_rsi(df: pd.DataFrame, periods=(6, 12, 24)) -> pd.DataFrame:
+        """RSI（Wilder 平滑，与国内行情软件口径一致）"""
+        diff = df['close'].diff()
+        gain = diff.clip(lower=0)
+        loss = -diff.clip(upper=0)
+        for p in periods:
+            avg_gain = gain.ewm(alpha=1 / p, adjust=False).mean()
+            avg_loss = loss.ewm(alpha=1 / p, adjust=False).mean()
+            rs = avg_gain / avg_loss.replace(0, np.nan)
+            df[f'rsi{p}'] = (100 - 100 / (1 + rs)).fillna(100.0).round(2)
+        return df
+
+    @staticmethod
+    def _calculate_kdj(df: pd.DataFrame, n: int = 9) -> pd.DataFrame:
+        """KDJ(9,3,3)：K/D 用国内通行的 1/3 递归平滑"""
+        low_n = df['low'].rolling(window=n, min_periods=1).min()
+        high_n = df['high'].rolling(window=n, min_periods=1).max()
+        span = (high_n - low_n).replace(0, np.nan)
+        rsv = ((df['close'] - low_n) / span * 100).fillna(50.0)
+        df['kdj_k'] = rsv.ewm(alpha=1 / 3, adjust=False).mean().round(2)
+        df['kdj_d'] = df['kdj_k'].ewm(alpha=1 / 3, adjust=False).mean().round(2)
+        df['kdj_j'] = (3 * df['kdj_k'] - 2 * df['kdj_d']).round(2)
+        return df
+
+    @staticmethod
+    def _calculate_boll(df: pd.DataFrame, n: int = 20, k: float = 2.0) -> pd.DataFrame:
+        """布林带(20,2)"""
+        mid = df['close'].rolling(window=n, min_periods=n).mean()
+        std = df['close'].rolling(window=n, min_periods=n).std()
+        df['boll_mid'] = mid.round(2)
+        df['boll_upper'] = (mid + k * std).round(2)
+        df['boll_lower'] = (mid - k * std).round(2)
+        return df
+
+    @staticmethod
+    def _calculate_atr(df: pd.DataFrame, n: int = 14) -> pd.DataFrame:
+        """ATR14（Wilder 平滑真实波幅）"""
+        prev_close = df['close'].shift(1)
+        tr = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - prev_close).abs(),
+            (df['low'] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        df['atr14'] = tr.ewm(alpha=1 / n, adjust=False).mean().round(3)
+        return df
+
+    @staticmethod
+    def _calculate_obv(df: pd.DataFrame) -> pd.DataFrame:
+        """OBV 能量潮：涨日加量、跌日减量的累积"""
+        direction = np.sign(df['close'].diff()).fillna(0)
+        df['obv'] = (direction * df['volume']).cumsum()
+        return df
+
+    @staticmethod
+    def _calculate_pos_52w(df: pd.DataFrame, window: int) -> pd.DataFrame:
+        """收盘价在近一年（按周期折算窗口）高低区间中的位置，0=年内最低 100=年内最高"""
+        high_w = df['high'].rolling(window=window, min_periods=1).max()
+        low_w = df['low'].rolling(window=window, min_periods=1).min()
+        span = (high_w - low_w).replace(0, np.nan)
+        df['pos_52w'] = ((df['close'] - low_w) / span * 100).fillna(50.0).round(1)
+        return df
+
+    @staticmethod
+    def _calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        信号列：由代码判定金叉死叉/均线形态/量价/缺口，LLM 只负责解读。
+        全部在升序序列上用 shift(1) 对比前一根，无未来数据。
+        """
+        # 均线排列形态（逐行判定）
+        def _pattern(row):
+            vals = [row.get('ma5'), row.get('ma10'), row.get('ma20'), row.get('ma50')]
+            if any(v is None or pd.isna(v) for v in vals):
+                return '数据不足'
+            if vals[0] > vals[1] > vals[2] > vals[3]:
+                return '多头排列'
+            if vals[0] < vals[1] < vals[2] < vals[3]:
+                return '空头排列'
+            return '缠绕'
+        df['ma_pattern'] = df.apply(_pattern, axis=1)
+
+        # 均线金叉/死叉（5x10、10x20）
+        cross_parts = pd.Series([''] * len(df), index=df.index)
+        for fast, slow in [(5, 10), (10, 20)]:
+            f, s = df.get(f'ma{fast}'), df.get(f'ma{slow}')
+            if f is None or s is None:
+                continue
+            golden = (f.shift(1) <= s.shift(1)) & (f > s)
+            death = (f.shift(1) >= s.shift(1)) & (f < s)
+            cross_parts = cross_parts.where(~golden, cross_parts + f'金叉{fast}x{slow} ')
+            cross_parts = cross_parts.where(~death, cross_parts + f'死叉{fast}x{slow} ')
+        df['ma_cross'] = cross_parts.str.strip()
+
+        # 量价信号：量比 + 当日涨跌方向
+        chg = df['close'].diff()
+        vr = df['volume_ratio']
+        df['vol_signal'] = ''
+        df.loc[(vr >= 2.0), 'vol_signal'] = '异常放量'
+        df.loc[(vr >= 1.5) & (vr < 2.0) & (chg > 0), 'vol_signal'] = '放量上涨'
+        df.loc[(vr >= 1.5) & (vr < 2.0) & (chg < 0), 'vol_signal'] = '放量下跌'
+        df.loc[(vr <= 0.7) & (chg < 0), 'vol_signal'] = '缩量回调'
+
+        # 跳空缺口
+        prev_high = df['high'].shift(1)
+        prev_low = df['low'].shift(1)
+        df['gap_signal'] = ''
+        df.loc[df['low'] > prev_high, 'gap_signal'] = '向上跳空'
+        df.loc[df['high'] < prev_low, 'gap_signal'] = '向下跳空'
         return df
 
     def calculate_ma_ema(
@@ -465,16 +586,11 @@ class BaseFetcher(ABC):
         if df.empty or price_col not in df.columns:
             return df
         df = df.sort_values(by='date', ascending=True).reset_index(drop=True)
-        logger.info(f"calculate ma and ema {price_col}")
-        logger.info(f"open {df.tail(10)}")
-        logger.info(f"close {df.tail(10).get(price_col)}")
         # ---------------------- 1. 计算MA（简单移动平均） ----------------------
         for period in ma_periods:
-            # rolling(window=period)：固定周期窗口；min_periods=1：数据不足时也计算
-            ma = df[price_col].rolling(window=period, min_periods= period).mean().round(2)
-            key = f'ma{period}'
-            logger.info(f"ma {key} {ma.tail(10)}")
-            df[key] = ma
+            # rolling(window=period)：min_periods=period，数据不足时为 NaN（不用短窗口造假）
+            ma = df[price_col].rolling(window=period, min_periods=period).mean().round(2)
+            df[f'ma{period}'] = ma
 
         # ---------------------- 2. 计算EMA（指数移动平均） ----------------------
         for period in ema_periods:
@@ -716,13 +832,21 @@ def merge_and_clean_data(date_field: str, df_db, df_new):
     """
         核心逻辑：
         1. 合并存量+增量数据
-        2. 按日期去重（保留增量数据，即最后一条）
-        3. 按日期升序排序
+        2. 统一日期类型（DB/akshare 是 date 对象，tushare 是 Timestamp——
+           不统一会导致重叠日去重失效、混合类型排序抛异常、复权漂移检测失灵）
+        3. 按日期去重（保留增量数据，即最后一条）
+        4. 按日期升序排序
     """
+    from utils.common import parse_row_date
+
     # 步骤1：合并数据
     df_merged = pd.concat([df_db, df_new], ignore_index=True)
 
-    # 步骤2：按日期去重（关键！保留最后一行=增量数据覆盖存量重复数据）
+    # 步骤2：统一日期类型为 datetime.date
+    if date_field in df_merged.columns:
+        df_merged[date_field] = df_merged[date_field].apply(parse_row_date)
+
+    # 步骤3：按日期去重（关键！保留最后一行=增量数据覆盖存量重复数据）
     # 若想保留存量数据，把 keep="last" 改为 keep="first"
     df_dedup = df_merged.drop_duplicates(
         subset=[date_field],  # 按日期去重（股票数据核心去重维度）

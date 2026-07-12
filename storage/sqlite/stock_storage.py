@@ -714,6 +714,7 @@ class StockIncome(Base):
     字段说明：
     • 标识字段：code（股票代码）、report_date（报告日期）
     • 利润数据：total_revenue（营业收入，单位：元）、operating_profit（营业利润，单位：元）、net_profit（净利润，单位：元）
+    • 费用数据：sell_exp（销售费用）、admin_exp（管理费用）、rd_exp（研发费用）、fin_exp（财务费用），单位均为元
     • 元数据：data_source（数据来源）、updated_at（更新时间）
     """
     __tablename__ = 'stock_income'
@@ -725,6 +726,10 @@ class StockIncome(Base):
     operating_profit = Column(Float)  # 营业利润（单位：元）
     net_profit = Column(Float)  # 净利润（单位：元）
     basic_eps = Column(Float)  # 基本每股收益（单位：元）
+    sell_exp = Column(Float)  # 销售费用（单位：元）
+    admin_exp = Column(Float)  # 管理费用（单位：元）
+    rd_exp = Column(Float)  # 研发费用（单位：元）
+    fin_exp = Column(Float)  # 财务费用（单位：元）
     revenue_growth = Column(Float)  # 营业收入同比增长率（单位：%）
     profit_growth = Column(Float)  # 净利润同比增长率（单位：%）
     gross_margin = Column(Float)  # 毛利率（单位：%）
@@ -747,6 +752,10 @@ class StockIncome(Base):
             'operating_profit': self.operating_profit,
             'net_profit': self.net_profit,
             'basic_eps': self.basic_eps,
+            'sell_exp': self.sell_exp,
+            'admin_exp': self.admin_exp,
+            'rd_exp': self.rd_exp,
+            'fin_exp': self.fin_exp,
             'revenue_growth': self.revenue_growth,
             'profit_growth': self.profit_growth,
             'gross_margin': self.gross_margin,
@@ -806,6 +815,57 @@ class StockBalanceSheet(Base):
             'total_equity': self.total_equity,
             'asset_liability_ratio': self.asset_liability_ratio,
             'current_ratio': self.current_ratio,
+            'data_source': self.data_source,
+        }
+
+# === 现金流量表模型 ===
+class StockCashflow(Base):
+    """
+    股票现金流量表模型 - ORM映射类
+
+    数据库表: stock_cashflow
+    功能：存储公司现金流量表数据（报告期累计口径）
+
+    字段说明：
+    • 标识字段：code（股票代码）、report_date（报告日期）
+    • 现金流数据（单位均为元）：
+      operating_cashflow（经营活动现金流净额，tushare n_cashflow_act）
+      investing_cashflow（投资活动现金流净额，tushare n_cashflow_inv_act）
+      financing_cashflow（筹资活动现金流净额，tushare n_cash_flows_fnc_act）
+      capex（购建固定资产、无形资产和其他长期资产支付的现金，tushare c_pay_acq_const_fids）
+      free_cashflow（自由现金流，tushare 计算值，可能为空）
+    • 元数据：data_source（数据来源）、updated_at（更新时间）
+    """
+    __tablename__ = 'stock_cashflow'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    report_date = Column(Date, nullable=False, index=True)
+    operating_cashflow = Column(Float)  # 经营活动现金流净额（单位：元）
+    investing_cashflow = Column(Float)  # 投资活动现金流净额（单位：元）
+    financing_cashflow = Column(Float)  # 筹资活动现金流净额（单位：元）
+    capex = Column(Float)  # 购建固定资产无形资产等支付的现金（资本开支，单位：元）
+    free_cashflow = Column(Float)  # 自由现金流（单位：元，可能为空）
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'report_date', name='uix_cashflow_code_date'),
+        Index('ix_cashflow_code_date', 'code', 'report_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockCashflow(code={self.code}, report_date={self.report_date}, operating_cashflow={self.operating_cashflow})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'code': self.code,
+            'report_date': self.report_date,
+            'operating_cashflow': self.operating_cashflow,
+            'investing_cashflow': self.investing_cashflow,
+            'financing_cashflow': self.financing_cashflow,
+            'capex': self.capex,
+            'free_cashflow': self.free_cashflow,
             'data_source': self.data_source,
         }
 
@@ -1037,6 +1097,11 @@ class DatabaseManager:
         if db_url is None:
             config = get_db_config()
             db_url = config.get("sqlite_path", "sqlite:///./data/sqlite/stock.db")
+        # 兼容配置里写纯文件路径的情况（如 ./data/sqlite/stock.db），自动补 sqlite:/// 前缀
+        if "://" not in str(db_url):
+            db_path = Path(db_url)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            db_url = f"sqlite:///{db_url}"
 
         # 步骤2：创建SQLAlchemy引擎（连接池管理器）
         # 参数说明：
@@ -1084,6 +1149,8 @@ class DatabaseManager:
         create_all 按新模型重建，安全无数据丢失：
         1. stock_research_report：ratio_yaar1/2/3 列名 typo → ratio_year1/2/3
         2. daily_forecast：code/forecast_date 错误的单列 unique 约束 → 只保留复合唯一约束
+        3. stock_income：历史表缺四项费用列（sell_exp/admin_exp/rd_exp/fin_exp），
+           create_all 对已存在的表不会加列，用 ALTER TABLE ADD COLUMN 补齐（幂等，存量数据保留）
         """
         try:
             inspector = inspect(self._engine)
@@ -1111,6 +1178,22 @@ class DatabaseManager:
                             conn.commit()
                             logger.info("检测到 daily_forecast 旧表（单列 unique 约束），已删除待重建")
                             break
+
+                # stock_income：旧表缺四项费用列时用 ALTER TABLE 补齐（有数据不能 DROP 重建）
+                if 'stock_income' in table_names:
+                    income_cols = [c['name'] for c in inspector.get_columns('stock_income')]
+                    # 四项费用列，单位：元
+                    expense_cols = {
+                        'sell_exp': '销售费用',
+                        'admin_exp': '管理费用',
+                        'rd_exp': '研发费用',
+                        'fin_exp': '财务费用',
+                    }
+                    for col_name, col_desc in expense_cols.items():
+                        if col_name not in income_cols:
+                            conn.execute(text(f'ALTER TABLE stock_income ADD COLUMN {col_name} FLOAT'))
+                            conn.commit()
+                            logger.info(f"stock_income 表补充费用列 {col_name}（{col_desc}，单位：元）")
         except Exception as e:
             # 迁移失败不阻塞启动，但要暴露出来便于排查
             logger.error(f"历史表结构迁移失败: {e}")
@@ -3342,6 +3425,10 @@ class DatabaseManager:
                         existing.operating_profit = row.get('operating_profit')
                         existing.net_profit = row.get('net_profit')
                         existing.basic_eps = row.get('basic_eps')
+                        existing.sell_exp = row.get('sell_exp')
+                        existing.admin_exp = row.get('admin_exp')
+                        existing.rd_exp = row.get('rd_exp')
+                        existing.fin_exp = row.get('fin_exp')
                         existing.revenue_growth = row.get('revenue_growth')
                         existing.profit_growth = row.get('profit_growth')
                         existing.gross_margin = row.get('gross_margin')
@@ -3355,6 +3442,10 @@ class DatabaseManager:
                             operating_profit=row.get('operating_profit'),
                             net_profit=row.get('net_profit'),
                             basic_eps=row.get('basic_eps'),
+                            sell_exp=row.get('sell_exp'),
+                            admin_exp=row.get('admin_exp'),
+                            rd_exp=row.get('rd_exp'),
+                            fin_exp=row.get('fin_exp'),
                             revenue_growth=row.get('revenue_growth'),
                             profit_growth=row.get('profit_growth'),
                             gross_margin=row.get('gross_margin'),
@@ -3498,6 +3589,102 @@ class DatabaseManager:
                 query = query.where(StockBalanceSheet.report_date <= end_date)
 
             results = session.execute(query.order_by(desc(StockBalanceSheet.report_date))).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'report_date' in data_list.columns:
+                data_list['report_date'] = data_list['report_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    def save_stock_cashflow(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存现金流量表数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含现金流量表数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存现金流量表数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                report_dates = [parse_row_date(d) for d in df['report_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockCashflow).where(
+                        and_(
+                            StockCashflow.code == code,
+                            StockCashflow.report_date.in_(report_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {r.report_date: r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    report_date = parse_row_date(row.get('report_date'))
+                    existing = existing_map.get(report_date)
+
+                    if existing:
+                        existing.operating_cashflow = row.get('operating_cashflow')
+                        existing.investing_cashflow = row.get('investing_cashflow')
+                        existing.financing_cashflow = row.get('financing_cashflow')
+                        existing.capex = row.get('capex')
+                        existing.free_cashflow = row.get('free_cashflow')
+                        existing.data_source = row.get('data_source', 'Tushare')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockCashflow(
+                            code=code,
+                            report_date=report_date,
+                            operating_cashflow=row.get('operating_cashflow'),
+                            investing_cashflow=row.get('investing_cashflow'),
+                            financing_cashflow=row.get('financing_cashflow'),
+                            capex=row.get('capex'),
+                            free_cashflow=row.get('free_cashflow'),
+                            data_source=row.get('data_source', 'Tushare'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 现金流量表数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 现金流量表数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 现金流量表数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_cashflow(self, code: str, start_date: Optional[date] = None, end_date: Optional[date] = None) -> pd.DataFrame:
+        """
+        获取现金流量表数据（按报告期降序）
+        Args:
+            code: 股票代码
+            start_date: 开始日期（可选）
+            end_date: 结束日期（可选）
+        Returns:
+            pd.DataFrame: 现金流量表数据
+        """
+        with self.get_session() as session:
+            query = select(StockCashflow).where(StockCashflow.code == code)
+
+            if start_date:
+                query = query.where(StockCashflow.report_date >= start_date)
+            if end_date:
+                query = query.where(StockCashflow.report_date <= end_date)
+
+            results = session.execute(query.order_by(desc(StockCashflow.report_date))).scalars().all()
 
             if not results:
                 return pd.DataFrame()
