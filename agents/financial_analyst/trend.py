@@ -255,11 +255,73 @@ def build_cashflow_trend(cash_records: List[Dict], income_records: List[Dict],
     return "\n".join(lines)
 
 
+def build_working_capital_trend(balance_records: List[Dict], income_records: List[Dict],
+                                max_periods: int = 5) -> str:
+    """营运资本趋势：应收/存货占营收比多期变化（回款质量与积压信号）+ 营运资本与流动比率"""
+    rev_by_date = {}
+    for r in income_records:
+        d = str(r.get("report_date") or "")[:10]
+        v = _f(r.get("total_revenue"))
+        if len(d) == 10 and v:
+            rev_by_date[d] = v
+    rows, seen = [], set()
+    for r in balance_records:
+        d = str(r.get("report_date") or "")[:10]
+        if len(d) != 10 or d in seen:
+            continue
+        seen.add(d)
+        ca, cl = _f(r.get("current_assets")), _f(r.get("current_liabilities"))
+        ar, inv = _f(r.get("accounts_receivable")), _f(r.get("inventory"))
+        rev = rev_by_date.get(d)
+        rows.append({
+            "date": d,
+            "ar": ar / 1e8 if ar is not None else None,
+            "inv": inv / 1e8 if inv is not None else None,
+            "ar_pct": ar / rev * 100 if (ar is not None and rev) else None,
+            "inv_pct": inv / rev * 100 if (inv is not None and rev) else None,
+            "wc": (ca - cl) / 1e8 if (ca is not None and cl is not None) else None,
+            "cr": _f(r.get("current_ratio")),
+        })
+    rows.sort(key=lambda x: x["date"], reverse=True)
+    if len(rows) < 2:
+        return ""
+
+    def _c(v, nd=1):
+        return f"{v:.{nd}f}" if v is not None else "-"
+
+    lines = ["【营运资本趋势（应收/存货为期末余额，占比=期末余额÷该期累计营收，看变化方向）】",
+             "报告期 | 应收(亿) | 应收/营收% | 存货(亿) | 存货/营收% | 营运资本(亿) | 流动比率"]
+    for r in rows[:max_periods]:
+        lines.append(f"{r['date']} | {_c(r['ar'])} | {_c(r['ar_pct'])} | {_c(r['inv'])} | "
+                     f"{_c(r['inv_pct'])} | {_c(r['wc'], 0)} | {_c(r['cr'], 2)}")
+
+    latest = rows[0]
+    by_date = {r["date"]: r for r in rows}
+    yoy = by_date.get(f"{int(latest['date'][:4]) - 1}{latest['date'][4:]}")
+    verdicts = []
+    if yoy:
+        for key, up_word, down_word, label in (
+                ("ar_pct", "回款占用加重（营收降但应收升要警惕渠道压货）", "回款改善", "应收占比"),
+                ("inv_pct", "存货积压加重", "存货消化", "存货占比")):
+            a, b = latest.get(key), yoy.get(key)
+            if a is not None and b is not None:
+                diff = a - b
+                if abs(diff) >= 1.0:
+                    verdicts.append(f"{label}较上年同期 {_sign(diff)}pct，"
+                                    f"{up_word if diff > 0 else down_word}")
+    if verdicts:
+        lines.append("程序判读：" + "；".join(verdicts))
+    return "\n".join(lines)
+
+
 def build_full_trend(income_records: List[Dict],
-                     cash_records: Optional[List[Dict]] = None) -> str:
-    """组合：利润趋势 + 费用率趋势 + 现金流趋势（缺哪块跳哪块）"""
+                     cash_records: Optional[List[Dict]] = None,
+                     balance_records: Optional[List[Dict]] = None) -> str:
+    """组合：利润趋势 + 费用率趋势 + 现金流趋势 + 营运资本趋势（缺哪块跳哪块）"""
     blocks = [build_income_trend(income_records),
               build_expense_trend(income_records)]
     if cash_records:
         blocks.append(build_cashflow_trend(cash_records, income_records))
+    if balance_records:
+        blocks.append(build_working_capital_trend(balance_records, income_records))
     return "\n\n".join(b for b in blocks if b)

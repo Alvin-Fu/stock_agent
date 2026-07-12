@@ -83,6 +83,9 @@ def compute_industry_metrics(per_stock: List[Dict[str, Any]]) -> Optional[Dict[s
         "bias_ma20_avg": bias_avg,
         "labels": labels,
         "overall": overall,
+        # 逐股原始行（含无K线指标的股票）：预期差调整/排名表需要每只的分位/市值/资金流，
+        # 只给中位数等于把最有用的横截面信息扔掉
+        "per_stock": list(per_stock or []),
     }
 
 
@@ -127,12 +130,42 @@ def collect_industry_valuation(codes: List[str]) -> Optional[Dict[str, Any]]:
                     hist = pd.to_numeric(basic["pe_ttm"], errors="coerce").dropna()
                     if len(hist) >= 60:
                         row["pe_percentile"] = round(float((hist < cur).mean() * 100), 1)
+                # 市值（total_mv 单位万元→亿元）：弹性/资金偏好判断都要它
+                mv = _num(basic.iloc[0].get("total_mv"))
+                if mv:
+                    row["total_mv"] = round(mv / 1e4, 1)
         except Exception as e:
             logger.warning(f"[行业估值] {code} 每日指标获取失败: {e}")
+
+        # 近20日主力净流入（tushare moneyflow，单位万元→亿元）：
+        # 用程序数字替代"搜索文本猜主力/游资"；无 token/失败时静默缺失
+        try:
+            row["mf_net20"] = _moneyflow_net20(code)
+        except Exception as e:
+            logger.debug(f"[行业估值] {code} 资金流获取失败: {e}")
 
         per_stock.append(row)
 
     return compute_industry_metrics(per_stock)
+
+
+def _moneyflow_net20(code: str) -> Optional[float]:
+    """近20个交易日主力净流入合计（亿元）；数据源不可用返回 None"""
+    from datetime import date, timedelta
+    from tools.stock_tools import stock_tool_instance
+
+    end = date.today()
+    start = end - timedelta(days=40)
+    df = stock_tool_instance.tushare.moneyflow(
+        code, "", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    if df is None or df.empty or "net_mf_amount" not in df.columns:
+        return None
+    if "trade_date" in df.columns:
+        df = df.sort_values("trade_date", ascending=False)
+    vals = pd.to_numeric(df["net_mf_amount"], errors="coerce").dropna()
+    if vals.empty:
+        return None
+    return round(float(vals.head(20).sum()) / 1e4, 2)
 
 
 def format_industry_valuation(metrics: Optional[Dict[str, Any]]) -> str:

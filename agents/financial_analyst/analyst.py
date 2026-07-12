@@ -53,7 +53,8 @@ class AnalystAgent:
 
     def _fetch_real_financial_data(self, stock_code: str) -> Dict[str, Any]:
         """从数据库/Tushare 拉取真实财务报表数据"""
-        result = {"income": "", "balance_sheet": "", "cashflow": "", "main_business": "", "trend": "", "parsed": {}}
+        result = {"income": "", "balance_sheet": "", "cashflow": "", "main_business": "",
+                  "trend": "", "peer_table": "", "forecast": "", "profit_split": "", "parsed": {}}
 
         # 先更新每日指标（PE/PB/市值），估值比率依赖它；失败不阻断其余分析
         try:
@@ -83,25 +84,52 @@ class AnalystAgent:
         except Exception as e:
             logger.error(f"获取现金流量表失败 {stock_code}: {e}")
 
-        # 主营业务构成：利润驱动分析的数字底座（内部已容错，失败返回空串）
-        from tools.main_business import fetch_main_business_text
-        result["main_business"] = fetch_main_business_text(stock_code)
+        # 主营业务构成：利润驱动分析的数字底座（内部已容错，失败返回空串/空列表）
+        from tools.main_business import fetch_main_business_records, build_main_business_text
+        mb_records = fetch_main_business_records(stock_code)
+        result["main_business"] = build_main_business_text(mb_records)
 
-        # 财报趋势：利润同比/利润率/单季拆分 + 费用率 + 现金流净现比，数字全由代码算好
+        # 财报趋势：利润同比/利润率/单季拆分 + 费用率 + 现金流净现比 + 营运资本
+        income_records = []
         try:
             income_df = self.db.get_stock_income(stock_code)
             if income_df is not None and not income_df.empty:
+                income_records = income_df.to_dict("records")
                 from .trend import build_full_trend
-                cash_records = None
+                cash_records, balance_records = None, None
                 try:
                     cash_df = self.db.get_stock_cashflow(stock_code)
                     if cash_df is not None and not cash_df.empty:
                         cash_records = cash_df.to_dict("records")
                 except Exception:
                     pass
-                result["trend"] = build_full_trend(income_df.to_dict("records"), cash_records)
+                try:
+                    balance_df = self.db.get_stock_balance_sheet(stock_code)
+                    if balance_df is not None and not balance_df.empty:
+                        balance_records = balance_df.to_dict("records")
+                except Exception:
+                    pass
+                result["trend"] = build_full_trend(income_records, cash_records, balance_records)
         except Exception as e:
             logger.warning(f"构建财报趋势失败（不影响其余分析）: {e}")
+
+        # 同行对比表（横向估值参照系）+ 机构盈利预测（forward 估值锚）
+        try:
+            from tools.peer_compare import fetch_peer_table
+            result["peer_table"], _ = fetch_peer_table(stock_code)
+        except Exception as e:
+            logger.warning(f"同行对比生成失败（不影响其余分析）: {e}")
+        try:
+            from tools.forecast import fetch_profit_forecast_text
+            result["forecast"] = fetch_profit_forecast_text(stock_code)
+        except Exception as e:
+            logger.warning(f"盈利预测获取失败（不影响其余分析）: {e}")
+
+        # 分部利润拆分（SOTP 数字底座）：最新年报净利 × 分部利润占比，程序算死
+        try:
+            result["profit_split"] = self._build_profit_split_text(mb_records, income_records)
+        except Exception as e:
+            logger.warning(f"分部利润拆分失败（不影响其余分析）: {e}")
 
         result["parsed"] = self._parse_latest_financial_data()
         return result
@@ -197,6 +225,35 @@ class AnalystAgent:
             logger.error(f"解析最新财务数据失败: {e}")
         return parsed
 
+    @staticmethod
+    def _build_profit_split_text(mb_records, income_records) -> str:
+        """分部利润拆分（程序计算）：最新年报净利 × 主营构成的分部利润占比"""
+        from tools.main_business import latest_profit_split
+        split = latest_profit_split(mb_records)
+        if not split:
+            return ""
+        fy_np = None
+        fy = split[0]["period"]
+        for r in income_records or []:
+            if str(r.get("report_date") or "")[:10] == fy:
+                try:
+                    v = float(r.get("net_profit"))
+                    fy_np = v / 1e8 if v == v else None
+                except (TypeError, ValueError):
+                    pass
+                break
+        if not fy_np or fy_np <= 0:
+            return ""
+        lines = [f"【分部利润拆分（程序计算：{fy[:4]}年报净利 {fy_np:.1f}亿 × 分部利润占比，粗拆口径）】"]
+        for s in split:
+            seg = f"  - {s['name']}: 约{fy_np * s['profit_share_pct'] / 100:.1f}亿" \
+                  f"（利润占比{s['profit_share_pct']}%"
+            if s.get("rev_share_pct") is not None:
+                seg += f"，收入占比{s['rev_share_pct']}%"
+            lines.append(seg + "）")
+        lines.append("  （分部间未剔除内部抵消；供分部估值参考用，不是精确分部净利）")
+        return "\n".join(lines)
+
     def _call_financial_tools(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """全部财务工具各调一次，返回{工具名: 结果}"""
         results = {}
@@ -252,7 +309,15 @@ class AnalystAgent:
    改善/恶化/加速/放缓上，并引用【财报趋势】表中程序算好的同比序列、利润率变化、
    单季拆分数字；禁止自行心算趋势，禁止只报单期绝对值就下结论；
    财务趋势要与主营构成占比变化、研报中的销量/出货量数据互相印证
-11. 避免给出投资建议，仅做客观分析
+11. 同行对比：估值贵贱、毛利率高低必须放在【同行对比】表里说（"PE 高于 4/5 家同行"
+    比"PE 处于历史 89% 分位"更有决策含义，两者都要说）；缺同行数据时明说，
+    禁止凭记忆引用"同行水平"
+12. 分部估值参考（SOTP）：仅当同时提供了【分部利润拆分】和【同行对比】时才做——
+    每个分部的估值倍数必须取自同行对比表中可比公司的实际 PE（写明取自哪家），
+    给低/高两档得到市值区间，与当前总市值比较，结论只说"当前市值处于/高于/低于
+    分部估值区间"；必须标注"极粗略参考，非目标价，未计分部协同与控股折价"；
+    亏损分部用 0 或注明无法估值，禁止发明倍数
+13. 避免给出投资建议，仅做客观分析
 
 【文风硬规则（违反即不合格）】
 - 每句话必须承载增量信息（数据、方向、因果或结论），凑字的话直接删
@@ -285,6 +350,9 @@ class AnalystAgent:
             cashflow_text = real_data["cashflow"]
             main_business_text = real_data["main_business"]
             trend_text = real_data["trend"]
+            peer_text = real_data["peer_table"]
+            forecast_text = real_data["forecast"]
+            profit_split_text = real_data["profit_split"]
 
             logger.info("获取研报作为定性补充...")
             report_text = self._fetch_report(stock_code)
@@ -317,6 +385,15 @@ class AnalystAgent:
 
 ========== 主营业务构成（利润驱动结构） ==========
 {main_business_text if main_business_text else '缺主营构成数据'}
+
+========== 同行对比（横向估值参照系） ==========
+{peer_text if peer_text else '缺同行对比数据（不得凭印象与同行比较）'}
+
+========== 机构盈利预测（forward 估值锚，预测≠事实） ==========
+{forecast_text if forecast_text else '无机构预测数据（只能用 trailing 口径估值）'}
+
+========== 分部利润拆分（分部估值 SOTP 底座） ==========
+{profit_split_text if profit_split_text else '缺分部利润数据（禁止做分部估值）'}
 
 ========== 最新一期财务数据(单位：亿元) ==========
 {financial_data}

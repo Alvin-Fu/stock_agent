@@ -131,14 +131,14 @@ class TechnicalAgent:
             # 判断是单股还是多股（产业链）场景
             codes = [c.strip() for c in stock_code.split(",") if c.strip()] if stock_code else []
 
-            # 空代码早退：候选池被护城河门槛清空（或问题里没识别出股票代码）时，
+            # 空代码早退：候选池被阶段准入门槛清空（或问题里没识别出股票代码）时，
             # 不能拿空串去拉K线——那会产生"技术面无数据"的假象，混进投资结论里
             if not codes:
-                logger.info("技术分析跳过：候选池为空（护城河门槛剔除全部候选或未识别出股票代码）")
+                logger.info("技术分析跳过：候选池为空（阶段准入门槛剔除全部候选或未识别出股票代码）")
                 return {
                     "messages": [],
                     "technical_result": {
-                        "summary": "未执行技术分析：候选池为空（全部候选被护城河门槛剔除，或问题中未识别出股票代码）。"
+                        "summary": "未执行技术分析：候选池为空（全部候选被阶段准入门槛剔除，或问题中未识别出股票代码）。"
                                    "这是流程性跳过，不是行情数据缺失，不得作为利空证据引用。",
                         "mode": "skipped",
                     },
@@ -185,12 +185,20 @@ class TechnicalAgent:
             sr_sups = [c["price"] for c in sr["supports"]] if sr else None
             sr_ress = [c["price"] for c in sr["resistances"]] if sr else None
 
+            # 大盘环境：沪深300 顺风/中性/逆风（逆风时仓位在 plan 内自动降档）
+            from tools.market_context import get_market_env, format_market_env
+            env = get_market_env()
+
             plan = build_trade_plan(daily_row, weekly_row, monthly_row, recent_low20, recent_high60,
-                                    sr_supports=sr_sups, sr_resistances=sr_ress)
+                                    sr_supports=sr_sups, sr_resistances=sr_ress,
+                                    market_env=env["label"] if env else None)
             plan_text = format_trade_plan(plan)
             sr_text = format_sr_levels(sr)
             if sr_text:
                 plan_text = f"{plan_text}\n{sr_text}" if plan_text else sr_text
+            env_text = format_market_env(env)
+            if env_text:
+                plan_text = f"{plan_text}\n{env_text}" if plan_text else env_text
             return plan, plan_text
         except Exception as e:
             logger.warning(f"操作参考计划计算失败（不影响技术分析）: {e}")
@@ -232,6 +240,69 @@ class TechnicalAgent:
             "intermediate_steps": [("technical_analyze", {"mode": "single", "code": code})],
         }
 
+    @staticmethod
+    def _compute_rs_block(codes: List[str]) -> str:
+        """
+        程序计算相对强度（RS）：个股近20/60日涨幅 相对 候选池均值 与 沪深300（可得时）。
+        挖机会的确认信号看的是"相对"不是"绝对"——同时跑赢同行和大盘=资金已在布局。
+        """
+        try:
+            from tools.stock_tools import stock_tool_instance
+            rows = []
+            for code in codes:
+                try:
+                    df = stock_tool_instance.fetch_and_save_stock_daily_data(code)
+                except Exception:
+                    df = None
+                if df is None or df.empty or "close" not in df.columns:
+                    rows.append({"code": code})
+                    continue
+                closes = df["close"].tolist()  # 日期倒序：[0] 为最新
+
+                def _ret(n):
+                    if len(closes) > n and closes[n]:
+                        return round((float(closes[0]) / float(closes[n]) - 1) * 100, 1)
+                    return None
+
+                rows.append({"code": code, "ret20": _ret(20), "ret60": _ret(60)})
+
+            valid20 = [r["ret20"] for r in rows if r.get("ret20") is not None]
+            valid60 = [r["ret60"] for r in rows if r.get("ret60") is not None]
+            if not valid20:
+                return ""
+            mean20 = round(sum(valid20) / len(valid20), 1)
+            mean60 = round(sum(valid60) / len(valid60), 1) if valid60 else None
+
+            bench20 = None
+            try:
+                from tools.market_context import get_market_env
+                env = get_market_env()
+                bench20 = env.get("chg20") if env else None
+            except Exception:
+                bench20 = None
+
+            lines = ["【相对强度RS（程序计算；正值=跑赢基准，负值=跑输）】",
+                     f"  基准：候选池均值 近20日{mean20:+}%"
+                     + (f"／近60日{mean60:+}%" if mean60 is not None else "")
+                     + (f"；沪深300 近20日{bench20:+}%" if bench20 is not None else "")]
+            for r in rows:
+                if r.get("ret20") is None:
+                    lines.append(f"  {r['code']}: 数据不足，RS缺失")
+                    continue
+                seg = f"  {r['code']}: 近20日{r['ret20']:+}%（RS vs池 {r['ret20'] - mean20:+.1f}"
+                if bench20 is not None:
+                    seg += f"，vs沪深300 {r['ret20'] - bench20:+.1f}"
+                seg += "）"
+                if r.get("ret60") is not None and mean60 is not None:
+                    seg += f"，近60日{r['ret60']:+}%（RS vs池 {r['ret60'] - mean60:+.1f}）"
+                lines.append(seg)
+            lines.append("  使用规则：同时跑赢池均值与大盘=资金布局的确认信号；技术总分接近（±0.5分内）时优先RS高者；"
+                         "RS为负的标的即使指标形态好，也必须在风险提示里点明弱于同行")
+            return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"相对强度计算失败（不影响对比分析）: {e}")
+            return ""
+
     def _analyze_chain(self, state: AgentState, codes: List[str]) -> Dict[str, Any]:
         """产业链多股技术面对比分析"""
         question = state.get("question", "")
@@ -260,6 +331,9 @@ class TechnicalAgent:
             plans_text = ("【各候选操作参考（程序规则计算，与排名互相独立）】\n"
                           + "\n\n".join(plan_blocks))
 
+        # 相对强度：绝对指标之外的横向确认信号（vs 候选池均值 / vs 沪深300）
+        rs_block = self._compute_rs_block(codes)
+
         messages = [
             SystemMessage(content=self._build_chain_prompt()),
             HumanMessage(content=f"""请对比分析以下 {len(codes)} 只股票的技术面。
@@ -268,9 +342,12 @@ class TechnicalAgent:
 
 {all_kline}
 
+{rs_block}
+
 {plans_text}
 
 请逐只打分 → 排名 → 选出技术面最强的1只；
+排名与"技术面最强"的选择必须参考【相对强度RS】的程序数字（引用原数，禁止自行推算涨幅）；
 点评你选出的最强标的时，引用其【操作参考】的程序数字（方向/价位/盈亏比/仓位），禁止修改。"""),
         ]
 

@@ -116,17 +116,74 @@ class ConditionWatcher:
         """扫描监控清单内有快照留档的个股，返回推送条数"""
         targets = [t for t in self.db.get_watch_targets()
                    if t["target_type"] == "company" and t.get("code")]
-        if not targets:
-            return 0
-
         pushed = 0
         for t in targets:
             try:
                 pushed += self._scan_one(t["code"], t["name"])
             except Exception as e:
                 logger.error(f"[条件盯盘] {t['name']} 失败: {e}")
+
+        # 行业重估触发条件（valuation 型）：估值分位回落是程序可判定的重估信号
+        try:
+            pushed += self.scan_industry_valuation_triggers()
+        except Exception as e:
+            logger.error(f"[条件盯盘] 行业估值触发扫描失败: {e}")
+
         if pushed:
             logger.info(f"[条件盯盘] 推送 {pushed} 条条件触发提醒")
+        return pushed
+
+    def scan_industry_valuation_triggers(self) -> int:
+        """
+        核对 valuation 型行业重估触发条件：候选池 PE(TTM) 历史分位中位数回落到阈值以下即命中。
+        只读本地 daily_basic 历史，不联网；news 型条件由 news_monitor 负责。
+        """
+        triggers = [t for t in self.db.get_active_industry_triggers()
+                    if t.get("trigger_type") == "valuation" and t.get("pe_percentile_below") is not None]
+        if not triggers:
+            return 0
+
+        import statistics
+        import pandas as pd
+        pushed = 0
+        for trig in triggers:
+            try:
+                codes = json.loads(trig.get("pool_codes") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                codes = []
+            if not codes:
+                continue
+            percentiles = []
+            for code in codes:
+                basic = self.db.get_latest_daily_basic_data(str(code), 750)
+                if basic is None or basic.empty:
+                    continue
+                cur = basic.iloc[0].get("pe_ttm")
+                if cur is None or pd.isna(cur) or float(cur) <= 0:
+                    continue
+                hist = pd.to_numeric(basic["pe_ttm"], errors="coerce").dropna()
+                if len(hist) >= 60:
+                    percentiles.append(float((hist < float(cur)).mean() * 100))
+            if len(percentiles) < 2:
+                continue
+            median_pct = round(statistics.median(percentiles), 1)
+            threshold = float(trig["pe_percentile_below"])
+            if median_pct >= threshold:
+                continue
+            note = f"候选池PE分位中位数已回落至 {median_pct}%（阈值 {threshold:g}%，样本 {len(percentiles)} 只）"
+            if not self.db.mark_industry_trigger_hit(trig["id"], note):
+                continue
+            self.db.save_monitor_event(
+                target=trig["industry"], event_type="reeval",
+                dedup_key=f"reeval:{trig['id']}",
+                title=f"重估触发：{trig['description']}",
+                content=note, importance="高", pushed=True,
+            )
+            self.notifier.send(f"🔁 行业重估触发（估值回落） | {trig['industry']}\n"
+                               f"条件：{trig['description']}\n当前：{note}\n"
+                               f"可发送「分析{trig['industry']}产业链」重新评估")
+            logger.info(f"[条件盯盘] 行业估值触发命中 #{trig['id']} {trig['industry']}: {note}")
+            pushed += 1
         return pushed
 
     def _scan_one(self, code: str, name: str) -> int:

@@ -792,6 +792,8 @@ class StockBalanceSheet(Base):
     total_equity = Column(Float)  # 所有者权益（单位：元）
     asset_liability_ratio = Column(Float)  # 资产负债率（单位：%）
     current_ratio = Column(Float)  # 流动比率（倍数）
+    accounts_receivable = Column(Float)  # 应收账款（单位：元，营运资本趋势用）
+    inventory = Column(Float)  # 存货（单位：元，营运资本趋势用）
     data_source = Column(String(50))
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -1087,6 +1089,43 @@ class IndustryReview(Base):
             'direction_verdict': self.direction_verdict,
             'review_content': self.review_content,
             'created_at': self.created_at,
+        }
+
+
+class IndustryReevalTrigger(Base):
+    """
+    行业重估触发条件：产业链分析给出"不参与/暂不参与"结论时留下的重估钩子。
+    trigger_type=news 由 news_monitor 用 LLM 对照行业新闻判定；
+    trigger_type=valuation 由 condition_watcher 按候选池 PE 分位程序判定。
+    命中后置 status=hit 并推送提醒，让"不参与"变成"暂不参与+自动盯"。
+    """
+    __tablename__ = 'industry_reeval_trigger'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    industry = Column(String(50), nullable=False, index=True)
+    trigger_type = Column(String(10), nullable=False, default='news')  # news / valuation
+    description = Column(String(300), nullable=False)  # 触发条件描述（可被公开信息验证）
+    keywords = Column(String(200))  # news 型：盯梢关键词
+    pool_codes = Column(Text)  # valuation 型：候选池代码列表 JSON
+    pe_percentile_below = Column(Float)  # valuation 型：分位回落阈值
+    status = Column(String(10), nullable=False, default='active')  # active / hit / expired
+    hit_note = Column(String(300))  # 命中依据
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    hit_at = Column(DateTime)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'industry': self.industry,
+            'trigger_type': self.trigger_type,
+            'description': self.description,
+            'keywords': self.keywords,
+            'pool_codes': self.pool_codes,
+            'pe_percentile_below': self.pe_percentile_below,
+            'status': self.status,
+            'hit_note': self.hit_note,
+            'created_at': self.created_at,
+            'hit_at': self.hit_at,
         }
 
 
@@ -1419,6 +1458,15 @@ class DatabaseManager:
                         conn.execute(text('ALTER TABLE industry_snapshot ADD COLUMN valuation TEXT'))
                         conn.commit()
                         logger.info("industry_snapshot 表补充 valuation 列（行业估值指标 JSON）")
+
+                # stock_balance_sheet：旧表缺应收/存货列时补齐（营运资本趋势用）
+                if 'stock_balance_sheet' in table_names:
+                    bs_cols = [c['name'] for c in inspector.get_columns('stock_balance_sheet')]
+                    for col_name in ('accounts_receivable', 'inventory'):
+                        if col_name not in bs_cols:
+                            conn.execute(text(f'ALTER TABLE stock_balance_sheet ADD COLUMN {col_name} FLOAT'))
+                            conn.commit()
+                            logger.info(f"stock_balance_sheet 表补充 {col_name} 列（营运资本趋势用）")
 
                 # analysis_snapshot：旧表缺列时补齐（trade_plan=条件触发；moat/flywheel=定性延续）
                 if 'analysis_snapshot' in table_names:
@@ -1902,6 +1950,19 @@ class DatabaseManager:
                 .order_by(desc(DailyForecast.forecast_date))
             ).scalars().all()
             return list(results)
+
+    def get_peers_by_industry(self, industry: str, exclude_code: str = None,
+                              limit: int = 12) -> List[Dict[str, Any]]:
+        """按行业取同行公司（同行对比表用），返回 [{code, name}]"""
+        if not industry:
+            return []
+        with self.get_session() as session:
+            query = select(StockBasic.code, StockBasic.name).where(
+                StockBasic.industry == industry)
+            if exclude_code:
+                query = query.where(StockBasic.code != exclude_code)
+            rows = session.execute(query.limit(limit)).all()
+            return [{"code": r[0], "name": r[1]} for r in rows]
 
     def get_stock_basic(self, code: str) -> Optional[StockBasic]:
         """获取股票的基本信息"""
@@ -3760,6 +3821,8 @@ class DatabaseManager:
                         existing.total_equity = row.get('total_equity')
                         existing.asset_liability_ratio = row.get('asset_liability_ratio')
                         existing.current_ratio = row.get('current_ratio')
+                        existing.accounts_receivable = row.get('accounts_receivable')
+                        existing.inventory = row.get('inventory')
                         existing.data_source = row.get('data_source', 'Tushare')
                         existing.updated_at = datetime.now()
                     else:
@@ -3775,6 +3838,8 @@ class DatabaseManager:
                             total_equity=row.get('total_equity'),
                             asset_liability_ratio=row.get('asset_liability_ratio'),
                             current_ratio=row.get('current_ratio'),
+                            accounts_receivable=row.get('accounts_receivable'),
+                            inventory=row.get('inventory'),
                             data_source=row.get('data_source', 'Tushare'),
                         )
                         session.add(record)
@@ -4067,6 +4132,72 @@ class DatabaseManager:
             except Exception:
                 session.rollback()
                 return False
+
+    # ===== 行业重估触发条件 =================================================
+
+    def save_industry_triggers(self, industry: str, triggers: List[Dict[str, Any]]) -> int:
+        """
+        保存行业重估触发条件：同一行业先把旧的 active 条目置为 expired（以最新一次分析为准），
+        再写入新条目。返回写入条数。
+        """
+        import json as _json
+        with self.get_session() as session:
+            try:
+                olds = session.execute(
+                    select(IndustryReevalTrigger).where(
+                        and_(IndustryReevalTrigger.industry == industry,
+                             IndustryReevalTrigger.status == 'active')
+                    )
+                ).scalars().all()
+                for o in olds:
+                    o.status = 'expired'
+                count = 0
+                for t in triggers or []:
+                    desc = str(t.get("description") or "").strip()
+                    if not desc:
+                        continue
+                    pool = t.get("pool_codes")
+                    session.add(IndustryReevalTrigger(
+                        industry=industry,
+                        trigger_type=str(t.get("trigger_type") or "news"),
+                        description=desc[:300],
+                        keywords=(str(t.get("keywords") or "")[:200] or None),
+                        pool_codes=_json.dumps(pool, ensure_ascii=False) if pool else None,
+                        pe_percentile_below=t.get("pe_percentile_below"),
+                    ))
+                    count += 1
+                session.commit()
+                return count
+            except Exception:
+                session.rollback()
+                raise
+
+    def get_active_industry_triggers(self, industry: str = None) -> List[Dict[str, Any]]:
+        """获取生效中的行业重估触发条件（可按行业过滤）"""
+        with self.get_session() as session:
+            stmt = select(IndustryReevalTrigger).where(IndustryReevalTrigger.status == 'active')
+            if industry:
+                stmt = stmt.where(IndustryReevalTrigger.industry == industry)
+            results = session.execute(stmt.order_by(IndustryReevalTrigger.created_at)).scalars().all()
+            return [t.to_dict() for t in results]
+
+    def mark_industry_trigger_hit(self, trigger_id: int, note: str = None) -> bool:
+        """标记触发条件命中；已非 active 返回 False（防重复推送）"""
+        with self.get_session() as session:
+            try:
+                record = session.execute(
+                    select(IndustryReevalTrigger).where(IndustryReevalTrigger.id == trigger_id)
+                ).scalar_one_or_none()
+                if record is None or record.status != 'active':
+                    return False
+                record.status = 'hit'
+                record.hit_note = (note or '')[:300]
+                record.hit_at = datetime.now()
+                session.commit()
+                return True
+            except Exception:
+                session.rollback()
+                raise
 
     # ===== 分析快照 / 复盘 ==================================================
 

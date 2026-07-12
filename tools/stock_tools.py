@@ -690,6 +690,8 @@ class StockTools:
             'total_cur_liab': 'current_liabilities',
             'total_ncl': 'non_current_liabilities',
             'total_hldr_eqy_exc_min_int': 'total_equity',
+            'accounts_receiv': 'accounts_receivable',
+            'inventories': 'inventory',
         }
 
         df = df.rename(columns=column_mapping)
@@ -699,7 +701,8 @@ class StockTools:
 
         df['code'] = stock_code
 
-        for col in ['total_assets', 'total_liabilities', 'current_assets', 'current_liabilities']:
+        for col in ['total_assets', 'total_liabilities', 'current_assets', 'current_liabilities',
+                    'accounts_receivable', 'inventory']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 

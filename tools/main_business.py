@@ -139,18 +139,56 @@ def build_main_business_text(records: List[Dict], source: str = "东方财富") 
     return "\n".join(lines) if section_count else ""
 
 
-def fetch_main_business_text(code: str) -> str:
-    """拉取并格式化主营业务构成；任何失败返回空串"""
+def latest_profit_split(records: List[Dict]) -> List[Dict]:
+    """
+    最新年报（12-31 期）按产品维度的分部利润占比（纯函数，分部估值 SOTP 用）。
+    返回 [{"name", "profit_share_pct", "rev_share_pct}]；无年报数据返回 []。
+    """
+    if not records:
+        return []
+    fy_dates = sorted({str(r.get("报告日期", ""))[:10] for r in records
+                       if str(r.get("报告日期", ""))[:10].endswith("12-31")}, reverse=True)
+    if not fy_dates:
+        return []
+    latest_fy = fy_dates[0]
+    rows = [r for r in records
+            if str(r.get("报告日期", ""))[:10] == latest_fy
+            and str(r.get("分类类型", "")).strip() in ("按产品分类", "按产品", "按行业分类", "按行业")
+            and str(r.get("主营构成", "")).strip() not in ("", "合计")]
+    if not rows:
+        return []
+    scale = _pct_scale([_num(r.get("利润比例")) for r in rows])
+    rev_scale = _pct_scale([_num(r.get("收入比例")) for r in rows])
+    out = []
+    for r in rows:
+        ps = _fmt_pct(_num(r.get("利润比例")), scale)
+        rs = _fmt_pct(_num(r.get("收入比例")), rev_scale)
+        if ps is None:
+            continue
+        out.append({"name": str(r.get("主营构成", "")).strip(),
+                    "profit_share_pct": ps, "rev_share_pct": rs,
+                    "period": latest_fy})
+    out.sort(key=lambda x: x["profit_share_pct"], reverse=True)
+    return out[:6]
+
+
+def fetch_main_business_records(code: str) -> List[Dict]:
+    """拉取主营业务构成原始记录；任何失败返回空列表"""
     try:
         import akshare as ak
         fetch = getattr(ak, "stock_zygc_em", None)
         if fetch is None:
             logger.warning("[信源] 当前 akshare 版本无 stock_zygc_em 接口，跳过主营构成")
-            return ""
+            return []
         df = fetch(symbol=_em_symbol(code))
         if df is None or df.empty:
-            return ""
-        return build_main_business_text(df.to_dict("records"))
+            return []
+        return df.to_dict("records")
     except Exception as e:
         logger.warning(f"[信源] 主营业务构成获取失败 {code}: {e}")
-        return ""
+        return []
+
+
+def fetch_main_business_text(code: str) -> str:
+    """拉取并格式化主营业务构成；任何失败返回空串"""
+    return build_main_business_text(fetch_main_business_records(code))

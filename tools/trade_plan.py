@@ -35,7 +35,8 @@ def build_trade_plan(daily_row: Dict[str, Any],
                      recent_low20: Optional[float] = None,
                      recent_high60: Optional[float] = None,
                      sr_supports: Optional[list] = None,
-                     sr_resistances: Optional[list] = None) -> Optional[Dict[str, Any]]:
+                     sr_resistances: Optional[list] = None,
+                     market_env: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     输入：三周期最新指标行（dict，含 close/ma20/ma_pattern/DIF/DEA/rsi6/pos_52w/
          boll_upper/boll_mid/boll_lower/atr14）+ 近20日最低价、近60日最高价
@@ -172,6 +173,11 @@ def build_trade_plan(daily_row: Dict[str, Any],
         position = 0
         pos_notes.append(f"盈亏比{risk_reward}不足1.5，回踩到位也不参与")
 
+    # ---------- 5. 大盘环境降档：指数空头结构时，个股多头信号胜率打折 ----------
+    if market_env == "逆风" and position > 1:
+        position -= 1
+        pos_notes.append("大盘逆风（沪深300空头结构）降1成")
+
     return {
         "direction": direction,
         "score": score,
@@ -185,6 +191,7 @@ def build_trade_plan(daily_row: Dict[str, Any],
         "risk_reward": risk_reward,
         "position": position,
         "position_notes": pos_notes,
+        "market_env": market_env,
     }
 
 

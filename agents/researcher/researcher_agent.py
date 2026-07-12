@@ -18,47 +18,74 @@ from tools.company_code_validator import find_stock_code, find_company_name
 from utils.logger import logger
 
 
-# 综合评分权重：业务经营 20% + 基本面 30% + 不可替代与溢价 50%
-COMPOSITE_WEIGHTS = {"business": 0.2, "fundamental": 0.3, "moat": 0.5}
+# 阶段化评分框架：机会=边际变化，护城河是存量质量——不同行业生命周期两者的权重完全不同。
+# 用成熟行业的护城河框架去筛导入期行业（如商业航天），结论永远是"不参与"，等于对成长机会失明。
+# momentum（边际变化）分项：只认近2个季度/近3个月的增量事实（增速拐点/新订单/产能爬坡/毛利率环比回升）。
+STAGE_WEIGHTS = {
+    "成熟期": {"business": 0.2, "fundamental": 0.3, "moat": 0.4, "momentum": 0.1},
+    "成长期": {"business": 0.2, "fundamental": 0.25, "moat": 0.25, "momentum": 0.3},
+    "导入期": {"business": 0.15, "fundamental": 0.2, "moat": 0.25, "momentum": 0.4},
+}
+# 阶段判定失败/缺失时的兜底：取中间档，避免把早期行业误按成熟框架全部拒之门外
+DEFAULT_STAGE = "成长期"
 
-# 护城河硬性准入门槛：评分低于该值（或分项缺失=无证据）的公司直接剔除出投资池，
-# 不参与排名与技术面对比——没有护城河的公司不纳入，不是靠权重拉低了事
-MOAT_GATE = 7.0
+# 阶段化准入门槛：门槛指标随行业阶段切换，指标分缺失（=无证据）一律不入池
+# 成熟期看护城河；成长期护城河和边际变化都要过线；导入期边际变化（订单可见性/卡位）为王
+STAGE_GATES = {
+    "成熟期": [("moat", 7.0, "护城河")],
+    "成长期": [("moat", 5.0, "护城河"), ("momentum", 6.0, "边际变化")],
+    "导入期": [("momentum", 7.0, "边际变化（订单可见性/卡位）")],
+}
 
 
-def apply_moat_gate(ranked: List[Dict[str, Any]], gate: float = MOAT_GATE):
+def normalize_stage(stage) -> str:
+    stage = str(stage or "").strip()
+    return stage if stage in STAGE_WEIGHTS else DEFAULT_STAGE
+
+
+def apply_stage_gate(ranked: List[Dict[str, Any]], stage: str):
     """
-    护城河硬门槛过滤（纯函数）：返回 (passed, excluded)。
-    moat 分项缺失（被中性5分顶替）也视为未达标——证据不足不入池。
+    阶段化硬门槛过滤（纯函数）：返回 (passed, excluded)。
+    门槛指标分项缺失（被中性5分顶替）也视为未达标——证据不足不入池。
     passed 重新编排名。
     """
+    stage = normalize_stage(stage)
+    gates = STAGE_GATES[stage]
     passed, excluded = [], []
     for item in ranked:
-        no_evidence = "moat" in (item.get("missing") or [])
-        if item.get("moat", 0) >= gate and not no_evidence:
+        missing = item.get("missing") or []
+        fails = []
+        for metric, gate, label in gates:
+            if metric in missing:
+                fails.append(f"{label}分项缺失（无证据）")
+            elif item.get(metric, 0) < gate:
+                fails.append(f"{label}{item.get(metric)}分未达{gate:g}分门槛")
+        if not fails:
             passed.append(dict(item))
         else:
             ex = dict(item)
-            ex["exclude_reason"] = "护城河分项缺失（无证据）" if no_evidence else f"护城河{item.get('moat')}分未达{gate:g}分门槛"
+            ex["exclude_reason"] = f"[{stage}] " + "；".join(fails)
             excluded.append(ex)
     for i, it in enumerate(passed, 1):
         it["rank"] = i
     return passed, excluded
 
 
-def compute_composite_ranking(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def compute_composite_ranking(candidates: List[Dict[str, Any]], stage: str = DEFAULT_STAGE) -> List[Dict[str, Any]]:
     """
     程序计算综合评分与排名（LLM 只提供分项分数，加权与排序不交给它心算）。
-    分项缺失/非法时按 5.0 中性分处理并标注。
-    返回按综合分降序的列表：[{code, business, fundamental, moat, composite, rank, note}]
+    权重按行业阶段切换；分项缺失/非法时按 5.0 中性分处理并标注。
+    返回按综合分降序的列表：[{code, business, fundamental, moat, momentum, composite, rank, note}]
     """
+    stage = normalize_stage(stage)
+    weights = STAGE_WEIGHTS[stage]
     ranked = []
     for c in candidates or []:
         code = str(c.get("code", "")).strip()
         if not code:
             continue
         scores, missing = {}, []
-        for key in COMPOSITE_WEIGHTS:
+        for key in weights:
             try:
                 v = float(c.get(key))
                 if not (0 <= v <= 10):
@@ -67,12 +94,52 @@ def compute_composite_ranking(candidates: List[Dict[str, Any]]) -> List[Dict[str
             except (TypeError, ValueError):
                 scores[key] = 5.0
                 missing.append(key)
-        composite = round(sum(scores[k] * w for k, w in COMPOSITE_WEIGHTS.items()), 2)
+        composite = round(sum(scores[k] * w for k, w in weights.items()), 2)
         ranked.append({
-            "code": code, **scores, "composite": composite, "missing": missing,
+            "code": code, **scores, "composite": composite, "stage": stage, "missing": missing,
             "note": "分项缺失按5分中性处理" if missing else "",
         })
     ranked.sort(key=lambda x: x["composite"], reverse=True)
+    for i, item in enumerate(ranked, 1):
+        item["rank"] = i
+    return ranked
+
+
+def apply_valuation_adjustment(ranked: List[Dict[str, Any]],
+                               per_stock: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    预期差调整（纯函数）：基本面评分和估值分位必须见面——综合分9但PE分位95%不该排第一。
+    对高历史分位减分、低分位加分，并标注机会/拥挤象限；按调整后综合分重排。
+    per_stock 来自 industry_metrics 的逐股程序数据（pe_percentile/total_mv/mf_net20）。
+    """
+    metrics_map = {str(r.get("code", "")): r for r in per_stock or []}
+    for item in ranked:
+        m = metrics_map.get(item["code"]) or {}
+        pct = m.get("pe_percentile")
+        item["pe_percentile"] = pct
+        item["total_mv"] = m.get("total_mv")
+        item["mf_net20"] = m.get("mf_net20")
+        adj = 0.0
+        if pct is not None:
+            if pct >= 80:
+                adj = -1.0
+            elif pct >= 60:
+                adj = -0.5
+            elif pct <= 30:
+                adj = 0.5
+        item["valuation_adj"] = adj
+        item["composite_adj"] = round(item["composite"] + adj, 2)
+        if pct is None:
+            item["quadrant"] = "无估值分位数据"
+        elif item["composite"] >= 7 and pct <= 40:
+            item["quadrant"] = "机会区（高分低估）"
+        elif item["composite"] >= 7 and pct >= 70:
+            item["quadrant"] = "拥挤区（高分高估）"
+        elif item["composite"] < 6 and pct >= 70:
+            item["quadrant"] = "危险区（低分高估）"
+        else:
+            item["quadrant"] = "中性"
+    ranked.sort(key=lambda x: x.get("composite_adj", x["composite"]), reverse=True)
     for i, item in enumerate(ranked, 1):
         item["rank"] = i
     return ranked
@@ -82,7 +149,10 @@ def format_ranking_table(ranked: List[Dict[str, Any]], name_of=None) -> str:
     """排名表文本（附在报告末尾，供 responder 展示与复盘留档抽取）"""
     if not ranked:
         return ""
-    lines = ["【综合排名（程序按 业务20%+基本面30%+不可替代50% 加权计算）】"]
+    stage = ranked[0].get("stage", DEFAULT_STAGE)
+    w = STAGE_WEIGHTS[normalize_stage(stage)]
+    lines = [f"【综合排名（行业阶段：{stage}；程序按 业务{w['business']:.0%}+基本面{w['fundamental']:.0%}"
+             f"+护城河{w['moat']:.0%}+边际变化{w['momentum']:.0%} 加权，再按PE历史分位做预期差调整）】"]
     for item in ranked:
         label = item["code"]
         if name_of:
@@ -93,8 +163,21 @@ def format_ranking_table(ranked: List[Dict[str, Any]], name_of=None) -> str:
             except Exception:
                 pass
         note = f"（{item['note']}）" if item.get("note") else ""
+        extra = []
+        if item.get("composite_adj") is not None:
+            pct = item.get("pe_percentile")
+            extra.append(f"调整后{item['composite_adj']}"
+                         + (f"（PE分位{pct}%，{item.get('valuation_adj'):+g}）" if pct is not None else "（无估值分位）"))
+        if item.get("quadrant"):
+            extra.append(item["quadrant"])
+        if item.get("total_mv") is not None:
+            extra.append(f"市值{item['total_mv']:.0f}亿")
+        if item.get("mf_net20") is not None:
+            extra.append(f"20日主力净流入{item['mf_net20']:+.1f}亿")
         lines.append(f"{item['rank']}. {label} 综合{item['composite']} "
-                     f"= 业务{item['business']} 基本面{item['fundamental']} 护城河{item['moat']}{note}")
+                     f"= 业务{item['business']} 基本面{item['fundamental']} 护城河{item['moat']} "
+                     f"边际{item['momentum']}{note}"
+                     + ("｜" + "｜".join(extra) if extra else ""))
     return "\n".join(lines)
 
 
@@ -197,11 +280,13 @@ class ResearcherAgent:
         results = self._do_search(queries)
         search_text = self._search_text(results)
 
-        system_prompt = """你是一个产业研究专家。请基于搜索结果，拆解该行业的产业链结构。
+        system_prompt = """你是一个产业研究专家。请基于搜索结果，拆解该行业的产业链结构，并判定行业生命周期阶段。
 
 请严格按以下JSON格式输出（不要有markdown包裹）：
 
 {
+  "stage": "导入期/成长期/成熟期 三选一",
+  "stage_reason": "一句话判定依据（渗透率/增速/盈利兑现程度等事实）",
   "upstream": [
     {"segment": "细分领域名", "keywords": "搜索该领域龙头用的关键词"},
     ...
@@ -221,6 +306,9 @@ class ResearcherAgent:
 }
 
 要求：
+- stage 判定标准：导入期=渗透率低/多数公司未盈利/商业模式在验证（如商业航天、人形机器人）；
+  成长期=渗透率快速提升/头部公司开始兑现利润；成熟期=格局稳定/增速回落/看份额与壁垒。
+  判定必须基于搜索结果中的事实，拿不准时选"成长期"
 - upstream/midstream/downstream 各 1-4 个细分领域
 - niche_innovators：识别该产业链中技术壁垒极高、不可替代性强、市值未必最大但在细分领域有垄断地位的"专精特新/隐形冠军"型企业（至少1个，最多3个细分领域），如光刻胶、高纯试剂、特种气体等
 - 每个细分领域要有明确的搜索关键词
@@ -245,6 +333,8 @@ class ResearcherAgent:
 
         # fallback
         return {
+            "stage": DEFAULT_STAGE,
+            "stage_reason": "结构识别解析失败，按成长期兜底",
             "upstream": [{"segment": f"{industry}上游原料/设备", "keywords": f"{industry} 上游 龙头"}],
             "midstream": [{"segment": f"{industry}中游制造", "keywords": f"{industry} 龙头"}],
             "downstream": [{"segment": f"{industry}下游应用", "keywords": f"{industry} 下游 龙头"}],
@@ -265,8 +355,8 @@ class ResearcherAgent:
             for seg in segments:
                 seg_name = seg.get("segment", "")
                 keywords = seg.get("keywords", seg_name)
-                # 搜索该细分领域的龙头
-                query = f"{keywords} 龙一 龙二 龙头公司 竞争格局 {recent_period}"
+                # 搜索该细分领域的主要上市公司（含二三线：弹性标的经常不在龙一龙二里）
+                query = f"{keywords} 龙头公司 二线 主要上市公司 竞争格局 {recent_period}"
                 try:
                     result = web_search.invoke({"query": query})
                 except Exception as e:
@@ -301,19 +391,21 @@ class ResearcherAgent:
         return all_leaders
 
     def _extract_leaders_from_text(self, text: str, segment: str, level: str) -> List[Dict[str, Any]]:
-        """从搜索结果中提取前两名龙头股的代码"""
+        """从搜索结果中提取该细分领域的主要上市公司（最多4家，按地位排序）"""
         if not text or "搜索失败" in str(text):
             return []
 
-        # 用 LLM 提取
-        prompt = f"""从以下搜索结果中提取「{segment}」细分领域的龙一和龙二公司。
+        # 用 LLM 提取。不只要龙一龙二：机会（弹性/低估）经常在二三线，收敛交给后面的评分，
+        # 不在搜索抽取这一步就把候选面掐死
+        prompt = f"""从以下搜索结果中提取「{segment}」细分领域的主要A股上市公司，最多4家，
+按行业地位从高到低排序（龙头在前，二三线也要列入）。
 
 请输出JSON数组（不要markdown包裹）：
 [{{"name": "公司名", "code": "股票代码"}}, ...]
 
 如果没有找到或无法确定，返回空数组 []。
 搜索结果：
-{text[:2000]}"""
+{text[:2500]}"""
 
         try:
             response = self.llm.invoke([HumanMessage(content=prompt)])
@@ -347,7 +439,7 @@ class ResearcherAgent:
                         validated.append({"name": name, "code": code, "rank": len(validated) + 1})
                     else:
                         logger.warning(f"[{segment}] 无法确认「{name}」的股票代码，跳过")
-                return validated[:2]
+                return validated[:4]
         except Exception as e:
             logger.error(f"提取龙头失败: {e}")
 
@@ -365,6 +457,11 @@ class ResearcherAgent:
             f"{industry} 产业链 政策 利好 利空 {three_month_range}",
             f"{industry} 行业 发展趋势 投资机会 {today.year} {today.year + 1}",
             f"{industry} 资金流向 主力资金 北向资金 机构持仓 {today.year}",
+            # 催化剂时间轴：机会有时间属性，招标/投产/发射/政策窗口是"什么时候涨"的依据
+            f"{industry} 催化剂 招标 投产 量产 发射 时间表 {today.year}下半年 {today.year + 1}",
+            # 景气拐点与利润迁移：渗透率斜率、涨价传导、瓶颈环节=定价权所在
+            f"{industry} 渗透率 行业增速 拐点 订单 排产 {recent_period}",
+            f"{industry} 涨价 供需缺口 瓶颈环节 价格传导 利润分配 {recent_period}",
         ]
 
         for level in ["upstream", "midstream", "downstream", "niche_innovators"]:
@@ -388,25 +485,44 @@ class ResearcherAgent:
 
         return queries
 
-    def _build_chain_system_prompt(self) -> str:
-        return """你是一个顶级的产业链研究专家。你的任务是从产业链中筛选出所有关键公司（含特精专新企业），分析其基本面、业务拆解、护城河、资金偏好，并输出清晰的候选公司清单（含股票代码），供下游技术分析 Agent 使用。
+    def _build_chain_system_prompt(self, stage: str = DEFAULT_STAGE, stage_reason: str = "") -> str:
+        stage = normalize_stage(stage)
+        w = STAGE_WEIGHTS[stage]
+        gate_desc = "；".join(f"{label}≥{gate:g}分" for _, gate, label in STAGE_GATES[stage])
+        return f"""你是一个顶级的产业链研究专家，擅长挖掘投资机会。你的任务是从产业链中筛选出所有关键公司（含特精专新企业），分析其基本面、边际变化、护城河、资金偏好，并输出清晰的候选公司清单（含股票代码），供下游技术分析 Agent 使用。
+
+本行业已判定为【{stage}】{f'（{stage_reason}）' if stage_reason else ''}。
+评分权重与准入门槛随阶段切换（程序执行）：本次权重为
+业务{w['business']:.0%}+基本面{w['fundamental']:.0%}+护城河{w['moat']:.0%}+边际变化{w['momentum']:.0%}，
+准入门槛为 {gate_desc}。
 
 请基于下方数据完成任务：
-1. 产业链结构（上游/中游/下游/特精专新 + 细分领域）及各环节龙一龙二
+1. 产业链结构（上游/中游/下游/特精专新 + 细分领域）及各环节主要上市公司
 2. 各公司的经营基本面、业务拆解、护城河、资金流向搜索数据
 
 请严格按照以下结构输出：
 
 ## 〇、候选公司清单与分项评分（必须放在最前面输出，供下游程序计算排名）
 纯JSON格式（不要markdown包裹）：
-{
+{{
   "candidates": [
-    {"code": "股票代码", "business": 业务经营分0-10, "fundamental": 基本面分0-10, "moat": 不可替代与溢价分0-10},
+    {{"code": "股票代码", "business": 业务经营分0-10, "fundamental": 基本面分0-10,
+      "moat": 不可替代与溢价分0-10, "momentum": 边际变化分0-10}},
+    ...
+  ],
+  "reeval_triggers": [
+    {{"type": "news", "trigger": "重估触发条件描述（可被新闻验证的具体事件）", "keywords": "盯梢用关键词，空格分隔"}},
     ...
   ]
-}
-说明：只给分项分数，**不要自行计算加权总分或排名**——综合排名由程序按
-「业务20% + 基本面30% + 不可替代与溢价50%」权重精确计算，避免心算误差。
+}}
+说明：
+- 只给分项分数，**不要自行计算加权总分或排名**——综合排名由程序按上述阶段权重精确计算，
+  并叠加 PE 历史分位的预期差调整，避免心算误差
+- momentum（边际变化分）打分证据**只认近2个季度/近3个月的增量事实**：
+  增速拐点、新订单/新客户导入、产能爬坡、毛利率环比回升、渗透率斜率变化；
+  存量优势（多年积累的技术/份额）不算边际变化，那是 moat 的事
+- reeval_triggers：1-4 条"若发生XX则值得重新评估该行业"的具体条件（如"某公司砷化镓电池收入占比超20%"
+  "可回收火箭完成商业化首飞"），必须可被公开新闻验证，程序会自动盯梢；没有就给空数组
 
 ## 一、产业链公司全景筛选
 - 用表格列出产业链上中下游 + 特精专新共筛选出的所有公司
@@ -439,13 +555,26 @@ class ResearcherAgent:
 - 不可替代性（0-5 分）：核心技术是否独有？供应链是否存在单一依赖？切换成本？在产业链中是否"卡脖子"环节？
 - 溢价能力（0-5 分）：毛利率水平？对上游议价能力？对下游定价权？品牌/专利/牌照壁垒？成本转嫁能力？
 - 特别关注特精专新企业，它们在某些环节可能具有极高的不可替代性
-- ⚠️ 护城河是硬性准入门槛：程序会把该项低于7分的公司剔除出投资池。
-  打分必须严格基于搜索证据（独有技术/专利/牌照/垄断地位的具体事实），
-  禁止为照顾公司入围而抬分；找不到壁垒证据就给低分，宁缺毋滥
+- ⚠️ 准入门槛由程序按行业阶段执行（本次：{gate_desc}），未达标公司会被剔除出投资池。
+  打分必须严格基于搜索证据（独有技术/专利/牌照/垄断地位的具体事实；
+  边际变化则要有近2季/近3月的增量事实），禁止为照顾公司入围而抬分；
+  找不到证据就给低分，宁缺毋滥
 
 ## 五、评分依据说明
-逐公司用一两句话说明三项分项分数的打分依据（业务经营/基本面/不可替代与溢价），
+逐公司用一两句话说明四项分项分数的打分依据（业务经营/基本面/不可替代与溢价/边际变化），
 **不要给出加权总分和名次**（由程序计算后附在报告末尾）
+
+## 六、环节利润迁移判断
+产业链分析最值钱的结论：利润正在向哪个环节集中、未来2-4个季度会往哪迁移。
+- 当前瓶颈环节在哪（瓶颈=定价权）：供需缺口、涨价/降价的传导方向、谁在挤压谁的毛利
+- 行业放量的兑现顺序：早周期（设备/材料）→ 中周期（制造）→ 晚周期（运营/服务），当前处于哪一段
+- 明确给出结论：**未来2-4个季度最受益的环节是哪个、为什么**，对应环节的候选公司要点名
+- 全部判断必须基于搜索证据（涨价新闻/排产数据/招标节奏），没有证据就写「证据不足，无法判断迁移方向」
+
+## 七、催化剂时间轴（未来3-6个月）
+机会有时间属性。用列表按时间先后列出可能的催化事件：
+- 每条格式：预计时间 | 事件（招标/发射/投产/量产/政策落地/财报窗口）| 影响的环节或公司 | 出处
+- 只列搜索结果里有明确依据的事件，禁止编造时间；没有就明写「未发现明确催化剂」
 
 【重要原则】
 - 候选公司清单 JSON 必须是输出的第一部分（输出过长被截断时后面的段落可丢，JSON 不能丢）
@@ -512,10 +641,12 @@ class ResearcherAgent:
             company_name = ""
         from tools.main_business import fetch_main_business_text
         from tools.info_sources import fetch_sales_flash_text
+        from tools.holder_events import fetch_holder_events_text
         structured_blocks = []
         for block in (
             fetch_sales_flash_text(stock_code),
             fetch_main_business_text(stock_code),
+            fetch_holder_events_text(stock_code, company_name),
             format_info_block("巨潮公告（最近30天，重大事项第一手来源）",
                               fetch_stock_announcements(stock_code), with_content=False),
             format_info_block("东财个股新闻（最新15条）", fetch_stock_news(stock_code)),
@@ -566,7 +697,9 @@ class ResearcherAgent:
         # ---- Step 1：识别产业链结构 ----
         logger.info("Step 1/3: 识别产业链上中下游+细分领域...")
         chain = self._identify_chain_structure(industry_name)
-        logger.info(f"产业链结构: upstream={len(chain.get('upstream',[]))}seg, midstream={len(chain.get('midstream',[]))}seg, downstream={len(chain.get('downstream',[]))}seg, niche={len(chain.get('niche_innovators',[]))}seg")
+        stage = normalize_stage(chain.get("stage"))
+        stage_reason = str(chain.get("stage_reason") or "")
+        logger.info(f"产业链结构: upstream={len(chain.get('upstream',[]))}seg, midstream={len(chain.get('midstream',[]))}seg, downstream={len(chain.get('downstream',[]))}seg, niche={len(chain.get('niche_innovators',[]))}seg, 行业阶段={stage}")
 
         # ---- Step 2：搜索每个细分领域的龙一龙二 ----
         logger.info("Step 2/3: 搜索各环节龙一龙二（含特精专新）...")
@@ -635,9 +768,9 @@ class ResearcherAgent:
         search_text = self._search_text(all_results)
 
         messages = [
-            SystemMessage(content=self._build_chain_system_prompt()),
+            SystemMessage(content=self._build_chain_system_prompt(stage, stage_reason)),
             HumanMessage(content=f"""用户问题：{question}
-目标行业：{industry_name}
+目标行业：{industry_name}（行业阶段：{stage}{f'，{stage_reason}' if stage_reason else ''}）
 
 {cls_block if cls_block else ''}
 
@@ -652,9 +785,10 @@ class ResearcherAgent:
 ========== 全网搜索结果（含经营/竞争力/业务拆解/收入毛利占比/出货量/资本开支/新增订单/技术突破/护城河） ==========
 {search_text[:15000]}
 
-请按结构输出：〇、JSON 候选代码清单（放最前）→ 一、全景筛选 → 二、业务拆解与经营数据
-（优先引用主营构成数据的占比/毛利率原数）→ 三、基本面评分 → 四、护城河分析（重点关注特精专新）
-→ 五、综合排名。
+请按结构输出：〇、JSON 候选清单+分项评分+重估触发条件（放最前）→ 一、全景筛选
+→ 二、业务拆解与经营数据（优先引用主营构成数据的占比/毛利率原数）→ 三、基本面评分
+→ 四、护城河分析（重点关注特精专新）→ 五、评分依据说明
+→ 六、环节利润迁移判断 → 七、催化剂时间轴。
 资金偏好只在搜索结果里有北向/龙虎榜/机构调研等公开证据时标注并写明出处，
 无证据写「无公开数据」，禁止凭板块印象填"主力/游资"。"""),
         ]
@@ -664,32 +798,39 @@ class ResearcherAgent:
         summary = response.content if hasattr(response, 'content') else str(response)
         logger.info(f"产业链分析完成，长度: {len(summary)}")
 
-        # 从 LLM 输出中提取候选与分项评分，综合排名由程序计算
+        # 从 LLM 输出中提取候选与分项评分，综合排名由程序计算。
+        # JSON 里除 candidates 外还有 reeval_triggers，正则截到首个 ] 会解析失败，
+        # 改用 raw_decode 从 {"candidates" 起始处解析完整对象
         import json, re
         candidate_codes = list(all_leader_codes)  # fallback：龙头搜索阶段已验证过的代码
         ranked = []
-        moat_excluded = []
-        json_match = re.search(r'\{\s*"candidates"\s*:\s*\[.*?\]\s*\}', summary, re.DOTALL)
-        if json_match:
+        gate_excluded = []
+        extracted = None
+        start_match = re.search(r'\{\s*"candidates"', summary)
+        if start_match:
             try:
-                extracted = json.loads(json_match.group(0))
-                ranked = compute_composite_ranking(extracted.get("candidates") or [])
-                if ranked:
-                    # 护城河硬门槛：未达标的直接剔除出投资池，不进排名与技术对比
-                    ranked, moat_excluded = apply_moat_gate(ranked)
-                    candidate_codes = [item["code"] for item in ranked]
-                    logger.info(f"程序计算综合排名完成（护城河门槛剔除 {len(moat_excluded)} 家）: "
-                                f"{[(i['code'], i['composite']) for i in ranked]}")
+                extracted, _ = json.JSONDecoder().raw_decode(summary[start_match.start():])
             except json.JSONDecodeError:
-                pass
-        if not ranked:
+                extracted = None
+        if extracted:
+            ranked = compute_composite_ranking(extracted.get("candidates") or [], stage)
+            if ranked:
+                # 阶段化硬门槛：未达标的直接剔除出投资池，不进排名与技术对比
+                ranked, gate_excluded = apply_stage_gate(ranked, stage)
+                # 预期差调整：评分与PE历史分位见面，高分位减分/低分位加分，标注机会/拥挤象限
+                per_stock = (industry_valuation or {}).get("per_stock") or []
+                ranked = apply_valuation_adjustment(ranked, per_stock)
+                candidate_codes = [item["code"] for item in ranked]
+                logger.info(f"程序计算综合排名完成（阶段={stage}，门槛剔除 {len(gate_excluded)} 家）: "
+                            f"{[(i['code'], i.get('composite_adj', i['composite'])) for i in ranked]}")
+        if not ranked and not extracted:
             # 兼容旧格式 candidate_codes（无分项分数时不产生排名）
             old_match = re.search(r'\{[^{}]*"candidate_codes"[^{}]*\}', summary, re.DOTALL)
             if old_match:
                 try:
-                    extracted = json.loads(old_match.group(0))
-                    if extracted.get("candidate_codes"):
-                        candidate_codes = extracted["candidate_codes"]
+                    old_extracted = json.loads(old_match.group(0))
+                    if old_extracted.get("candidate_codes"):
+                        candidate_codes = old_extracted["candidate_codes"]
                 except json.JSONDecodeError:
                     pass
 
@@ -700,17 +841,54 @@ class ResearcherAgent:
             except Exception:
                 return None
 
+        gate_desc = "；".join(f"{label}≥{g:g}分" for _, g, label in STAGE_GATES[stage])
         if ranked:
             summary = summary + "\n\n" + format_ranking_table(ranked, name_of=_safe_name)
-        if moat_excluded:
-            ex_lines = [f"【护城河门槛剔除（评分<{MOAT_GATE:g}分或无打分证据，不入投资池，仅列示供了解全貌）】"]
-            for it in moat_excluded:
+        if gate_excluded:
+            ex_lines = [f"【阶段门槛剔除（行业阶段：{stage}，门槛：{gate_desc}；不入投资池，转入观察池，仅列示供了解全貌）】"]
+            for it in gate_excluded:
                 nm = _safe_name(it["code"])
                 label = f"{nm}({it['code']})" if nm else it["code"]
                 ex_lines.append(f"- {label}：{it['exclude_reason']}")
             summary = summary + "\n\n" + "\n".join(ex_lines)
-        if not ranked and moat_excluded:
-            summary += "\n\n⚠️ 本次全部候选的护城河评分均未达标，无投资池标的——以下内容仅作行业观察，不给介入建议"
+        if not ranked and gate_excluded:
+            summary += (f"\n\n⚠️ 本次全部候选均未达【{stage}】阶段准入门槛，无投资池标的——以下内容仅作行业观察，"
+                        "不给介入建议；被剔除公司转入观察池，重估触发条件命中后系统会自动提醒重新评估")
+
+        # 重估触发条件：LLM 给的 news 型 + 程序自动补的估值型，落库并加入监控清单，
+        # 让"不参与"从死结论变成"暂不参与 + 自动盯"
+        reeval_triggers = []
+        if extracted:
+            for t in (extracted.get("reeval_triggers") or [])[:4]:
+                desc = str(t.get("trigger") or "").strip()
+                if desc:
+                    reeval_triggers.append({
+                        "trigger_type": "news",
+                        "description": desc[:300],
+                        "keywords": str(t.get("keywords") or "")[:200],
+                    })
+        pe_pct = (industry_valuation or {}).get("pe_percentile_median")
+        if pe_pct is not None and pe_pct >= 60:
+            reeval_triggers.append({
+                "trigger_type": "valuation",
+                "description": f"候选池PE(TTM)历史分位中位数从{pe_pct}%回落至50%以下",
+                "pe_percentile_below": 50.0,
+                "pool_codes": sorted(all_leader_codes),
+            })
+        if reeval_triggers:
+            try:
+                from storage.sqlite.stock_storage import get_db
+                _db = get_db()
+                _db.save_industry_triggers(industry_name, reeval_triggers)
+                kw = " ".join(t.get("keywords") or "" for t in reeval_triggers).strip()
+                _db.add_watch_target(name=industry_name, target_type="industry",
+                                     keywords=kw[:200] if kw else None)
+                trig_lines = ["【重估触发条件（已落库，监控任务自动盯梢，命中会推送提醒）】"]
+                trig_lines += [f"- [{t['trigger_type']}] {t['description']}" for t in reeval_triggers]
+                summary = summary + "\n\n" + "\n".join(trig_lines)
+                logger.info(f"重估触发条件已保存 {len(reeval_triggers)} 条并加入监控清单: {industry_name}")
+            except Exception as e:
+                logger.warning(f"重估触发条件保存失败（不影响分析）: {e}")
 
         # 出口统一验证：只把能在股票基础表反查到的代码交给 technical_agent
         verified_codes = []
@@ -729,7 +907,8 @@ class ResearcherAgent:
         return {
             "messages": [response],
             "research_result": {"summary": summary, "sources": all_queries,
-                                "industry_valuation": industry_valuation},
+                                "industry_valuation": industry_valuation,
+                                "industry_stage": stage},
             "chain_leaders": chain,
             "stock_code": ",".join(verified_codes) if verified_codes else "",
             "intermediate_steps": [("researcher", {"mode": "chain", "industry": industry_name, "segments": sum(len(chain.get(k,[])) for k in ["upstream","midstream","downstream","niche_innovators"]), "candidates": len(verified_codes), "queries": len(all_queries)})],
