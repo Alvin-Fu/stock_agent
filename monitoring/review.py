@@ -30,12 +30,15 @@ _EXTRACT_PROMPT = """从以下股票分析报告中抽取可检验的核心判�
   "resistance": [压力位价格数字, ...],
   "key_reasons": ["核心理由1", "核心理由2", "核心理由3"],
   "moat_view": "护城河评级及一句依据（如：高——星载T/R芯片唯一上市标的）",
-  "flywheel_view": "飞轮判断及一句依据（如：未见明显飞轮——各业务相互独立）"
+  "flywheel_view": "飞轮判断及一句依据（如：未见明显飞轮——各业务相互独立）",
+  "fundamental_outlook": {{"next_report": "改善/恶化/持平", "basis": "一句话依据（20字内）"}}
 }}
 
 规则：报告没有明确给出的项用 null（数组给 []）；support/resistance 只要具体价格数字；
 key_reasons 最多3条、每条20字内，只选支撑最终结论的关键依据；
-moat_view/flywheel_view 各 40 字内，报告没提就 null。
+moat_view/flywheel_view 各 40 字内，报告没提就 null；
+fundamental_outlook 抽报告对**下一期财报**的方向前瞻（利润改善/恶化/持平，
+如"基于月度数据推断Q2利润仍承压"→恶化），报告没做前瞻就 null。
 
 分析报告：
 {report}"""
@@ -62,6 +65,12 @@ def _parse_judgement(raw: str) -> Optional[Dict[str, Any]]:
             return out[:4]
         def _text(v, limit=80):
             return str(v)[:limit] if v else None
+        outlook = data.get("fundamental_outlook")
+        if isinstance(outlook, dict) and outlook.get("next_report") in ("改善", "恶化", "持平"):
+            outlook = {"next_report": outlook["next_report"],
+                       "basis": str(outlook.get("basis") or "")[:60]}
+        else:
+            outlook = None
         return {
             "short_term_view": _view(data.get("short_term_view")),
             "mid_term_view": _view(data.get("mid_term_view")),
@@ -70,6 +79,7 @@ def _parse_judgement(raw: str) -> Optional[Dict[str, Any]]:
             "key_reasons": [str(r)[:40] for r in (data.get("key_reasons") or [])[:3]],
             "moat_view": _text(data.get("moat_view")),
             "flywheel_view": _text(data.get("flywheel_view")),
+            "fundamental_outlook": outlook,
         }
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
@@ -112,6 +122,22 @@ def snapshot_analysis(stock_code: str, question: str, final_answer: str,
         except Exception:
             pass
 
+        # 基本面前瞻：嵌入"基准期"（快照时点已披露的最新财报期与同比），
+        # 新财报出来后程序拿新旧同比对账，前瞻从"说说而已"变成可证伪判断
+        outlook_json = None
+        outlook = judgement.get("fundamental_outlook")
+        if outlook:
+            try:
+                income_df = db.get_stock_income(stock_code)
+                if income_df is not None and not income_df.empty:
+                    base = income_df.iloc[0]
+                    outlook["base_period"] = str(base.get("report_date"))[:10]
+                    pg = base.get("profit_growth")
+                    outlook["base_profit_growth"] = round(float(pg), 2) if pg is not None else None
+            except Exception as e:
+                logger.warning(f"[复盘] {stock_code} 前瞻基准期获取失败: {e}")
+            outlook_json = json.dumps(outlook, ensure_ascii=False)
+
         snapshot_id = db.save_analysis_snapshot(
             code=stock_code, name=name, question=(question or "")[:500],
             price_at_analysis=price,
@@ -124,6 +150,7 @@ def snapshot_analysis(stock_code: str, question: str, final_answer: str,
             trade_plan=json.dumps(trade_plan, ensure_ascii=False, default=str) if trade_plan else None,
             moat_view=judgement.get("moat_view"),
             flywheel_view=judgement.get("flywheel_view"),
+            fundamental_outlook=outlook_json,
         )
         logger.info(f"[复盘] {stock_code} 分析快照已留档 #{snapshot_id}"
                     f"（短期{judgement['short_term_view']}，价 {price}）")
@@ -246,7 +273,8 @@ _INDUSTRY_EXTRACT_PROMPT = """从以下产业链分析报告中抽取可检验�
 
 def snapshot_industry_analysis(industry_name: str, question: str, final_answer: str,
                                candidate_codes: List[str],
-                               valuation: Optional[Dict[str, Any]] = None) -> Optional[int]:
+                               valuation: Optional[Dict[str, Any]] = None,
+                               excluded_codes: Optional[List[str]] = None) -> Optional[int]:
     """产业链分析完成后留档（同步实现，调用方用线程异步跑）"""
     if not industry_name or not candidate_codes:
         return None
@@ -289,6 +317,23 @@ def snapshot_industry_analysis(industry_name: str, question: str, final_answer: 
                 pass
             candidates.append({"code": code, "name": name or code, "price": price, "rank": i})
 
+        # 门槛剔除组：记下当时价格，复盘时与进池组对照——门槛有效性只有事后收益能证明
+        excluded = []
+        for code in (excluded_codes or [])[:10]:
+            price, ename = None, None
+            try:
+                daily = db.get_all_daily_data(code)
+                if daily is not None and not daily.empty:
+                    price = float(daily.iloc[0].get("close"))
+            except Exception:
+                pass
+            try:
+                ename = find_company_name(code)
+            except Exception:
+                pass
+            if price:
+                excluded.append({"code": code, "name": ename or code, "price": price})
+
         # 基准点位
         benchmark_price = None
         try:
@@ -304,6 +349,7 @@ def snapshot_industry_analysis(industry_name: str, question: str, final_answer: 
             candidates=json.dumps(candidates, ensure_ascii=False),
             top_pick=top_pick, industry_view=industry_view,
             valuation=json.dumps(valuation, ensure_ascii=False) if valuation else None,
+            excluded=json.dumps(excluded, ensure_ascii=False) if excluded else None,
             benchmark_price=benchmark_price,
         )
         logger.info(f"[复盘] 产业链快照已留档 #{snapshot_id}：{industry_name}，"
@@ -316,10 +362,11 @@ def snapshot_industry_analysis(industry_name: str, question: str, final_answer: 
 
 def snapshot_industry_analysis_async(industry_name: str, question: str, final_answer: str,
                                      candidate_codes: List[str],
-                                     valuation: Optional[Dict[str, Any]] = None) -> None:
+                                     valuation: Optional[Dict[str, Any]] = None,
+                                     excluded_codes: Optional[List[str]] = None) -> None:
     threading.Thread(
         target=snapshot_industry_analysis,
-        args=(industry_name, question, final_answer, candidate_codes, valuation),
+        args=(industry_name, question, final_answer, candidate_codes, valuation, excluded_codes),
         name="industry-snapshot", daemon=True,
     ).start()
 
@@ -456,9 +503,65 @@ class ReviewRunner:
             logger.error(f"[复盘] {code} 复盘失败: {e}\n{traceback.format_exc()}")
             return None
 
+    def check_fundamental_outlooks(self) -> int:
+        """
+        基本面前瞻对账（纯程序判定）：快照里的"下期财报改善/恶化"前瞻，
+        在新一期财报入库后与实际同比对账。改善=新一期净利同比高于基准期同比
+        （加速或降幅收窄），恶化反之；差异<2pct 或前瞻为"持平"记未验证。
+        """
+        pending = self.db.get_snapshots_pending_fundamental_check()
+        done = 0
+        for snap in pending:
+            try:
+                outlook = json.loads(snap.get("fundamental_outlook") or "null")
+                if not outlook:
+                    continue
+                base_period = outlook.get("base_period")
+                base_pg = outlook.get("base_profit_growth")
+                income_df = self.db.get_stock_income(snap["code"])
+                if income_df is None or income_df.empty or not base_period:
+                    continue
+                latest = income_df.iloc[0]
+                new_period = str(latest.get("report_date"))[:10]
+                if new_period <= base_period:
+                    continue  # 新财报还没出，继续等
+                new_pg = latest.get("profit_growth")
+                if new_pg is None or base_pg is None:
+                    self.db.set_snapshot_fundamental_verdict(
+                        snap["id"], "未验证", f"新期{new_period}或基准期缺同比数据")
+                    continue
+                new_pg = float(new_pg)
+                delta = new_pg - float(base_pg)
+                actual = "改善" if delta > 2 else ("恶化" if delta < -2 else "持平")
+                view = outlook.get("next_report")
+                if view == "持平" or actual == "持平":
+                    verdict = "未验证" if view != actual else "正确"
+                else:
+                    verdict = "正确" if view == actual else "错误"
+                note = (f"前瞻[{view}] vs 实际[{actual}]：净利同比 "
+                        f"{base_pg}%({base_period})→{new_pg:.1f}%({new_period})")
+                self.db.set_snapshot_fundamental_verdict(snap["id"], verdict, note)
+                done += 1
+                logger.info(f"[复盘] {snap['code']} 基本面前瞻对账：{verdict}（{note}）")
+                if self.notifier:
+                    icon = {"正确": "✅", "错误": "❌"}.get(verdict, "⏸")
+                    self.notifier.send(
+                        f"{icon} 基本面前瞻对账 | {snap.get('name') or snap['code']}({snap['code']})\n"
+                        f"{str(snap.get('created_at'))[:10]} 的前瞻：{view}"
+                        f"（{outlook.get('basis') or '无依据记录'}）\n{note} → {verdict}")
+            except Exception as e:
+                logger.error(f"[复盘] {snap.get('code')} 前瞻对账失败: {e}")
+        return done
+
     def run_due_reviews(self, after_days: int = 5, industry_after_days: int = 10) -> int:
         """复盘全部到期快照（个股+产业链），返回完成数"""
         done = 0
+
+        # 基本面前瞻对账：不依赖到期天数，新财报入库即触发
+        try:
+            done += self.check_fundamental_outlooks()
+        except Exception as e:
+            logger.error(f"[复盘] 基本面前瞻对账批处理失败: {e}")
 
         due = self.db.get_snapshots_due_review(after_days)
         if due:
@@ -485,6 +588,11 @@ class ReviewRunner:
                 self.notifier.send(
                     f"📈 系统成绩单：近 {acc['total']} 次个股复盘中，可验证的方向判断 {acc['judged']} 次，"
                     f"命中 {acc['correct']} 次（命中率 {acc['accuracy']}%）")
+            facc = self.db.get_fundamental_accuracy()
+            if facc.get("accuracy") is not None:
+                self.notifier.send(
+                    f"📈 基本面前瞻成绩单：已对账 {facc['judged']} 次，"
+                    f"命中 {facc['correct']} 次（命中率 {facc['accuracy']}%）")
             track = self.db.get_industry_track_record()
             if track.get("total"):
                 self.notifier.send(
@@ -535,6 +643,24 @@ class ReviewRunner:
             verdicts = calc_industry_verdicts(
                 performance, snap.get("benchmark_price"), self._current_benchmark_price(),
                 snap.get("top_pick"), snap.get("industry_view"))
+
+            # 门槛剔除组对照：剔除组事后收益 vs 进池组合，是门槛松紧的唯一硬证据
+            excluded_avg_return = None
+            try:
+                excluded = json.loads(snap.get("excluded") or "[]")
+                ex_pcts = []
+                for ex in excluded:
+                    code, price_then = ex.get("code"), ex.get("price")
+                    if not code or not price_then:
+                        continue
+                    df = stock_tool_instance.fetch_and_save_stock_daily_data(code)
+                    if df is None or df.empty:
+                        continue
+                    ex_pcts.append((float(df.iloc[0]["close"]) / float(price_then) - 1) * 100)
+                if ex_pcts:
+                    excluded_avg_return = round(sum(ex_pcts) / len(ex_pcts), 2)
+            except Exception as e:
+                logger.warning(f"[复盘] {industry} 剔除组收益计算失败: {e}")
 
             # 当时的估值/回调提示对账（代码判定）
             risk_note = ""
@@ -601,6 +727,7 @@ class ReviewRunner:
                 rank_effective=verdicts["rank_effective"],
                 top_pick_rank=verdicts["top_pick_rank"],
                 direction_verdict=verdicts["direction_verdict"],
+                excluded_avg_return=excluded_avg_return,
                 review_content=card,
             )
             self.db.mark_industry_snapshot_reviewed(snap["id"])

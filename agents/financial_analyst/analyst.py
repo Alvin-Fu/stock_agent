@@ -132,6 +132,16 @@ class AnalystAgent:
             logger.warning(f"分部利润拆分失败（不影响其余分析）: {e}")
 
         result["parsed"] = self._parse_latest_financial_data()
+
+        # 数据源健康上报：财报块拿没拿到一眼可见，静默降级是最危险的失败模式
+        try:
+            from tools.source_health import report_source
+            for label, key in (("利润表", "income"), ("资产负债表", "balance_sheet"),
+                               ("现金流量表", "cashflow"), ("主营构成", "main_business"),
+                               ("同行对比", "peer_table")):
+                report_source(label, bool(result.get(key)))
+        except Exception:
+            pass
         return result
 
     def _parse_latest_financial_data(self) -> Dict[str, Any]:

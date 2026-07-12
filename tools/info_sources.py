@@ -15,6 +15,7 @@ from datetime import date, timedelta
 from typing import List, Dict, Optional
 
 from utils.logger import logger
+from tools.source_health import report_source
 
 # 财联社电报当日内存缓存（快讯流全市场共用，避免每个标的重复拉）
 _CLS_CACHE = {"ts": 0.0, "items": None}
@@ -36,9 +37,12 @@ def fetch_stock_news(code: str, limit: int = 15) -> List[Dict[str, str]]:
                 "source": str(row.get("文章来源", "")).strip(),
                 "url": str(row.get("新闻链接", "")).strip(),
             })
-        return [it for it in items if it["title"]]
+        items = [it for it in items if it["title"]]
+        report_source("东财新闻", bool(items), "接口返回为空")
+        return items
     except Exception as e:
         logger.warning(f"[信源] 东财个股新闻获取失败 {code}: {e}")
+        report_source("东财新闻", False, str(e))
         return []
 
 
@@ -59,9 +63,12 @@ def fetch_stock_announcements(code: str, days: int = 30, limit: int = 15) -> Lis
                 "time": str(row.get("公告时间", "")).strip(),
                 "url": str(row.get("公告链接", "")).strip(),
             })
-        return [it for it in items if it["title"]]
+        items = [it for it in items if it["title"]]
+        report_source("巨潮公告", bool(items), "接口返回为空")
+        return items
     except Exception as e:
         logger.warning(f"[信源] 巨潮公告获取失败 {code}: {e}")
+        report_source("巨潮公告", False, str(e))
         return []
 
 
@@ -147,6 +154,7 @@ def fetch_sales_flash_text(code: str, days: int = 40) -> str:
     try:
         ann = _pick_sales_flash(fetch_stock_announcements(code, days=days, limit=30))
         if not ann or not ann.get("url"):
+            report_source("产销快报", False, f"近{days}天无产销快报公告（部分公司不发布，属正常）")
             return ""
 
         db = None
@@ -161,16 +169,19 @@ def fetch_sales_flash_text(code: str, days: int = 40) -> str:
         if not text:
             text = _download_pdf_text(ann["url"])
             if not text:
+                report_source("产销快报", False, "PDF下载或抽取失败")
                 return ""
             if db is not None:
                 db.save_announcement_text(code, ann["title"], ann_time=ann.get("time"),
                                           url=ann.get("url"), content=text)
                 logger.info(f"[信源] 产销快报正文已缓存: {code} {ann['title']}")
 
+        report_source("产销快报", True)
         return (f"【产销快报公告原文（{ann['title']}，{ann.get('time', '')}，权威口径，"
                 f"销量数字以此为准）】\n{text[:2500]}")
     except Exception as e:
         logger.warning(f"[信源] 产销快报获取失败 {code}: {e}")
+        report_source("产销快报", False, str(e))
         return ""
 
 
@@ -251,6 +262,7 @@ def fetch_cls_telegraph(keywords: Optional[List[str]] = None, limit: int = 20) -
     （用于按公司名/行业名过滤宏观快讯流）。
     """
     items = _load_cls_telegraph()
+    report_source("快讯流", bool(items), "三个快讯源均无数据")
     if keywords:
         kws = [k for k in keywords if k]
         items = [it for it in items

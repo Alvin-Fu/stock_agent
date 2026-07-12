@@ -970,6 +970,9 @@ class AnalysisSnapshot(Base):
     trade_plan = Column(Text)  # 当时的程序操作参考 JSON（方向/观察区/止损/目标），条件触发提醒用
     moat_view = Column(String(100))      # 当时的护城河评级及依据（定性判断延续用）
     flywheel_view = Column(String(100))  # 当时的飞轮判断及依据（定性判断延续用）
+    fundamental_outlook = Column(Text)   # 基本面前瞻 JSON：下期财报方向判断+依据+基准期（可证伪）
+    fundamental_verdict = Column(String(10))   # 前瞻对账结果：正确/错误/未验证（新财报披露后程序判定）
+    fundamental_note = Column(String(300))     # 对账依据（新旧同比数字）
     review_done = Column(Integer, nullable=False, default=0)  # 是否已自动复盘
     created_at = Column(DateTime, default=datetime.now, index=True)
 
@@ -989,6 +992,9 @@ class AnalysisSnapshot(Base):
             'trade_plan': self.trade_plan,
             'moat_view': self.moat_view,
             'flywheel_view': self.flywheel_view,
+            'fundamental_outlook': self.fundamental_outlook,
+            'fundamental_verdict': self.fundamental_verdict,
+            'fundamental_note': self.fundamental_note,
             'review_done': bool(self.review_done),
             'created_at': self.created_at,
         }
@@ -1036,6 +1042,7 @@ class IndustrySnapshot(Base):
     top_pick = Column(String(10))  # 技术面最强的股票代码
     industry_view = Column(String(10))  # 行业判断：偏多/中性/偏空
     valuation = Column(Text)  # 行业估值与位置指标 JSON（含 overall 标签，复盘对账用）
+    excluded = Column(Text)  # JSON: 被阶段门槛剔除的公司 [{"code","name","price"}]，门槛有效性对账用
     benchmark_price = Column(Float)  # 沪深300 当时点位
     review_done = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.now, index=True)
@@ -1049,6 +1056,7 @@ class IndustrySnapshot(Base):
             'top_pick': self.top_pick,
             'industry_view': self.industry_view,
             'valuation': self.valuation,
+            'excluded': self.excluded,
             'benchmark_price': self.benchmark_price,
             'review_done': bool(self.review_done),
             'created_at': self.created_at,
@@ -1072,6 +1080,7 @@ class IndustryReview(Base):
     rank_effective = Column(String(10))  # 排名区分度：有效/无区分/反向
     top_pick_rank = Column(String(20))  # 首选实际涨幅名次，如 "2/8"
     direction_verdict = Column(String(10))  # 行业方向：正确/错误/未验证
+    excluded_avg_return = Column(Float)  # 门槛剔除组等权收益 %（与 portfolio_return 对照验证门槛有效性）
     review_content = Column(Text)
     created_at = Column(DateTime, default=datetime.now, index=True)
 
@@ -1087,6 +1096,7 @@ class IndustryReview(Base):
             'rank_effective': self.rank_effective,
             'top_pick_rank': self.top_pick_rank,
             'direction_verdict': self.direction_verdict,
+            'excluded_avg_return': self.excluded_avg_return,
             'review_content': self.review_content,
             'created_at': self.created_at,
         }
@@ -1477,13 +1487,23 @@ class DatabaseManager:
                             logger.info("检测到 daily_forecast 旧表（单列 unique 约束），已删除待重建")
                             break
 
-                # industry_snapshot：旧表缺 valuation 列时补齐
+                # industry_snapshot：旧表缺列时补齐
                 if 'industry_snapshot' in table_names:
                     snap_cols = [c['name'] for c in inspector.get_columns('industry_snapshot')]
-                    if 'valuation' not in snap_cols:
-                        conn.execute(text('ALTER TABLE industry_snapshot ADD COLUMN valuation TEXT'))
+                    for col_name, col_desc in (('valuation', '行业估值指标 JSON'),
+                                               ('excluded', '门槛剔除公司 JSON')):
+                        if col_name not in snap_cols:
+                            conn.execute(text(f'ALTER TABLE industry_snapshot ADD COLUMN {col_name} TEXT'))
+                            conn.commit()
+                            logger.info(f"industry_snapshot 表补充 {col_name} 列（{col_desc}）")
+
+                # industry_review：旧表缺剔除组收益列时补齐（门槛有效性对账用）
+                if 'industry_review' in table_names:
+                    rev_cols = [c['name'] for c in inspector.get_columns('industry_review')]
+                    if 'excluded_avg_return' not in rev_cols:
+                        conn.execute(text('ALTER TABLE industry_review ADD COLUMN excluded_avg_return FLOAT'))
                         conn.commit()
-                        logger.info("industry_snapshot 表补充 valuation 列（行业估值指标 JSON）")
+                        logger.info("industry_review 表补充 excluded_avg_return 列（剔除组平均收益）")
 
                 # stock_balance_sheet：旧表缺应收/存货列时补齐（营运资本趋势用）
                 if 'stock_balance_sheet' in table_names:
@@ -1494,13 +1514,17 @@ class DatabaseManager:
                             conn.commit()
                             logger.info(f"stock_balance_sheet 表补充 {col_name} 列（营运资本趋势用）")
 
-                # analysis_snapshot：旧表缺列时补齐（trade_plan=条件触发；moat/flywheel=定性延续）
+                # analysis_snapshot：旧表缺列时补齐（trade_plan=条件触发；moat/flywheel=定性延续；
+                # fundamental_*=基本面前瞻对账闭环）
                 if 'analysis_snapshot' in table_names:
                     asnap_cols = [c['name'] for c in inspector.get_columns('analysis_snapshot')]
                     for col_name, col_type, col_desc in (
                             ('trade_plan', 'TEXT', '程序操作参考 JSON'),
                             ('moat_view', 'VARCHAR(100)', '护城河评级'),
-                            ('flywheel_view', 'VARCHAR(100)', '飞轮判断')):
+                            ('flywheel_view', 'VARCHAR(100)', '飞轮判断'),
+                            ('fundamental_outlook', 'TEXT', '基本面前瞻 JSON'),
+                            ('fundamental_verdict', 'VARCHAR(10)', '前瞻对账结果'),
+                            ('fundamental_note', 'VARCHAR(300)', '前瞻对账依据')):
                         if col_name not in asnap_cols:
                             conn.execute(text(f'ALTER TABLE analysis_snapshot ADD COLUMN {col_name} {col_type}'))
                             conn.commit()
@@ -4261,6 +4285,53 @@ class DatabaseManager:
             except Exception:
                 session.rollback()
                 raise
+
+    def get_snapshots_pending_fundamental_check(self, max_age_days: int = 180) -> List[Dict[str, Any]]:
+        """有基本面前瞻但尚未对账的快照（太老的不再追，前瞻只针对下一期财报）"""
+        with self.get_session() as session:
+            cutoff = datetime.now() - timedelta(days=max_age_days)
+            results = session.execute(
+                select(AnalysisSnapshot).where(
+                    and_(AnalysisSnapshot.fundamental_outlook.isnot(None),
+                         AnalysisSnapshot.fundamental_verdict.is_(None),
+                         AnalysisSnapshot.created_at >= cutoff)
+                ).order_by(AnalysisSnapshot.created_at)
+            ).scalars().all()
+            return [s.to_dict() for s in results]
+
+    def set_snapshot_fundamental_verdict(self, snapshot_id: int, verdict: str, note: str = None) -> bool:
+        """写入基本面前瞻对账结果"""
+        with self.get_session() as session:
+            try:
+                record = session.execute(
+                    select(AnalysisSnapshot).where(AnalysisSnapshot.id == snapshot_id)
+                ).scalar_one_or_none()
+                if record is None:
+                    return False
+                record.fundamental_verdict = (verdict or '')[:10]
+                record.fundamental_note = (note or '')[:300]
+                session.commit()
+                return True
+            except Exception:
+                session.rollback()
+                raise
+
+    def get_fundamental_accuracy(self, recent_n: int = 50) -> Dict[str, Any]:
+        """基本面前瞻成绩单：最近 N 条已对账前瞻的命中率"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(AnalysisSnapshot.fundamental_verdict).where(
+                    AnalysisSnapshot.fundamental_verdict.isnot(None)
+                ).order_by(AnalysisSnapshot.created_at.desc()).limit(recent_n)
+            ).scalars().all()
+            judged = [v for v in results if v in ('正确', '错误')]
+            correct = sum(1 for v in judged if v == '正确')
+            return {
+                "total": len(results),
+                "judged": len(judged),
+                "correct": correct,
+                "accuracy": round(correct / len(judged) * 100, 1) if judged else None,
+            }
 
     def get_snapshots_due_review(self, after_days: int = 5) -> List[Dict[str, Any]]:
         """获取到期待复盘的快照（创建超过 after_days 个自然日且未复盘）"""

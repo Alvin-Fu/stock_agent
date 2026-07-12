@@ -146,7 +146,11 @@ def collect_industry_valuation(codes: List[str]) -> Optional[Dict[str, Any]]:
 
         per_stock.append(row)
 
-    return compute_industry_metrics(per_stock)
+    metrics = compute_industry_metrics(per_stock)
+    from tools.source_health import report_source
+    report_source("行业估值样本", metrics is not None,
+                  f"有效样本不足（{len(per_stock)}只入样）" if metrics is None else "")
+    return metrics
 
 
 def _moneyflow_net20(code: str) -> Optional[float]:

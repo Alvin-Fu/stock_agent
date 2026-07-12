@@ -119,6 +119,11 @@ class TechnicalAgent:
         ]:
             logger.info(f"  {code} 获取{label}数据...")
             data = self._call_tool(tool_name, code)
+            try:
+                from tools.source_health import report_source
+                report_source(f"K线{label}", not data.startswith(("❌", "获取失败")), code)
+            except Exception:
+                pass
             truncated = data[:3000] if len(data) > 3000 else data
             parts.append(f"=== {label} ===\n{truncated}")
         return "\n\n".join(parts)

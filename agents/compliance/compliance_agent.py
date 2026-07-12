@@ -133,14 +133,24 @@ class ComplianceAgent:
         if style_hits:
             quality_issues.append("文风禁用词：" + "、".join(f"「{p}」×{n}" for p, n in style_hits))
 
-        # 有问题 → 一次 LLM 定点修复（只改问题处，其余逐字保留）；修复失败回退原文
+        # 有问题 → 一次 LLM 定点修复（只改问题处，其余逐字保留）；
+        # 修复后复检：问题数没有净减少（没修好或引入新问题）就弃用，回退原文
         revised = final_answer
         if quality_issues:
             logger.warning(f"[质量守门] 命中 {len(quality_issues)} 个问题: {quality_issues[:5]}")
             repaired = self._repair(final_answer, quality_issues)
             if repaired:
-                revised = repaired
-                logger.info("[质量守门] 定点修复完成")
+                recheck = run_quality_checks(repaired) + check_conclusion_skeleton(repaired, mode)
+                re_style = scan_banned_phrases(repaired)
+                if re_style:
+                    recheck.append("文风禁用词：" + "、".join(f"「{p}」×{n}" for p, n in re_style))
+                if len(recheck) < len(quality_issues):
+                    revised = repaired
+                    logger.info(f"[质量守门] 定点修复完成（{len(quality_issues)}→{len(recheck)} 个问题）"
+                                + (f"，仍残留: {recheck[:3]}" if recheck else ""))
+                else:
+                    logger.warning(f"[质量守门] 修复无净改善（{len(quality_issues)}→{len(recheck)}），"
+                                   "弃用修复结果保留原文")
 
         review_result = self._review(revised, reference_numbers)
         review_result["style_hits"] = style_hits
@@ -155,6 +165,15 @@ class ComplianceAgent:
             revised += "\n\n*🔧 " + "；".join(corrections[:3]) + "*"
         if review_result.get("risk_level") in ("high", "unknown") and other_issues:
             revised += f"\n\n*合规提示：{'；'.join(other_issues[:3])}*"
+
+        # 数据源健康摘要：程序化附加（不经 LLM），静默降级从此可见
+        try:
+            from tools.source_health import format_health
+            health = format_health()
+            if health:
+                revised += f"\n\n*{health}*"
+        except Exception:
+            pass
 
         logger.info(f"合规审查完成，通过: {review_result['passed']}，"
                     f"风险等级: {review_result.get('risk_level')}，问题数: {len(review_result.get('issues', []))}")

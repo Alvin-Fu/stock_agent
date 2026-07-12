@@ -27,6 +27,12 @@ class WorkflowExecutor:
     def _init_state(self, question: str, **kwargs) -> AgentState:
         """初始化状态（入口统一清洗非法 Unicode，防 surrogates not allowed）"""
         question = sanitize_text(question)
+        # 数据源健康采集器清零：本次分析各信源的成败由 compliance 末尾汇总上屏
+        try:
+            from tools.source_health import reset_health
+            reset_health()
+        except Exception:
+            pass
         return {
             "messages": [HumanMessage(content=question)],
             "question": question,
@@ -93,7 +99,8 @@ class WorkflowExecutor:
                         full_report = f"{snap_answer}\n\n{research[-3000:]}\n\n{technical[-2000:]}"
                         snapshot_industry_analysis_async(
                             snap_industry, question, full_report, codes,
-                            valuation=research_result.get("industry_valuation"))
+                            valuation=research_result.get("industry_valuation"),
+                            excluded_codes=research_result.get("gate_excluded_codes"))
             except Exception as e:
                 logger.warning(f"分析快照留档触发失败（不影响本次回答）: {e}")
 

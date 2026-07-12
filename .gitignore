@@ -36,6 +36,7 @@ venv/
 ENV/
 env/
 .venv/
+python_stock_env/
 
 # IDE
 .idea/

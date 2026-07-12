@@ -652,6 +652,7 @@ class ResearcherAgent:
 
     def _do_search(self, queries: List[str]) -> Dict[str, str]:
         results = {}
+        fail = 0
         for q in queries:
             try:
                 logger.info(f"搜索: {q[:50]}...")
@@ -659,6 +660,13 @@ class ResearcherAgent:
             except Exception as e:
                 logger.error(f"搜索失败 [{q}]: {e}")
                 results[q] = f"搜索失败: {e}"
+                fail += 1
+        try:
+            from tools.source_health import report_source
+            report_source("网页搜索", fail == 0,
+                          f"{fail}/{len(queries)} 条查询失败" if fail else "")
+        except Exception:
+            pass
         return results
 
     def _search_text(self, results: Dict[str, str]) -> str:
@@ -1007,7 +1015,9 @@ class ResearcherAgent:
             "research_result": {"summary": summary, "sources": all_queries,
                                 "industry_valuation": industry_valuation,
                                 "industry_index": industry_index,
-                                "industry_stage": stage},
+                                "industry_stage": stage,
+                                # 门槛剔除组：留档后与进池组对照，用事后收益验证门槛有效性
+                                "gate_excluded_codes": [it["code"] for it in gate_excluded]},
             "chain_leaders": chain,
             "stock_code": ",".join(verified_codes) if verified_codes else "",
             "intermediate_steps": [("researcher", {"mode": "chain", "industry": industry_name, "segments": sum(len(chain.get(k,[])) for k in ["upstream","midstream","downstream","niche_innovators"]), "candidates": len(verified_codes), "queries": len(all_queries)})],

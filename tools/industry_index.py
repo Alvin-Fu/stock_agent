@@ -84,10 +84,14 @@ def fetch_industry_index_metrics(industry: str) -> Optional[Dict]:
             if metrics:
                 metrics.update(board=board, kind=kind)
                 logger.info(f"[行业指数] {industry} → {kind}板块「{board}」: {metrics}")
+                from tools.source_health import report_source
+                report_source("行业指数", True)
                 return metrics
         except Exception as e:
             logger.warning(f"[行业指数] {kind}板块获取失败（{industry}）: {e}")
     logger.info(f"[行业指数] 未匹配到「{industry}」对应的板块指数")
+    from tools.source_health import report_source
+    report_source("行业指数", False, "未匹配到对应板块")
     return None
 
 
