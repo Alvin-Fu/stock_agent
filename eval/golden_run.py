@@ -56,12 +56,35 @@ def lint_report(text: str, mode: str) -> list:
     return issues
 
 
-def main() -> None:
-    only = sys.argv[1] if len(sys.argv) > 1 else None
+def health_flags(text: str, mode: str) -> list:
+    """数据成色检查：0 个 lint 问题≠好报告——白酒曾在搜索全挂时产出"干净"的贫血报告。
+    解析报告尾部的【数据源健康】行与产业链候选数，标记降级运行（降级≠质量问题，
+    但降级跑不能当质量基准，也不能拿来跟健康跑对比回归）"""
+    flags = []
+    m = re.search(r"【数据源健康】(.+)", text)
+    if not m:
+        flags.append("报告缺少数据源健康行")
+    else:
+        line = m.group(1)
+        n_fail, n_partial = line.count("✗"), line.count("△")
+        if n_fail:
+            flags.append(f"{n_fail}个信源完全失败")
+        if n_partial:
+            flags.append(f"{n_partial}个信源部分失败")
+    if mode == "industry":
+        m2 = re.search(r"共筛出\s*(\d+)\s*家", text)
+        if m2 and int(m2.group(1)) < 5:
+            flags.append(f"候选池仅{m2.group(1)}家（<5，疑似候选发现降级）")
+    return flags
+
+
+def run(only: str = None) -> str:
+    """跑 golden 回归，返回 summary markdown 文本（scheduler 周任务直接推飞书）"""
+    from utils.config import ensure_runtime_config
+    ensure_runtime_config()  # 缺 key 立即报错，别空跑 5 个 case
     cases = [c for c in CASES if not only or c["id"] == only]
     if not cases:
-        print(f"未找到 case: {only}；可选：{[c['id'] for c in CASES]}")
-        return
+        return f"未找到 case: {only}；可选：{[c['id'] for c in CASES]}"
 
     runs_dir = Path(__file__).parent / "runs"
     prev = sorted(runs_dir.glob("*/summary.tsv"))  # 上一次基线
@@ -82,35 +105,49 @@ def main() -> None:
             answer = f"运行失败: {e}"
         elapsed = round(time.time() - t0)
         issues = lint_report(answer, case["mode"])
+        flags = health_flags(answer, case["mode"])
         (out_dir / f"{case['id']}.md").write_text(
             f"<!-- question: {case['question']} | 用时{elapsed}s | 问题数{len(issues)} -->\n\n"
-            + answer + "\n\n## LINT\n" + "\n".join(f"- {i}" for i in issues),
+            + answer + "\n\n## LINT\n" + "\n".join(f"- {i}" for i in issues)
+            + ("\n\n## 数据成色\n" + "\n".join(f"- {f}" for f in flags) if flags else ""),
             encoding="utf-8")
-        rows.append((case["id"], len(issues), len(answer), elapsed))
-        print(f"  {len(issues)} 个问题，{len(answer)} 字符，{elapsed}s")
+        rows.append((case["id"], len(issues), len(answer), elapsed, "；".join(flags)))
+        print(f"  {len(issues)} 个问题，{len(answer)} 字符，{elapsed}s"
+              + (f"，数据成色：{'；'.join(flags)}" if flags else ""))
         for i in issues[:8]:
             print(f"  - {i}")
 
-    # 摘要 + 与上次基线对比
-    tsv = "\n".join(f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}" for r in rows)
-    (out_dir / "summary.tsv").write_text("case\tissues\tchars\tseconds\n" + tsv, encoding="utf-8")
+    # 摘要 + 与上次基线对比（降级跑的对比结果只供参考，不定基线）
+    tsv = "\n".join(f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}\t{r[4]}" for r in rows)
+    (out_dir / "summary.tsv").write_text("case\tissues\tchars\tseconds\tdegraded\n" + tsv + "\n",
+                                         encoding="utf-8")
 
-    summary = [f"# Golden 回归 {out_dir.name}", "", "| case | 问题数 | 字符数 | 用时s | 对比上次 |",
-               "|---|---|---|---|---|"]
+    summary = [f"# Golden 回归 {out_dir.name}", "",
+               "| case | 问题数 | 字符数 | 用时s | 数据成色 | 对比上次 |",
+               "|---|---|---|---|---|---|"]
     prev_map = {}
     if prev:
         for line in prev[-1].read_text(encoding="utf-8").splitlines()[1:]:
             parts = line.split("\t")
-            if len(parts) >= 2:
+            if len(parts) >= 2 and parts[1].isdigit():
                 prev_map[parts[0]] = int(parts[1])
-    for cid, n_issues, chars, secs in rows:
+    for cid, n_issues, chars, secs, degraded in rows:
         base = prev_map.get(cid)
         diff = "首跑" if base is None else (f"{n_issues - base:+d}" if n_issues != base else "持平")
         flag = " ⚠️回归" if base is not None and n_issues > base else ""
-        summary.append(f"| {cid} | {n_issues} | {chars} | {secs} | {diff}{flag} |")
-    (out_dir / "summary.md").write_text("\n".join(summary), encoding="utf-8")
-    print("\n" + "\n".join(summary))
+        grade = f"⚠️{degraded}" if degraded else "健康"
+        summary.append(f"| {cid} | {n_issues} | {chars} | {secs} | {grade} | {diff}{flag} |")
+    if any(r[4] for r in rows):
+        summary += ["", "⚠️ 存在数据降级的 case：其结果不作为质量基准，回归对比仅供参考。"]
+    text = "\n".join(summary)
+    (out_dir / "summary.md").write_text(text, encoding="utf-8")
+    print("\n" + text)
     print(f"\n产出目录：{out_dir}")
+    return text + f"\n\n产出目录：{out_dir}"
+
+
+def main() -> None:
+    run(sys.argv[1] if len(sys.argv) > 1 else None)
 
 
 if __name__ == "__main__":

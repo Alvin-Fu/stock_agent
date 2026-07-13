@@ -174,6 +174,11 @@ class LLMFactory:
             api_key=api_key,
             base_url=deepseek_conf["url"],
             verbose=False,
+            # 超时与重试必须显式配置：默认无超时曾让一次半死连接挂住 2 小时13分
+            # （2026-07-13 golden run，compliance 修复调用 01:16→03:30 才 Connection error）。
+            # 单次请求最长 5 分钟 + 自动重试 2 次，最坏 ~15 分钟必然返回
+            timeout=kwargs.pop("timeout", 300),
+            max_retries=kwargs.pop("max_retries", 2),
         )
         return ds
 

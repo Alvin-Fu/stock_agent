@@ -23,6 +23,7 @@ langchain-tavily>=0.1
 chromadb>=0.5
 sentence-transformers>=2.5   # reranker（CrossEncoder），未开启 use_reranker 时可不装
 duckduckgo-search>=6.0       # DuckDuckGo 搜索（未配 Tavily key 时的兜底）
+ddgs>=1.0                    # 新版 langchain DuckDuckGoSearchRun 的实际后端（Tavily 配额耗尽兜底）
 
 # 数据库
 sqlalchemy>=2.0,<3

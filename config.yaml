@@ -86,10 +86,14 @@ tools:
 database:
   sqlite_path: "./data/sqlite/stock.db"
 
-# 联网搜索（填了 tavily_api_key 用 Tavily，否则用 DuckDuckGo；
-# 结构化信源——东财新闻/巨潮公告/财联社快讯——走 akshare 免 key，自动启用）
+# 联网搜索：多引擎链 Tavily → Brave → DuckDuckGo，前者失败自动落到后者
+# - tavily_api_key：主引擎质量最好；配额耗尽/鉴权失败时本进程内自动跳过
+# - brave_api_key：备用引擎（https://api-dashboard.search.brave.com 注册，免费档每月 2000 次）
+# - DuckDuckGo：无 key 保底，质量一般且有限流
+# 结构化信源——东财新闻/巨潮公告/财联社快讯/板块成分股——走 akshare 免 key，自动启用
 search:
   tavily_api_key: ""
+  brave_api_key: ""
 
 # 飞书机器人（python feishu_bot.py 启动；长连接模式，无需公网地址）
 feishu:
@@ -109,3 +113,6 @@ monitor:
   review_after_days: 5           # 个股分析满 N 个自然日后自动复盘
   industry_review_after_days: 10 # 产业链分析满 N 个自然日后自动复盘（产业逻辑兑现较慢）
   review_time: "15:40"           # 自动复盘时间（交易日盘后）
+  golden_enabled: true           # 每周自动跑 golden 回归（改动裸奔检测），完成后推飞书摘要
+  golden_day: "saturday"         # 周几跑（周末跑：不占交易日 LLM 配额，跑几小时也不碍事）
+  golden_time: "09:00"

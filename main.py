@@ -8,9 +8,11 @@
 import traceback
 
 from orchestration.workflow import WorkflowExecutor
+from utils.config import ensure_runtime_config
 from utils.logger import logger
 
 if __name__ == "__main__":
+    ensure_runtime_config()  # 关键配置缺失时启动即报错，不等跑到 LLM 调用才炸
     logger.info("🚀 启动多 Agent 智能分析系统...")
     executor = WorkflowExecutor(enable_memory=True)
     logger.info("✅ 工作流加载完成")

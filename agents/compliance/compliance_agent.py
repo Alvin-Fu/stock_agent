@@ -75,6 +75,11 @@ def run_quality_checks(text: str) -> list:
         issues.append("出现'若选择介入……仓位0成'自相矛盾句式，"
                       "应改写为'程序判定不介入（附原因），回踩观察位XX再重估'")
 
+    # 5) 占位符数字：搜索没给具体数就写"X亿元订单"是幻觉式凑数（实测出现过）
+    for m in re.finditer(r"[XN]{1,2}\s*(?:亿|万|%|元)", text):
+        snippet = text[max(0, m.start() - 12):min(len(text), m.end() + 8)].replace("\n", " ")
+        issues.append(f"出现占位符数字（应改写为'金额/数值未披露'）：「…{snippet}…」")
+
     return issues
 
 

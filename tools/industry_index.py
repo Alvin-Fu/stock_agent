@@ -46,10 +46,21 @@ def _compute_metrics(closes) -> Optional[Dict]:
     return {"ret5": _ret(5), "ret20": _ret(20), "ret60": _ret(60), "pos_52w": pos}
 
 
+def _closes_from_hist(hist) -> Optional[list]:
+    """从行情表提取收盘序列（东财列名「收盘」，同花顺「收盘价」）"""
+    if hist is None or getattr(hist, "empty", True):
+        return None
+    col = next((c for c in ("收盘", "收盘价", "close") if c in hist.columns), None)
+    if not col:
+        return None
+    return pd.to_numeric(hist[col], errors="coerce").dropna().tolist()
+
+
 def fetch_industry_index_metrics(industry: str) -> Optional[Dict]:
     """
-    取行业对应的东财板块指数表现。返回
-    {"board": 板块名, "kind": 概念/行业, "ret5", "ret20", "ret60", "pos_52w"}；失败返回 None。
+    取行业对应的板块指数表现：东财概念/行业板块优先，同花顺兜底
+    （东财 push2 行情域名在部分网络被按 SNI 掐断，曾致健康行常年"行业指数✗"）。
+    返回 {"board": 板块名, "kind": 来源+概念/行业, "ret5", "ret20", "ret60", "pos_52w"}；失败返回 None。
     """
     try:
         import akshare as ak
@@ -60,27 +71,30 @@ def fetch_industry_index_metrics(industry: str) -> Optional[Dict]:
     start = (date.today() - timedelta(days=400)).strftime("%Y%m%d")
     end = date.today().strftime("%Y%m%d")
     sources = (
-        ("概念", getattr(ak, "stock_board_concept_name_em", None),
-         getattr(ak, "stock_board_concept_hist_em", None)),
-        ("行业", getattr(ak, "stock_board_industry_name_em", None),
-         getattr(ak, "stock_board_industry_hist_em", None)),
+        ("东财概念", "stock_board_concept_name_em", "stock_board_concept_hist_em",
+         "板块名称", {"period": "daily", "adjust": ""}),
+        ("东财行业", "stock_board_industry_name_em", "stock_board_industry_hist_em",
+         "板块名称", {"period": "daily", "adjust": ""}),
+        ("同花顺行业", "stock_board_industry_name_ths", "stock_board_industry_index_ths",
+         "name", {}),
+        ("同花顺概念", "stock_board_concept_name_ths", "stock_board_concept_index_ths",
+         "name", {}),
     )
-    for kind, fetch_names, fetch_hist in sources:
+    for kind, names_fname, hist_fname, name_col, hist_kwargs in sources:
+        fetch_names = getattr(ak, names_fname, None)
+        fetch_hist = getattr(ak, hist_fname, None)
         if fetch_names is None or fetch_hist is None:
             continue
         try:
             names_df = fetch_names()
-            if names_df is None or names_df.empty or "板块名称" not in names_df.columns:
+            if names_df is None or names_df.empty or name_col not in names_df.columns:
                 continue
-            board = _match_board_name(names_df["板块名称"].tolist(), industry)
+            board = _match_board_name(names_df[name_col].tolist(), industry)
             if not board:
                 continue
-            hist = fetch_hist(symbol=board, period="daily",
-                              start_date=start, end_date=end, adjust="")
-            if hist is None or hist.empty or "收盘" not in hist.columns:
-                continue
-            closes = pd.to_numeric(hist["收盘"], errors="coerce").dropna().tolist()
-            metrics = _compute_metrics(closes)
+            hist = fetch_hist(symbol=board, start_date=start, end_date=end, **hist_kwargs)
+            closes = _closes_from_hist(hist)
+            metrics = _compute_metrics(closes) if closes else None
             if metrics:
                 metrics.update(board=board, kind=kind)
                 logger.info(f"[行业指数] {industry} → {kind}板块「{board}」: {metrics}")
@@ -89,7 +103,7 @@ def fetch_industry_index_metrics(industry: str) -> Optional[Dict]:
                 return metrics
         except Exception as e:
             logger.warning(f"[行业指数] {kind}板块获取失败（{industry}）: {e}")
-    logger.info(f"[行业指数] 未匹配到「{industry}」对应的板块指数")
+    logger.info(f"[行业指数] 各来源均未匹配到「{industry}」对应的板块指数")
     from tools.source_health import report_source
     report_source("行业指数", False, "未匹配到对应板块")
     return None
@@ -103,7 +117,7 @@ def format_industry_index(metrics: Optional[Dict]) -> str:
     def _pct(v):
         return f"{v:+.1f}%" if v is not None else "-"
 
-    lines = [f"【行业指数表现（东财{metrics['kind']}板块「{metrics['board']}」，程序计算）】",
+    lines = [f"【行业指数表现（{metrics['kind']}板块「{metrics['board']}」，程序计算）】",
              f"  近5日 {_pct(metrics.get('ret5'))}｜近20日 {_pct(metrics.get('ret20'))}"
              f"｜近60日 {_pct(metrics.get('ret60'))}"
              + (f"｜近一年位置 {metrics['pos_52w']}%（0=最低,100=最高）"

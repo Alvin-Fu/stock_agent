@@ -1,0 +1,6 @@
+case	issues	chars	seconds	degraded
+byd-full	0	3323	619	1个信源完全失败
+moutai-fund	0	2711	158	2个信源完全失败
+catl-tech	2	2381	119	
+aerospace-chain	4	5435	1212	
+liquor-chain	0	3268	1509	1个信源完全失败；1个信源部分失败；候选池仅3家（<5，疑似候选发现降级）

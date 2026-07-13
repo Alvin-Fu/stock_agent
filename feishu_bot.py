@@ -394,4 +394,6 @@ class FeishuBot:
 
 
 if __name__ == "__main__":
+    from utils.config import ensure_runtime_config
+    ensure_runtime_config()  # 关键配置缺失时启动即报错，不等跑到 LLM 调用才炸
     FeishuBot().start()

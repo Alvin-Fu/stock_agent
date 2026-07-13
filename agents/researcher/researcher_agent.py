@@ -167,8 +167,9 @@ def format_ranking_table(ranked: List[Dict[str, Any]], name_of=None) -> str:
         extra = []
         if item.get("composite_adj") is not None:
             pct = item.get("pe_percentile")
+            # 窗口必须在源头带上：下游 LLM 只会照抄，这里不写"近3年"，报告里就是裸分位
             extra.append(f"调整后{item['composite_adj']}"
-                         + (f"（PE分位{pct}%，{item.get('valuation_adj'):+g}）" if pct is not None else "（无估值分位）"))
+                         + (f"（PE近3年分位{pct}%，{item.get('valuation_adj'):+g}）" if pct is not None else "（无估值分位）"))
         if item.get("quadrant"):
             extra.append(item["quadrant"])
         if item.get("total_mv") is not None:
@@ -380,9 +381,17 @@ class ResearcherAgent:
         }
 
     def _search_leaders_for_chain(self, industry: str, chain: Dict[str, Any]) -> Dict[str, Any]:
-        """第二步：搜索每个产业链环节（含特精专新）的龙一龙二，并尝试从DB获取代码"""
+        """第二步：搜索每个产业链环节（含特精专新）的龙一龙二，并尝试从DB获取代码。
+        东财板块成分股作为权威候选池同时喂给抽取——搜索降级时候选发现不再塌缩"""
         today = date.today()
         recent_period = f"{today.year}年{today.month}月"
+
+        constituents_text = ""
+        try:
+            from tools.board_constituents import fetch_board_constituents, format_board_constituents
+            constituents_text = format_board_constituents(fetch_board_constituents(industry))
+        except Exception as e:
+            logger.warning(f"板块成分股拉取失败（回退纯搜索发现）: {e}")
 
         all_leaders = {"upstream": [], "midstream": [], "downstream": [], "niche_innovators": []}
 
@@ -401,7 +410,7 @@ class ResearcherAgent:
                     logger.error(f"搜索细分领域龙头失败 [{seg_name}]: {e}")
                     result = ""
 
-                leaders = self._extract_leaders_from_text(str(result), seg_name, level)
+                leaders = self._extract_leaders_from_text(str(result), seg_name, level, constituents_text)
 
                 # 保底重试：首搜零候选时换一条更直白的查询再试一次，
                 # 避免整个环节（乃至整层中游/下游）静默为空、候选池塌缩
@@ -410,7 +419,7 @@ class ResearcherAgent:
                     logger.info(f"[{level}/{seg_name}] 首搜零候选，重试: {retry_query[:50]}...")
                     try:
                         retry_result = web_search.invoke({"query": retry_query})
-                        leaders = self._extract_leaders_from_text(str(retry_result), seg_name, level)
+                        leaders = self._extract_leaders_from_text(str(retry_result), seg_name, level, constituents_text)
                         if leaders:
                             result = retry_result
                     except Exception as e:
@@ -428,22 +437,35 @@ class ResearcherAgent:
 
         return all_leaders
 
-    def _extract_leaders_from_text(self, text: str, segment: str, level: str) -> List[Dict[str, Any]]:
-        """从搜索结果中提取该细分领域的主要上市公司（最多4家，按地位排序）"""
-        if not text or "搜索失败" in str(text):
+    def _extract_leaders_from_text(self, text: str, segment: str, level: str,
+                                   constituents_text: str = "") -> List[Dict[str, Any]]:
+        """从搜索结果+板块成分股清单中提取该细分领域的主要上市公司（最多4家，按地位排序）。
+        搜索失败但有成分股清单时仍可抽取——候选发现不再被搜索质量卡死"""
+        search_failed = not text or "搜索失败" in str(text)
+        if search_failed and not constituents_text:
             return []
+        search_block = "（本次搜索失败，仅依据下方板块成分股清单判断）" if search_failed else str(text)[:2500]
 
         # 用 LLM 提取。不只要龙一龙二：机会（弹性/低估）经常在二三线，收敛交给后面的评分，
         # 不在搜索抽取这一步就把候选面掐死
-        prompt = f"""从以下搜索结果中提取「{segment}」细分领域的主要A股上市公司，最多4家，
-按行业地位从高到低排序（龙头在前，二三线也要列入）。
+        cons_block = ""
+        if constituents_text:
+            cons_block = f"""
+{constituents_text[:2000]}
+（上方成分股清单是权威候选池：优先从中挑属于该细分领域的公司；搜索结果里提到、
+清单里没有的公司也可列入，但必须是搜索结果明确提到的，禁止凭印象补）
+"""
+
+        prompt = f"""从以下资料中提取「{segment}」细分领域的主要A股上市公司，最多4家，
+按行业地位从高到低排序（龙头在前，二三线也要列入）。只选主营业务确实属于该细分领域的公司。
 
 请输出JSON数组（不要markdown包裹）：
 [{{"name": "公司名", "code": "股票代码"}}, ...]
 
 如果没有找到或无法确定，返回空数组 []。
+{cons_block}
 搜索结果：
-{text[:2500]}"""
+{search_block}"""
 
         try:
             response = self.llm.invoke([HumanMessage(content=prompt)])
@@ -570,7 +592,9 @@ class ResearcherAgent:
 - momentum 锚点举例：单季营收/订单同比+50%且已兑现=8；毛利率环比回升+新客户开始量产=7；
   仅增速企稳无新增量=5~6；增速下滑=3~4
 - reeval_triggers：1-4 条"若发生XX则值得重新评估该行业"的具体条件（如"某公司砷化镓电池收入占比超20%"
-  "可回收火箭完成商业化首飞"），必须可被公开新闻验证，程序会自动盯梢；没有就给空数组
+  "可回收火箭完成商业化首飞"），必须可被公开新闻验证，程序会自动盯梢；没有就给空数组。
+  **必须是尚未发生的前瞻事件**——已发生的大事写进「行业近况与重大事件」，
+  禁止登记为触发条件（已发生事件落库后监控第一轮扫描就会全部误报命中）
 
 ## 一、产业链公司全景筛选
 - 用表格列出产业链上中下游 + 特精专新共筛选出的所有公司
@@ -656,7 +680,12 @@ class ResearcherAgent:
         for q in queries:
             try:
                 logger.info(f"搜索: {q[:50]}...")
-                results[q] = web_search.invoke({"query": q})
+                r = web_search.invoke({"query": q})
+                results[q] = r
+                # 工具内部兜底失败时返回"搜索失败:"前缀字符串（不抛异常），同样计入失败——
+                # 否则配额耗尽时健康摘要显示"网页搜索✓"的假健康
+                if isinstance(r, str) and r.startswith("搜索失败"):
+                    fail += 1
             except Exception as e:
                 logger.error(f"搜索失败 [{q}]: {e}")
                 results[q] = f"搜索失败: {e}"

@@ -40,6 +40,10 @@ class MonitorScheduler:
         self.review_after_days = int(cfg.get("review_after_days", 5))
         self.industry_review_after_days = int(cfg.get("industry_review_after_days", 10))
         self.review_time = str(cfg.get("review_time", "15:40"))
+        self.golden_enabled = bool(cfg.get("golden_enabled", True))
+        self.golden_day = str(cfg.get("golden_day", "saturday")).lower()
+        self.golden_time = str(cfg.get("golden_time", "09:00"))
+        self._golden_running = False
 
         self._running = False
         self._thread = None
@@ -77,6 +81,28 @@ class MonitorScheduler:
             self.review_runner.run_due_reviews(self.review_after_days, self.industry_review_after_days)
         except Exception as e:
             logger.error(f"[复盘] 定时复盘异常: {e}")
+
+    def _run_golden(self):
+        """周度 golden 回归：改 prompt/规则后的裸奔检测例行化。
+        跑一轮要几小时且不能阻塞调度循环 → 独立线程；防重入"""
+        if self._golden_running:
+            logger.warning("[Golden] 上一轮回归尚未结束，本次跳过")
+            return
+
+        def job():
+            self._golden_running = True
+            try:
+                logger.info("[Golden] 周度回归开始（预计数十分钟到数小时）")
+                from eval.golden_run import run as golden_run
+                summary = golden_run()
+                self.notifier.send("【Golden 周回归】\n" + summary[:3500])
+            except Exception as e:
+                logger.error(f"[Golden] 周度回归失败: {e}")
+                self.notifier.send(f"【Golden 周回归】运行失败: {e}")
+            finally:
+                self._golden_running = False
+
+        threading.Thread(target=job, name="golden-weekly", daemon=True).start()
 
     def _run_backup(self):
         """每日备份主库（快照/复盘/监控历史都在里面），保留最近 7 份"""
@@ -116,12 +142,19 @@ class MonitorScheduler:
         self._schedule.every(self.news_interval).minutes.do(self._run_news_scan)
         self._schedule.every().day.at(self.review_time).do(self._run_reviews)
         self._schedule.every().day.at("22:30").do(self._run_backup)
+        if self.golden_enabled:
+            day_job = getattr(self._schedule.every(), self.golden_day, None)
+            if day_job is None:
+                logger.warning(f"[Golden] golden_day 配置无效（{self.golden_day}），回退 saturday")
+                day_job = self._schedule.every().saturday
+            day_job.at(self.golden_time).do(self._run_golden)
 
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="monitor-scheduler", daemon=True)
         self._thread.start()
         logger.info(f"[监控] 调度已启动：盘后信号 {self.signal_scan_time}，新闻每 {self.news_interval} 分钟，"
-                    f"复盘 {self.review_time}（分析满 {self.review_after_days} 天）")
+                    f"复盘 {self.review_time}（分析满 {self.review_after_days} 天）"
+                    + (f"，golden 回归每周 {self.golden_day} {self.golden_time}" if self.golden_enabled else ""))
 
     def _loop(self):
         while self._running:

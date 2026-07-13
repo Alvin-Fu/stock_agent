@@ -119,6 +119,24 @@ def get_search_config() -> Dict[str, Any]:
     config = load_config()
     return config.get("search", {})
 
+def ensure_runtime_config() -> None:
+    """
+    启动即校验关键配置，缺什么当场报清楚——曾因 local.yaml 缺失静默回退到
+    密钥全空的 config.yaml，一路跑到 LLM 调用才炸，浪费整段链路还不好定位。
+    各入口（main/feishu_bot/golden_run）启动时调用；缺关键项抛 RuntimeError。
+    """
+    cfg = load_config() or {}
+    problems = []
+    ds_key = (((cfg.get("models") or {}).get("deepseek") or {}).get("api_key") or "").strip()
+    if not ds_key:
+        problems.append("models.deepseek.api_key 为空（LLM 无法调用，分析链路必挂）")
+    if problems:
+        hint = f"当前生效配置: {CONFIG_PATH}"
+        if CONFIG_PATH == _DEFAULT_CONFIG:
+            hint += "（未发现 local.yaml——个人密钥应放项目根目录 local.yaml，结构参照 config.yaml）"
+        raise RuntimeError("配置检查未通过：\n- " + "\n- ".join(problems) + "\n" + hint)
+
+
 def get_retriever_config() -> Dict[str, Any]:
     """获取检索配置"""
     config = load_config()
