@@ -80,6 +80,12 @@ def run_quality_checks(text: str) -> list:
         snippet = text[max(0, m.start() - 12):min(len(text), m.end() + 8)].replace("\n", " ")
         issues.append(f"出现占位符数字（应改写为'金额/数值未披露'）：「…{snippet}…」")
 
+    # 6) 技术指标名笔误（LLM 手滑高频款，实测出过"JDJ值106.30"）。
+    #    注意 \b 对中文邻字不成立（CJK 也算 \w），用显式字母边界
+    for wrong, right in (("JDJ", "KDJ"), ("MCAD", "MACD")):
+        if re.search(rf"(?<![A-Za-z]){wrong}(?![A-Za-z])", text):
+            issues.append(f"技术指标名笔误：「{wrong}」应为「{right}」")
+
     return issues
 
 
@@ -161,9 +167,22 @@ class ComplianceAgent:
         all_issues = review_result.get("issues") or []
         corrections = [str(i) for i in all_issues if str(i).startswith("数字勘误")]
         other_issues = [str(i) for i in all_issues if not str(i).startswith("数字勘误")]
-        # 数字勘误无条件上屏：报错的数字比缺免责声明危险得多
+        # 数字勘误优先定点替换正文错误数字——曾把勘误贴在尾部而正文错数原样保留，
+        # 读者在正文读到-446.99亿、翻到最后才发现被推翻。替换后复审确认无残留勘误
+        # 才采纳；替换失败/复审仍有勘误则降级为尾部注记（错数上屏总比静默好）
         if corrections:
-            revised += "\n\n*🔧 " + "；".join(corrections[:3]) + "*"
+            adopted = False
+            fixed = self._repair(revised, corrections)
+            if fixed:
+                still = [str(i) for i in (self._review(fixed, reference_numbers).get("issues") or [])
+                         if str(i).startswith("数字勘误")]
+                if not still:
+                    revised = fixed
+                    adopted = True
+                    logger.info(f"[合规] 数字勘误已定点替换正文（{len(corrections)}处），复审通过")
+            if not adopted:
+                revised += "\n\n*🔧 " + "；".join(corrections[:3]) + "（正文对应数字以此勘误为准）*"
+                logger.warning("[合规] 数字勘误定点替换未通过复审，降级为尾部注记")
         if review_result.get("risk_level") in ("high", "unknown") and other_issues:
             revised += f"\n\n*合规提示：{'；'.join(other_issues[:3])}*"
 
@@ -201,6 +220,9 @@ class ComplianceAgent:
 - 来源表述不在枚举内的：改成五种允许表述中最贴切的一种
 - 自相矛盾句式：按问题描述改写
 - 文风禁用词：改写为有数字支撑的表述，或删掉该句
+- 数字勘误类：把正文中的错误数字（含结论、表格、推导说明里的同一个数）全部替换为
+  勘误给出的正确值，与该数字绑定的定性判断（如"同期最大负值"）不再成立时一并修正；
+  不得改动勘误未涉及的其他数字
 直接输出修复后的完整报告全文，不要解释，不要 markdown 代码块包裹。
 
 【问题清单】

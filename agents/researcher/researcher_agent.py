@@ -6,6 +6,7 @@
 注意：不负责技术面分析（日线/周线/MACD 等），技术面由 technical_agent 专责
 """
 
+import re
 import traceback
 from typing import Dict, Any, List, Optional
 from datetime import date, datetime, timedelta
@@ -183,10 +184,16 @@ def format_ranking_table(ranked: List[Dict[str, Any]], name_of=None) -> str:
     return "\n".join(lines)
 
 
+# 触发条件可判定性标记：数字阈值或明确事件词，至少占其一
+_DETERMINABLE_MARK = re.compile(
+    r"\d|转正|扭亏|落地|公告|公布|发布|披露|中标|获批|签订|首次|突破|新高|新低")
+
+
 def parse_company_triggers(summary: str) -> List[Dict[str, str]]:
     """
     从个股研究输出末尾抽取公司级重估触发条件 JSON（纯函数）。
-    返回 [{"trigger_type":"news","description":...,"keywords":...}]，最多4条；解析失败返回 []。
+    返回 [{"trigger_type":"news","description":...,"keywords":...}]，最多4条；
+    解析失败返回 []；缺方向阈值/事件词的不可判定条目被丢弃。
     """
     import json as _json
     import re as _re
@@ -201,6 +208,11 @@ def parse_company_triggers(summary: str) -> List[Dict[str, str]]:
                 continue
             desc = str(t.get("trigger") or "").strip()
             if not desc:
+                continue
+            # 可判定性校验：无数字阈值也无事件词的触发条件（如"毛利率环比变化"）
+            # 任何时候都"成立"，监控没法判定命中，直接丢弃
+            if not _DETERMINABLE_MARK.search(desc):
+                logger.warning(f"[个股触发] 丢弃不可判定的触发条件：「{desc}」（缺方向阈值/事件词）")
                 continue
             out.append({"trigger_type": "news", "description": desc,
                         "keywords": str(t.get("keywords") or "").strip()})
@@ -293,6 +305,12 @@ class ResearcherAgent:
      {{"company_triggers": [{{"trigger": "重估触发条件（可被公开新闻验证的具体事件）",
        "keywords": "盯梢关键词 空格分隔"}}, ...]}}
      取三情景中最关键的1-4条可验证触发条件（利多利空都要有）；没有就给 []
+   - 触发条件硬规则（违反的条目会被程序丢弃）：
+     ①必须是**尚未发生**的前瞻事件：已披露报告期的数据不得作为触发条件
+     （一季报已公布就写"中报/三季报净利润同比转正"，不能写"一季报转正"）；
+     ②必须可判定：含明确方向+数字阈值（"毛利率回升至25%以上""同比转正"）
+     或明确事件（"公告""正式落地""公布"），禁止"毛利率波动/环比变化"这类
+     没有方向阈值、任何时候都成立的写法
 
 【风险对称要求】
 - 每条高影响力利好必须检查并列出对应风险（如：出口高增→关税/反补贴调查风险；大客户订单→客户集中度风险）
@@ -675,9 +693,11 @@ class ResearcherAgent:
     # ========== 通用工具 ==========
 
     def _do_search(self, queries: List[str]) -> Dict[str, str]:
+        # 健康按"条"上报而非按"批"：整批只报一次时，5条查询全成功显示成裸"✓"，
+        # 读起来像只搜了1条（实际误导过排查）；按条上报后显示"✓5/5"
         results = {}
-        fail = 0
         for q in queries:
+            ok = True
             try:
                 logger.info(f"搜索: {q[:50]}...")
                 r = web_search.invoke({"query": q})
@@ -685,17 +705,16 @@ class ResearcherAgent:
                 # 工具内部兜底失败时返回"搜索失败:"前缀字符串（不抛异常），同样计入失败——
                 # 否则配额耗尽时健康摘要显示"网页搜索✓"的假健康
                 if isinstance(r, str) and r.startswith("搜索失败"):
-                    fail += 1
+                    ok = False
             except Exception as e:
                 logger.error(f"搜索失败 [{q}]: {e}")
                 results[q] = f"搜索失败: {e}"
-                fail += 1
-        try:
-            from tools.source_health import report_source
-            report_source("网页搜索", fail == 0,
-                          f"{fail}/{len(queries)} 条查询失败" if fail else "")
-        except Exception:
-            pass
+                ok = False
+            try:
+                from tools.source_health import report_source
+                report_source("网页搜索", ok, "" if ok else "部分查询失败")
+            except Exception:
+                pass
         return results
 
     def _search_text(self, results: Dict[str, str]) -> str:

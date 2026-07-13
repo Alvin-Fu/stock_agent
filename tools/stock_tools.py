@@ -1318,8 +1318,18 @@ def _format_cashflow_data(df: pd.DataFrame, stock_code: str) -> str:
     lines.append(f"  - 投资活动现金流净额: {to_yi(latest.get('investing_cashflow'))}")
     lines.append(f"  - 筹资活动现金流净额: {to_yi(latest.get('financing_cashflow'))}")
     lines.append(f"  - 资本开支（购建固定资产等支付现金）: {to_yi(latest.get('capex'))}")
-    if _num(latest.get('free_cashflow')) is not None:
-        lines.append(f"  - 自由现金流: {to_yi(latest.get('free_cashflow'))}")
+    # 自由现金流由程序计算（经营现金流-资本开支），LLM 只许引用——
+    # 实测让 LLM 心算 FCF 出过"-446.99亿"（正确值-202.51亿）这种错一倍的数字
+    cur_capex = _num(latest.get('capex'))
+    if cur_ocf is not None and cur_capex is not None:
+        fcf = cur_ocf - cur_capex
+        lines.append(f"  - 自由现金流（程序计算：经营{cur_ocf / 1e8:.2f}亿 - 资本开支{cur_capex / 1e8:.2f}亿）: "
+                     f"{fcf / 1e8:.2f}亿元")
+    elif _num(latest.get('free_cashflow')) is not None:
+        lines.append(f"  - 自由现金流（tushare 计算值）: {to_yi(latest.get('free_cashflow'))}")
+    lines.append("  （使用规则：自由现金流只能引用上方程序计算值并同时给出经营现金流与资本开支两个数；"
+                 "程序未给出时写'无法计算（缺资本开支数据）'，**禁止自行心算 FCF**，"
+                 "尤其禁止拿投资活动净额当资本开支）")
 
     lines.append("\n📊 最近4个报告期（均为累计口径）:")
     for _, row in df.head(4).iterrows():

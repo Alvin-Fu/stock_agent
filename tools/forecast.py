@@ -60,9 +60,17 @@ def forward_pe_lines(df, close: Optional[float]) -> List[str]:
             if ym and eps:
                 pairs.append((ym.group(0), eps))
 
-    for year, eps in sorted(set(pairs))[:3]:
+    pairs = sorted(set(pairs))[:3]
+    for year, eps in pairs:
         lines.append(f"  {year}年：预测EPS {eps:.2f}元 → forward PE {close / eps:.1f}倍"
                      f"（现价{close:.2f}÷{eps:.2f}，程序计算）")
+    # 预测增速也程序算：LLM 拿预测表自行推"3年净利润CAGR约9%"属于同一类心算病
+    if len(pairs) >= 2:
+        (y0, e0), (y1, e1) = pairs[0], pairs[-1]
+        span = int(y1) - int(y0)
+        if span > 0 and e0 > 0:
+            cagr = ((e1 / e0) ** (1 / span) - 1) * 100
+            lines.append(f"  预测EPS年均增速（{y0}→{y1}）：{cagr:+.1f}%/年（程序计算，机构预期口径）")
     return lines
 
 
@@ -105,8 +113,9 @@ def fetch_profit_forecast_text(code: str, name: str = "") -> str:
                          + "\n".join(fpe_lines))
 
         return ("【机构盈利预测（东财汇总，预测值仅供参考，不是事实）】\n" + text + fpe_block
-                + "\n（使用规则：forward PE 只能引用上方程序计算值，**禁止自行用预测表心算**"
-                  "forward PE 或净利润总额——尤其禁止 EPS×股本 反推净利润；"
+                + "\n（使用规则：forward PE 与预测增速只能引用上方程序计算值，**禁止自行用预测表心算**"
+                  "forward PE、净利润总额或增速/CAGR——尤其禁止 EPS×股本 反推净利润、"
+                  "禁止自行推算'N年净利润CAGR约X%'；"
                   "程序未给出 forward PE 时只说明有机构预测覆盖、不做换算；"
                   "预测与已披露实际数矛盾时以实际数为准）")
     except Exception as e:
