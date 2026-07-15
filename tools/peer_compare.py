@@ -40,7 +40,19 @@ def _load_market_spot() -> Dict[str, Dict]:
             return _SPOT_CACHE["map"]
         try:
             import akshare as ak
-            df = ak.stock_zh_a_spot_em()
+            # 东财全市场快照偶尔断连，加3次重试
+            last_err = None
+            for attempt in range(3):
+                try:
+                    df = ak.stock_zh_a_spot_em()
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < 2:
+                        time.sleep(1.5 * (attempt + 1))
+            if last_err is not None:
+                raise last_err
             m = {}
             for _, r in df.iterrows():
                 code = str(r.get("代码", "")).strip()

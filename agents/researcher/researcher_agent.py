@@ -47,30 +47,40 @@ def normalize_stage(stage) -> str:
 
 def apply_stage_gate(ranked: List[Dict[str, Any]], stage: str):
     """
-    阶段化硬门槛过滤（纯函数）：返回 (passed, excluded)。
-    门槛指标分项缺失（被中性5分顶替）也视为未达标——证据不足不入池。
+    阶段化硬门槛过滤（纯函数）：返回 (passed, watch, excluded)。
+    passed = 全部达标；watch = 距门槛差 ≤0.5 分，入观察备选池；
+    excluded = 距门槛差 >0.5 分，彻底剔除。
     passed 重新编排名。
     """
     stage = normalize_stage(stage)
     gates = STAGE_GATES[stage]
-    passed, excluded = [], []
+    passed, watch, excluded = [], [], []
     for item in ranked:
         missing = item.get("missing") or []
         fails = []
+        is_watch = True
         for metric, gate, label in gates:
             if metric in missing:
                 fails.append(f"{label}分项缺失（无证据）")
+                is_watch = False
             elif item.get(metric, 0) < gate:
-                fails.append(f"{label}{item.get(metric)}分未达{gate:g}分门槛")
+                gap = gate - item.get(metric, 0)
+                if gap > 0.5:
+                    is_watch = False
+                fails.append(f"{label}{item.get(metric)}分未达{gate:g}分门槛（差{gap:.1f}分）")
         if not fails:
             passed.append(dict(item))
+        elif is_watch:
+            ex = dict(item)
+            ex["exclude_reason"] = f"[{stage}] 观察备选：" + "；".join(fails)
+            watch.append(ex)
         else:
             ex = dict(item)
             ex["exclude_reason"] = f"[{stage}] " + "；".join(fails)
             excluded.append(ex)
     for i, it in enumerate(passed, 1):
         it["rank"] = i
-    return passed, excluded
+    return passed, watch, excluded
 
 
 def compute_composite_ranking(candidates: List[Dict[str, Any]], stage: str = DEFAULT_STAGE) -> List[Dict[str, Any]]:
@@ -227,6 +237,116 @@ class ResearcherAgent:
     def __init__(self):
         self.llm = get_agent_llm("researcher")
 
+    # ========== 结构化数据提取（通用） ==========
+
+    def _extract_structured_data_from_search(self, search_text: str, company_name: str = "",
+                                              industry: str = "") -> Dict[str, Any]:
+        """
+        从搜索结果中提取结构化数据（销量/出货量/营收/毛利率/产能/订单等），
+        作为结构化信源补充喂给主分析 LLM，减少 LLM 自己从大段文本找数字的幻觉风险。
+        返回: {"tables": [...], "figures": [...], "time_series": [...]}
+        """
+        if not search_text or len(search_text) < 100:
+            return {"tables": [], "figures": [], "time_series": []}
+
+        context = company_name or industry or "该公司"
+        prompt = f"""从以下搜索结果中，提取关于「{context}」的所有结构化经营数据。
+
+请按 JSON 格式输出（不要markdown包裹）：
+{{
+  "time_series": [
+    {{"metric": "指标名如'月销量'", "period": "2025-06", "value": 12345, "unit": "辆",
+      "note": "数据来源/口径说明"}},
+    ...
+  ],
+  "key_figures": [
+    {{"metric": "指标名", "value": "具体数值", "unit": "单位",
+      "note": "时间点/范围/来源"}},
+    ...
+  ]
+}}
+
+规则：
+- time_series：按月/按季度的时序数据，用于判断趋势。每条一条时间点。
+  如多个车型的销量，每个车型各一条。
+- key_figures：非时序的关键数字（如"产能利用率85%""市占率30%"）。
+- 只提取搜索结果中明确提到的数字，禁止用自己的知识补充。
+- 单位必须写明（万辆/亿元/吨/千瓦时等）。
+- note 要注明数据来源（如"公司公告""乘联会""懂车帝销量榜"）和口径。
+- 没找到结构化数据的返回 {{"time_series": [], "key_figures": []}}
+
+搜索结果：
+{search_text[:5000]}"""
+
+        try:
+            import json, re
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            raw = response.content if hasattr(response, 'content') else str(response)
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if match:
+                result = json.loads(match.group(0))
+                result.setdefault("time_series", [])
+                result.setdefault("key_figures", [])
+                logger.info(f"结构化数据提取: {len(result['time_series'])}条时序 + {len(result['key_figures'])}条关键数字")
+                return result
+        except Exception as e:
+            logger.debug(f"结构化数据提取失败（不影响主流程）: {e}")
+
+        return {"tables": [], "figures": [], "time_series": []}
+
+    def _format_structured_data_block(self, structured: Dict[str, Any]) -> str:
+        """将结构化数据格式化为 LLM 易读的文本块"""
+        lines = []
+        ts = structured.get("time_series") or []
+        kf = structured.get("key_figures") or []
+        if ts:
+            lines.append("【结构化时序数据（程序提取，可信度高于 LLM 自行从搜索结果中找数字）】")
+            # 按指标分组
+            by_metric = {}
+            for item in ts:
+                m = item.get("metric", "其他")
+                by_metric.setdefault(m, []).append(item)
+            for metric, items in sorted(by_metric.items()):
+                items.sort(key=lambda x: str(x.get("period", "")))
+                lines.append(f"\n## {metric}")
+                for it in items:
+                    note = f"（{it['note']}）" if it.get("note") else ""
+                    lines.append(f"  {it.get('period','')}: {it.get('value','')} {it.get('unit','')}{note}")
+        if kf:
+            lines.append("\n## 关键数字")
+            for it in kf:
+                note = f"（{it['note']}）" if it.get("note") else ""
+                lines.append(f"  {it.get('metric','')}: {it.get('value','')} {it.get('unit','')}{note}")
+        return "\n".join(lines)
+
+    def _search_with_fallback(self, query: str, max_retries: int = 2) -> str:
+        """搜索+降级重试：首搜结果空或含失败关键词时，换一种更直接的表述重试"""
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"搜索: {query[:60]}...")
+                result = web_search.invoke({"query": query})
+                if isinstance(result, str):
+                    # 工具兜底失败返回"搜索失败:"前缀
+                    if result.startswith("搜索失败"):
+                        logger.warning(f"搜索失败(attempt {attempt+1}): {query[:40]}")
+                        # 最后一次失败不再重试
+                        if attempt == max_retries - 1:
+                            return result
+                        # 换表述重试：去掉一些限定词
+                        query = query.replace(" 当月 ", " ").replace(" 最近 ", " ").replace(" 同比 环比", "")
+                        continue
+                    # 结果太短（< 50字）也重试
+                    if len(result.strip()) < 50:
+                        logger.warning(f"搜索结果过短({len(result)}字)，重试(attempt {attempt+1})")
+                        continue
+                    return result
+                return str(result)
+            except Exception as e:
+                logger.error(f"搜索异常 [{query[:40]}](attempt {attempt+1}): {e}")
+                if attempt == max_retries - 1:
+                    return f"搜索失败: {e}"
+        return "搜索失败: 多次重试后仍失败"
+
     # ========== 个股搜索模式 ==========
 
     def _build_stock_queries(self, stock_code: str) -> List[str]:
@@ -248,18 +368,25 @@ class ResearcherAgent:
         last_month = f"{last_month_end.year}年{last_month_end.month}月"
 
         return [
+            # 基础面
             f"{tag} 公司公告 重大事项 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
-            f"{tag} {last_month} 销量 出货量 同比 环比",
-            f"{tag} 所属行业 产业政策 发展趋势 {three_month_range}",
             f"{tag} 经营状况 营收 利润 最新业绩 {recent_period}",
-            f"{tag} 月度产销快报 销量 环比 同比 {recent_period}",
-            f"{tag} 竞争对手 销量对比 市场份额 {today.year}",
             f"{tag} 业务构成 收入占比 毛利占比 各板块营收拆分",
-            f"{tag} 出货量 产能 新增订单 订单来源 资本开支",
-            f"{tag} 技术实力 研发投入 核心技术突破 专利",
+            f"{tag} 所属行业 产业政策 发展趋势 {three_month_range}",
+
+            # 行业特有运营指标（通用搜索，适用于汽车/半导体/光伏/消费电子等）
+            f"{tag} {last_month} 月度 销量 出货量 交付量 同比 环比",
+            f"{tag} 月度产销快报 经营数据 最新 公告 {recent_period}",
+            f"{tag} 出货量 产能 产能利用率 新增订单 订单来源 资本开支 {recent_period}",
+
+            # 技术与竞争
+            f"{tag} 技术实力 研发投入 核心技术突破 专利 新产品",
+            f"{tag} 竞争对手 销量对比 市场份额 {today.year}",
             f"{tag} 护城河 技术壁垒 不可替代性 切换成本 市占率 竞争格局",
-            f"{tag} 第二增长曲线 新业务 布局 进展 放量 {recent_period}",
             f"{tag} 产业链 上下游 市场地位 竞争格局 {recent_period}",
+
+            # 增长与资金
+            f"{tag} 第二增长曲线 新业务 布局 进展 放量 {recent_period}",
             f"{tag} 利好 利空 机构评级 目标价 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
         ]
 
@@ -276,6 +403,8 @@ class ResearcherAgent:
 3. **业务拆解**：各板块收入/毛利占比、TOP3业务、出货量、产能利用率、资本开支、新增订单及来源；
    销量/出货量必须给近几个月的同比或环比序列并注明是单月还是累计，
    只有单月数据时不得外推为趋势
+   **海外业务（如有）必须拆分毛利率差异来源**：车型结构差异、关税/运费影响、
+   定价策略差异、渠道费用差异等，分析海外毛利率高于/低于国内的原因及可持续性
 4. **财报空窗期前瞻**：最新财报报告期之后已公布的月度经营数据（销量/出货量/订单/中标）
    是下一期财报的领先指标，必须单独汇总为「报告期后经营数据」小节
    （如一季报后已出的4/5/6月销量），并给出方向性前瞻：延续加速/延续放缓/出现拐点。
@@ -316,6 +445,19 @@ class ResearcherAgent:
 - 每条高影响力利好必须检查并列出对应风险（如：出口高增→关税/反补贴调查风险；大客户订单→客户集中度风险）
 - 机构评级降权处理：A股卖方几乎不出卖出评级，"N家机构全部买入"不构成有效利好，最多作为关注度参考
 - 目标价：搜索结果里有具体数字才引用，没有就不写"上涨空间较大"这类无依据表述
+
+【机构预期修正要求】
+- 如果搜索信息显示当前季度/月度经营数据明显弱于去年同期或上季度（如销量同比下滑、毛利率走低），
+  必须在报告中给出基于经营数据的**保守修正后全年净利润估算**（用当前月销量年化×单车净利等简易算法），
+  并和Wind/Bloomberg 34家机构一致预期做差值对比，量化"预期差"——机构预期可能下行修正的空间
+- 如果经营数据优于预期，同样需计算修正方向
+
+【价格反弹与基本面反转区分原则】
+- 报告中必须区分两组独立判断：
+  ① **短期价格反弹**：仅基于超卖/技术面支撑的反弹，不改变基本面方向，不可作为建仓依据
+  ② **基本面反转**：销量/利润/毛利率出现可验证的拐点信号（如"单月销量同比转正且连续2个月"），
+     才构成基本面建仓信号
+- 两组判断在结论段落中分开表述，不得混为一谈
 
 【输出要求】每个维度给出明确结论；业务数据尽可能用数字；搜索结果中没有的信息标注「信息不足」，
 禁止用自身知识补数字；最后 3 句以内核心总结。
@@ -603,6 +745,10 @@ class ResearcherAgent:
 - momentum（边际变化分）打分证据**只认近2个季度/近3个月的增量事实**：
   增速拐点、新订单/新客户导入、产能爬坡、毛利率环比回升、渗透率斜率变化；
   存量优势（多年积累的技术/份额）不算边际变化，那是 moat 的事
+- **边际变化打分必须附加量化证据**：单季营收同比增速/环比增速、在手订单金额同比变化、
+  产能利用率变动、毛利率变动幅度等，每个分数必须有具体数字支撑。
+  例如"订单增长"须写明"订单同比+50%至XX亿元（来源XX）"，仅定性描述不给高分。
+  写不出量化数据的边际变化评分上限为6分
 - 打分锚点（四个分项通用；准入门槛在7/6/5分档，锚点直接决定进池出池，必须校准）：
   5=行业平均/无差异化证据；6-7=有明确公开证据的相对优势；8=显著领先且证据充分；
   9-10=近乎垄断或爆发式增量；3以下=明显劣势。每个分数必须能对应写出证据，
@@ -617,6 +763,8 @@ class ResearcherAgent:
 ## 一、产业链公司全景筛选
 - 用表格列出产业链上中下游 + 特精专新共筛选出的所有公司
 - 表头：环节 | 细分领域 | 排名 | 公司名称 | 代码 | 核心业务一句话 | 资金偏好
+- **分类精度要求**：航天业务关联极弱的公司（如慈星股份、创耀科技）单独标注为「纯题材概念股」，
+  与真正受益标的分开列示，不得混入核心受益环节
 
 【资金偏好标签说明】
 对每家公司标注其主要受哪类资金青睐（可标多个，用 / 分隔）：
@@ -646,6 +794,8 @@ class ResearcherAgent:
 - 溢价能力（0-5 分）：毛利率水平？对上游议价能力？对下游定价权？品牌/专利/牌照壁垒？成本转嫁能力？
 - 特别关注特精专新企业，它们在某些环节可能具有极高的不可替代性
 - ⚠️ 准入门槛由程序按行业阶段执行（本次：{gate_desc}），未达标公司会被剔除出投资池。
+  **弹性准入规则**：距门槛差 ≤0.5 分的标的仍列入「观察备选池」，在报告中单独标注。
+  （例如 moat 门槛5分 → 4.5-4.9分的标的归入观察备选池，不入正式投资池但保持跟踪）
   打分必须严格基于搜索证据（独有技术/专利/牌照/垄断地位的具体事实；
   边际变化则要有近2季/近3月的增量事实），禁止为照顾公司入围而抬分；
   找不到证据就给低分，宁缺毋滥
@@ -666,7 +816,9 @@ class ResearcherAgent:
 
 ## 七、催化剂时间轴（未来3-6个月）
 机会有时间属性。用列表按时间先后列出可能的催化事件：
-- 每条格式：预计时间 | 事件（招标/发射/投产/量产/政策落地/财报窗口）| 影响的环节或公司 | 出处
+- 每条格式：预计时间 | 事件（招标/发射/投产/量产/政策落地/财报窗口）| 影响的环节或公司 | 落地概率 | 弹性强度 | 出处
+- **落地概率**：每条催化标注概率（高/中/低），说明判断依据，禁止默认全部"高概率"
+- **弹性强度**：标注该事件对行业/个股业绩弹性大小（强催化/弱催化），区分股价驱动级别
 - 出处必须写具体来源（媒体名/公司公告/政府文件，尽量带日期），禁止笼统写
   「搜索数据」「搜索结果」——无法说出具体来源的事件视为依据不足，不列
 - 只列搜索结果里有明确依据的事件，禁止编造时间；没有就明写「未发现明确催化剂」
@@ -682,7 +834,9 @@ class ResearcherAgent:
 
 【重要原则】
 - 候选公司清单 JSON 必须是输出的第一部分（输出过长被截断时后面的段落可丢，JSON 不能丢）
-- 最后必须附「行业风险」小节：行业周期位置、政策与地缘风险、估值水位，各一两句，
+- 最后必须附「行业风险」小节，拆分为两个独立小节：
+  **一、行业系统性风险**：行业周期位置、政策与地缘风险、估值水位，各一两句
+  **二、个股特有风险**：客户集中度、航天业务占比不足、订单波动、产能爬坡不及预期等
   每条高影响力利好须对应检查风险（如国产替代→下游资本开支放缓风险）
 - 所有结论必须基于搜索结果，不足处标注「信息不足」
 - 业务拆解数据是评估公司质量和成长性的核心，请尽可能详细
@@ -699,12 +853,9 @@ class ResearcherAgent:
         for q in queries:
             ok = True
             try:
-                logger.info(f"搜索: {q[:50]}...")
-                r = web_search.invoke({"query": q})
-                results[q] = r
-                # 工具内部兜底失败时返回"搜索失败:"前缀字符串（不抛异常），同样计入失败——
-                # 否则配额耗尽时健康摘要显示"网页搜索✓"的假健康
-                if isinstance(r, str) and r.startswith("搜索失败"):
+                result = self._search_with_fallback(q)
+                results[q] = result
+                if isinstance(result, str) and result.startswith("搜索失败"):
                     ok = False
             except Exception as e:
                 logger.error(f"搜索失败 [{q}]: {e}")
@@ -780,6 +931,29 @@ class ResearcherAgent:
         all_results = self._do_search(queries)
         search_text = self._search_text(all_results)
 
+        # ---- 结构化数据提取（从搜索结果中提取销量/出货量等时序数字） ----
+        structured_data = self._extract_structured_data_from_search(search_text, company_name=company_name)
+        structured_data_block = self._format_structured_data_block(structured_data)
+        has_structured = bool(structured_data.get("time_series") or structured_data.get("key_figures"))
+        structured_section = ""
+        if has_structured:
+            logger.info(f"结构化数据提取成功，共 {len(structured_data.get('time_series',[]))} 条时序")
+            structured_section = ("========== 程序提取的结构化数据（时序数据+关键数字）"
+                                  " ==========\n" + structured_data_block)
+
+        # ---- 行业数据路由：有专用API则优先调用（如汽车→懂车帝销量） ----
+        industry_section = ""
+        try:
+            from tools.data_router import fetch_industry_data
+            router_result = fetch_industry_data(stock_code, company_name)
+            if router_result.get("has_data"):
+                industry_section = (f"========== 行业专用数据源（{router_result.get('std_industry','')}）"
+                                    f" ==========\n{router_result.get('data_text','')}")
+                logger.info(f"✅ 行业数据路由命中: [{stock_code}] → "
+                            f"{router_result.get('std_industry')} → {router_result.get('source')}")
+        except Exception as e:
+            logger.debug(f"行业数据路由未命中（不影响主流程）: {e}")
+
         messages = [
             SystemMessage(content=self._build_stock_system_prompt()),
             HumanMessage(content=f"""用户问题：{question}
@@ -788,12 +962,17 @@ class ResearcherAgent:
 ========== 结构化信源（公告/新闻/快讯，可信度高，与搜索结果冲突时以此为准） ==========
 {structured_text[:8000]}
 
+{structured_section}
+
+{industry_section}
+
 ========== 全网搜索结果（补充信息） ==========
 {search_text[:10000]}
 请基于以上信息进行全面分析。
 销量/产销类数字的引用规则：提供了【产销快报公告原文】时**只能引用该原文的数字**并注明
 "根据公司公告"；搜索结果里与之冲突的销量数字一律弃用；未提供该块时才可引用搜索结果的
-销量数字，且必须注明具体出处与统计口径（乘用车/含商用车/单月/累计）。"""),
+销量数字，且必须注明具体出处与统计口径（乘用车/含商用车/单月/累计）。
+运营数据（销量/出货量/交付量等）优先引用【程序提取的结构化数据】区块中的时序数字。"""),
         ]
 
         logger.info("LLM 综合分析中...")
@@ -914,6 +1093,94 @@ class ResearcherAgent:
         except Exception as e:
             logger.warning(f"候选主营构成拉取失败（不影响分析）: {e}")
 
+        # ---- 候选标的关键财务/筹码/估值数据（程序拉取）----
+        stock_snapshot_text = ""
+        try:
+            from tools.stock_tools import (
+                call_fetch_fina_indicator, call_fetch_financial_health_summary,
+                call_fetch_holder_number, call_fetch_northbound_hold,
+                call_fetch_cost_basis, call_fetch_cashflow_data,
+                call_fetch_income_data, call_fetch_balance_sheet_data,
+                call_fetch_batch_valuation, call_fetch_batch_sotp_valuation,
+            )
+            snapshot_blocks = []
+
+            # 先做一次批量估值对比（所有候选代码一起，不用按个股重复）
+            batch_val_text = ""
+            try:
+                codes_str = ",".join(sorted(all_leader_codes)[:10])
+                if codes_str:
+                    r = call_fetch_batch_valuation(codes_str)
+                    if r and '❌' not in r and len(r) > 50:
+                        batch_val_text = f"◇ 同业估值对比（来源: batch_valuation_fetcher）\n{r.strip()[:3000]}"
+            except Exception:
+                pass
+            if batch_val_text:
+                snapshot_blocks.append(batch_val_text)
+
+            for c in sorted(all_leader_codes)[:6]:
+                snap_lines = [f"◇ 候选 {c}"]
+                # 利润表（营收/净利/研发费用/销售费用/管理费用分拆）
+                try:
+                    r = call_fetch_income_data(c)
+                    if r and '❌' not in r and len(r) > 50:
+                        snap_lines.append(r.strip().split('\n')[:15])
+                except Exception:
+                    pass
+                # 财务指标（ROE/毛利率/费用率）
+                try:
+                    r = call_fetch_fina_indicator(c)
+                    if r and '❌' not in r and len(r) > 50:
+                        snap_lines.append(r.strip().split('\n')[:20])
+                except Exception:
+                    pass
+                # 资产负债表（存货/应收账款/总资产等）
+                try:
+                    r = call_fetch_balance_sheet_data(c)
+                    if r and '❌' not in r and len(r) > 50:
+                        snap_lines.append(r.strip().split('\n')[:12])
+                except Exception:
+                    pass
+                # 现金流量表（资本开支/CAPEX/自由现金流）
+                try:
+                    r = call_fetch_cashflow_data(c)
+                    if r and '❌' not in r and len(r) > 50:
+                        snap_lines.append(r.strip().split('\n')[:12])
+                except Exception:
+                    pass
+                # 财务健康度（周转天数/FCF/杜邦等）
+                try:
+                    r = call_fetch_financial_health_summary(c)
+                    if r and '❌' not in r and len(r) > 50:
+                        snap_lines.append(r.strip().split('\n')[:15])
+                except Exception:
+                    pass
+                # 股东户数
+                try:
+                    r = call_fetch_holder_number(c)
+                    if r and '❌' not in r and len(r) > 50:
+                        snap_lines.append(r.strip().split('\n')[:10])
+                except Exception:
+                    pass
+                # 北向资金持仓
+                try:
+                    r = call_fetch_northbound_hold(c)
+                    if r and '❌' not in r and len(r) > 50:
+                        snap_lines.append(r.strip().split('\n')[:10])
+                except Exception:
+                    pass
+                # 筹码成本估算
+                try:
+                    r = call_fetch_cost_basis(c)
+                    if r and '❌' not in r and len(r) > 50:
+                        snap_lines.append(r.strip().split('\n')[:10])
+                except Exception:
+                    pass
+                snapshot_blocks.append("\n".join(snap_lines))
+            stock_snapshot_text = "\n\n".join(snapshot_blocks)
+        except Exception as e:
+            logger.warning(f"候选标的关键数据拉取失败（不影响分析）: {e}")
+
         # 全景搜索（含不可替代性/溢价能力维度）
         all_queries = self._build_chain_queries(industry_name, chain)
         all_results = self._do_search(all_queries)
@@ -935,6 +1202,9 @@ class ResearcherAgent:
 
 ========== 候选公司主营业务构成（程序拉取，各业务收入/利润占比与毛利率，当前利润驱动依据） ==========
 {mb_text[:8000] if mb_text else '（未获取到，业务拆解只能依据搜索结果，缺数据处标注「信息不足」）'}
+
+========== 候选公司关键财务数据快照（程序拉取，含利润表/财务指标/资产负债表/现金流/资本开支/健康度/股东户数/北向资金/筹码成本+同业估值对比） ==========
+{stock_snapshot_text[:10000] if stock_snapshot_text else '（未获取到个股级关键数据）'}
 
 ========== 全网搜索结果（含经营/竞争力/业务拆解/收入毛利占比/出货量/资本开支/新增订单/技术突破/护城河） ==========
 {search_text[:15000]}
@@ -970,7 +1240,7 @@ class ResearcherAgent:
             ranked = compute_composite_ranking(extracted.get("candidates") or [], stage)
             if ranked:
                 # 阶段化硬门槛：未达标的直接剔除出投资池，不进排名与技术对比
-                ranked, gate_excluded = apply_stage_gate(ranked, stage)
+                ranked, gate_watch, gate_excluded = apply_stage_gate(ranked, stage)
                 # 预期差调整：评分与PE历史分位见面，高分位减分/低分位加分，标注机会/拥挤象限
                 per_stock = (industry_valuation or {}).get("per_stock") or []
                 ranked = apply_valuation_adjustment(ranked, per_stock)
@@ -998,14 +1268,41 @@ class ResearcherAgent:
         gate_desc = "；".join(f"{label}≥{g:g}分" for _, g, label in STAGE_GATES[stage])
         if ranked:
             summary = summary + "\n\n" + format_ranking_table(ranked, name_of=_safe_name)
+        if gate_watch:
+            w_lines = ["", "### 🔭 观察备选池（距门槛 ≤0.5 分）"]
+            w_lines.append("")
+            w_lines.append("以下标的分项评分接近但未完全达门槛，保持跟踪：")
+            w_lines.append("")
+            w_lines.append("| 标的 | 备选原因 | 业务分 | 护城河 | 边际变化 | 综合分 |")
+            w_lines.append("|------|---------|-------|--------|---------|-------|")
+            for it in gate_watch:
+                cd = it.get("code", "")
+                ex_reason = (it.get("exclude_reason") or "")[:45]
+                biz = it.get("business", "-")
+                moat = it.get("moat", "-")
+                mom = it.get("momentum", "-")
+                comp = it.get("composite", "-")
+                w_lines.append(f"| {cd} | {ex_reason} | {biz} | {moat} | {mom} | {comp} |")
+            w_lines.append("")
+            summary = summary + "\n\n" + "\n".join(w_lines)
         if gate_excluded:
-            ex_lines = [f"【阶段门槛剔除（行业阶段：{stage}，门槛：{gate_desc}；不入投资池，转入观察池，仅列示供了解全貌）】"]
+            e_lines = ["", "### 长期赛道跟踪备选池"]
+            e_lines.append("")
+            e_lines.append("以下标的因当前阶段不达标被门槛剔除，但具备长期战略跟踪价值：")
+            e_lines.append("")
+            e_lines.append("| 标的 | 剔除原因 | 业务分 | 护城河 | 边际变化 | 综合分 |")
+            e_lines.append("|------|---------|-------|--------|---------|-------|")
             for it in gate_excluded:
-                nm = _safe_name(it["code"])
-                label = f"{nm}({it['code']})" if nm else it["code"]
-                ex_lines.append(f"- {label}：{it['exclude_reason']}")
-            summary = summary + "\n\n" + "\n".join(ex_lines)
-        if not ranked and gate_excluded:
+                cd = it.get("code", "")
+                ex_reason = (it.get("exclude_reason") or "")[:40]
+                biz = it.get("business", "-")
+                moat = it.get("moat", "-")
+                mom = it.get("momentum", "-")
+                comp = it.get("composite", "-")
+                e_lines.append(f"| {cd} | {ex_reason} | {biz} | {moat} | {mom} | {comp} |")
+            e_lines.append("")
+            summary = summary + "\n\n" + "\n".join(e_lines)
+        if not ranked and (gate_watch or gate_excluded):
             summary += (f"\n\n⚠️ 本次全部候选均未达【{stage}】阶段准入门槛，无投资池标的——以下内容仅作行业观察，"
                         "不给介入建议；被剔除公司转入观察池，重估触发条件命中后系统会自动提醒重新评估")
 
@@ -1058,6 +1355,61 @@ class ResearcherAgent:
                 verified_codes.append(code)
         logger.info(f"候选代码验证: {len(candidate_codes)} -> {len(verified_codes)}")
 
+        # ---- 排名存档 ----
+        try:
+            from storage.sqlite.stock_storage import get_db
+            _db = get_db()
+            # 构建候选列表（ranked为主，回退到 verified_codes）
+            candidates_json = []
+            if ranked:
+                for i, item in enumerate(ranked, 1):
+                    nm = _safe_name(item.get("code", ""))
+                    candidates_json.append({
+                        "code": item.get("code", ""),
+                        "name": nm or "",
+                        "rank": i,
+                        "composite": item.get("composite_adj", item.get("composite", 0)),
+                    })
+            else:
+                for i, c in enumerate(verified_codes, 1):
+                    nm = _safe_name(c)
+                    candidates_json.append({"code": c, "name": nm or "", "rank": i, "composite": 0})
+
+            # 估价位置（从 industry_valuation 提取）
+            pe_pct = (industry_valuation or {}).get("pe_percentile_median")
+            pb_pct = (industry_valuation or {}).get("pb_percentile_median")
+
+            _db.save_industry_snapshot(
+                industry_name=industry_name,
+                question=question[:500] if question else "",
+                candidates=candidates_json,
+                top_pick=candidates_json[0]["code"] if candidates_json else "",
+                industry_view=("偏多" if stage in ("导入期","成长期") else "中性"),
+                valuation={"pe_percentile": pe_pct, "pb_percentile": pb_pct},
+                excluded=[{
+                    "code": it["code"],
+                    "reason": it.get("exclude_reason",""),
+                    "business": it.get("business"),
+                    "fundamental": it.get("fundamental"),
+                    "moat": it.get("moat"),
+                    "momentum": it.get("momentum"),
+                    "composite": it.get("composite"),
+                } for it in (gate_excluded or [])],
+                watch=[{
+                    "code": it["code"],
+                    "reason": it.get("exclude_reason",""),
+                    "business": it.get("business"),
+                    "fundamental": it.get("fundamental"),
+                    "moat": it.get("moat"),
+                    "momentum": it.get("momentum"),
+                    "composite": it.get("composite"),
+                } for it in (gate_watch or [])],
+                benchmark_price=None,
+            )
+            logger.info(f"排名结果已存档: {industry_name} ({len(candidates_json)} 家)")
+        except Exception as e:
+            logger.warning(f"排名存档失败（不影响分析）: {e}")
+
         return {
             "messages": [response],
             "research_result": {"summary": summary, "sources": all_queries,
@@ -1065,7 +1417,8 @@ class ResearcherAgent:
                                 "industry_index": industry_index,
                                 "industry_stage": stage,
                                 # 门槛剔除组：留档后与进池组对照，用事后收益验证门槛有效性
-                                "gate_excluded_codes": [it["code"] for it in gate_excluded]},
+                                "gate_excluded_codes": [it["code"] for it in gate_excluded],
+                                "gate_watch_codes": [it["code"] for it in gate_watch]},
             "chain_leaders": chain,
             "stock_code": ",".join(verified_codes) if verified_codes else "",
             "intermediate_steps": [("researcher", {"mode": "chain", "industry": industry_name, "segments": sum(len(chain.get(k,[])) for k in ["upstream","midstream","downstream","niche_innovators"]), "candidates": len(verified_codes), "queries": len(all_queries)})],

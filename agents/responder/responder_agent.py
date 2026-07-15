@@ -169,50 +169,57 @@ class ResponderAgent:
         return prompt
 
     def generate_node(self, state: AgentState) -> Dict[str, Any]:
-        question = state.get("question", "")
-        documents = state.get("documents", [])
-        analysis = state.get("analysis_result", {})
-        research = state.get("research_result", {})
-        technical = state.get("technical_result", {})
+        try:
+            question = state.get("question", "")
+            documents = state.get("documents", [])
+            analysis = state.get("analysis_result", {})
+            research = state.get("research_result", {})
+            technical = state.get("technical_result", {})
 
-        logger.info("开始生成最终回答")
+            logger.info("开始生成最终回答")
 
-        context = self._format_context(documents, analysis, research, technical)
+            context = self._format_context(documents, analysis, research, technical)
 
-        # 分析连续性：单只个股时注入上次分析快照与复盘结论
-        history = self._format_history(state.get("stock_code") or "")
-        if history:
-            context += f"\n\n{history}"
+            # 分析连续性：单只个股时注入上次分析快照与复盘结论
+            history = self._format_history(state.get("stock_code") or "")
+            if history:
+                context += f"\n\n{history}"
 
-        # 用户纠错记录：个股按代码、产业链按行业名取，注入后严禁再犯
-        feedback = self._format_feedback(state.get("stock_code") or "",
-                                         state.get("industry_name") or "")
-        if feedback:
-            context += f"\n\n{feedback}"
+            # 用户纠错记录：个股按代码、产业链按行业名取，注入后严禁再犯
+            feedback = self._format_feedback(state.get("stock_code") or "",
+                                             state.get("industry_name") or "")
+            if feedback:
+                context += f"\n\n{feedback}"
 
-        system_prompt = self._build_system_prompt(state)
+            system_prompt = self._build_system_prompt(state)
 
-        user_message = f"""用户问题：{question}
+            user_message = f"""用户问题：{question}
 
 【参考资料】
 {context}
 
 请生成回答。"""
 
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_message),
-        ]
+            messages = [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_message),
+            ]
 
-        response = self.llm.invoke(messages)
-        final_answer = response.content
+            response = self.llm.invoke(messages)
+            final_answer = response.content
 
-        logger.info("回答生成完成")
+            logger.info("回答生成完成")
 
-        return {
-            "final_answer": final_answer,
-            "intermediate_steps": [("responder", final_answer[:200])],
-        }
+            return {
+                "final_answer": final_answer,
+                "intermediate_steps": [("responder", final_answer[:200])],
+            }
+        except Exception as e:
+            logger.error(f"Responder 生成回答失败: {e} {traceback.format_exc()}")
+            return {
+                "final_answer": f"抱歉，生成分析报告时发生了错误：{e}。请稍后重试或检查日志。",
+                "intermediate_steps": [("responder", f"ERROR: {e}")],
+            }
 
     @staticmethod
     def _format_feedback(stock_code: str, industry_name: str) -> str:
@@ -297,9 +304,11 @@ class ResponderAgent:
         if technical:
             parts.append(f"【技术分析结果】\n{technical.get('summary', '')}")
             if technical.get("trade_plan_text"):
-                parts.append(technical["trade_plan_text"])
+                v = technical["trade_plan_text"]
+                parts.append(str(v) if not isinstance(v, str) else v)
             if technical.get("trade_plans_text"):
-                parts.append(technical["trade_plans_text"])
+                v = technical["trade_plans_text"]
+                parts.append(str(v) if not isinstance(v, str) else v)
             if technical.get("mode"):
                 parts.append(f"分析模式：{technical['mode']}")
         return "\n\n".join(parts) if parts else "无参考资料"

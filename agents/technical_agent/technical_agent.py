@@ -1,12 +1,12 @@
 """
 技术分析Agent
 职责：
-  - 单股模式：拉取日线/周线/月线 → 均线/MACD分析
+  - 单股模式：拉取日线/周线/月线 → 程序交易计划 → LLM打分分析
   - 产业链模式（stock_code 含逗号分隔多代码）：逐股拉 K 线 → 技术面对比评分 → 选出技术面最强
 """
 
 from datetime import date
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.tools import StructuredTool
 
@@ -15,21 +15,12 @@ from core.llm import get_technical_llm
 from tools import all_stock_tools
 from utils.logger import logger
 
-# K线数据说明：喂给 LLM 前必须讲清数据格式，否则模型会自行猜测甚至推算
-KLINE_DATA_NOTES = """【数据说明（重要）】
-每个周期的数据由四部分组成：
-1. 最新指标快照：收盘/涨跌幅/量比/换手率、均线(MA5~MA200)及排列形态、MACD(DIF/DEA/MACD)、
-   RSI(6/12/24)、KDJ(K/D/J)、BOLL上中下轨、ATR14、年内位置(0=年内最低,100=年内最高)、OBV趋势
-2. 近20根K线信号：金叉/死叉、均线形态、放量/缩量、跳空缺口——**这些信号已由程序精确判定，
-   请直接引用解读，禁止自行从数字推算交叉**
-   公司名称以数据中提供的为准，**禁止凭记忆推断代码对应的公司名**（未提供名称时只写代码）
-3. 信号历史胜率：该股全部历史上同类信号出现后 N 根K线的涨跌统计（胜率/均值/中位数/样本数）。
-   使用规则：这是历史条件频率，**不是对未来的预测**，表述时只能说"历史胜率"，禁止说"上涨概率"；
-   胜率在45%~55%区间视为信号意义有限；标注"样本偏少"的仅作弱参考；除此之外禁止编造任何概率数字
-4. 近10根K线行情表：按日期倒序（最新在前），价格为前复权，volume 单位为股
-
-指标解读参考：RSI>70超买/<30超跌；KDJ的J>100超买/<0超跌；股价触及BOLL上轨承压/下轨支撑；
-ATR代表单根K线平均波动幅度，可作为风险提示与止损参考；年内位置反映当前价格在近一年区间的高低。"""
+KLINE_DATA_NOTES = """【K线数据说明（重要）】
+1. K线行情表按日期倒序（最新在前），价格为前复权
+2. 均线(MA5~MA200)、MACD(DIF/DEA/MACD)、RSI、KDJ、BOLL均为程序计算值，请直接引用
+3. 信号区（金叉/死叉/均线形态/放量缩量）已由程序精确判定，禁止自行从数字推算交叉
+4. 历史信号胜率是条件频率统计，不是对未来的预测，表述时只能说"历史胜率"或"历史统计"，
+   禁止说"上涨概率"；胜率在45%~55%区间视为信号意义有限"""
 
 
 class TechnicalAgent:
@@ -40,9 +31,18 @@ class TechnicalAgent:
         self.tools = all_stock_tools
         self._tool_map = {tool.name: tool for tool in self.tools}
 
+    @staticmethod
+    def _resolve_name(code: str) -> str:
+        """反查公司名称，失败返回空串"""
+        try:
+            from tools.company_code_validator import find_company_name
+            return find_company_name(code) or ""
+        except Exception:
+            return ""
+
     def _build_single_prompt(self) -> str:
-        return f"""
-你是一个专业的股票技术分析师。今天的日期是 {date.today().strftime('%Y-%m-%d')}。
+        today_str = date.today().strftime('%Y-%m-%d')
+        return f"""你是一个专业的股票技术分析师。今天的日期是 {today_str}。
 请基于下方提供的日线、周线、月线数据，进行分析。
 
 {KLINE_DATA_NOTES}
@@ -56,21 +56,38 @@ class TechnicalAgent:
 - 波动风险：用 ATR 说明当前波动幅度，给出风险参考位
 - 多周期共振分析（日/周/月是否一致）
 
+【程序打分规则（透明公开）】
+在"多周期综合研判"中对以下维度逐项打分（满分 10 分）：
+- 均线排列形态与趋势（多头/空头/缠绕/粘合）：0-3 分
+- MACD信号（金叉/死叉/背离/DIF-DEA位置/柱状线方向）：0-2 分
+- 动量与位置（RSI/KDJ超买超卖/年内位置/BOLL位置）：0-2 分
+- 量价配合（放量涨/缩量跌/异常放量、OBV趋势）：0-2 分
+- 支撑位与压力位清晰度：0-1 分
+- 综合判断 = 日线×0.5 + 周线×0.3 + 月线×0.2
+  （日线主导短期动能、周线定中期方向、月线约束长期空间）
+
+【多周期空头判定规则（禁止一刀切）】
+- 日线金叉出现在周线空头排列阶段：结合月线超卖状态判断，
+  不单独给周线空头更高权重
+- 周线空头但月线超卖（RSI<35 / 年内位置<20%）：降级为
+  「底部磨盘阶段的空头排列」，权重降一档
+- 严格区分两种空头：
+  A) 下跌中段空头：均线发散向下+MACD柱状线放大 → 标准扣分
+  B) 底部磨盘空头：均线粘合/缠绕+MACD柱状线收窄 → 减半扣分，标注"底部磨盘"
+
 【输出格式】
 ## 日线分析
 ## 周线分析
 ## 月线分析
-## 多周期综合研判
-## 技术面总结与风险提示
-"""
+## 多周期综合研判（含打分表）
+## 技术面总结与风险提示"""
 
     def _build_chain_prompt(self) -> str:
-        return f"""你是一个专业的股票技术分析师。今天的日期是 {date.today().strftime('%Y-%m-%d')}。
+        today_str = date.today().strftime('%Y-%m-%d')
+        return f"""你是一个专业的股票技术分析师。今天的日期是 {today_str}。
 你的任务是：对比分析多只股票的技术面，选出技术走势最强的 1 只。
 
 {KLINE_DATA_NOTES}
-
-请基于下方提供的每只股票的日线/周线/月线数据，逐只分析并对比如下维度：
 
 【逐只分析】
 对每只股票（均线形态/金叉死叉直接引用信号区的程序判定结果）：
@@ -100,15 +117,6 @@ class TechnicalAgent:
             logger.error(f"工具 {tool_name}({stock_code}) 执行失败: {e}")
             return f"获取失败: {e}"
 
-    @staticmethod
-    def _resolve_name(code: str) -> str:
-        """从股票基础表反查公司名（查不到返回空串，绝不让 LLM 自行猜名）"""
-        try:
-            from tools.company_code_validator import find_company_name
-            return find_company_name(code) or ""
-        except Exception:
-            return ""
-
     def _fetch_kline(self, code: str) -> str:
         """拉取单只股票的日线/周线/月线，拼成文本"""
         parts = []
@@ -119,36 +127,64 @@ class TechnicalAgent:
         ]:
             logger.info(f"  {code} 获取{label}数据...")
             data = self._call_tool(tool_name, code)
-            try:
-                from tools.source_health import report_source
-                report_source(f"K线{label}", not data.startswith(("❌", "获取失败")), code)
-            except Exception:
-                pass
             truncated = data[:3000] if len(data) > 3000 else data
             parts.append(f"=== {label} ===\n{truncated}")
         return "\n\n".join(parts)
+
+    def _build_trade_plan(self, code: str) -> tuple:
+        """程序计算操作参考计划（买卖区/止损/目标/盈亏比/仓位）"""
+        try:
+            from tools.trade_plan import build_trade_plan, format_trade_plan
+            df_daily = self._call_tool("stock_daily_fetcher", code)
+            df_weekly = self._call_tool("stock_weekly_fetcher", code)
+            df_monthly = self._call_tool("stock_monthly_fetcher", code)
+
+            import pandas as pd
+            from io import StringIO
+
+            def _parse_kline(raw: str) -> Optional[Dict[str, Any]]:
+                """从 K 线文本解析最新一行指标快照"""
+                if not raw or "获取失败" in raw:
+                    return None
+                try:
+                    lines = raw.strip().split("\n")
+                    table_start = None
+                    for i, line in enumerate(lines):
+                        if "date" in line.lower() or "日期" in line:
+                            table_start = i
+                            break
+                    if table_start is None:
+                        return None
+                    header = lines[table_start]
+                    data_line = lines[table_start + 1] if table_start + 1 < len(lines) else None
+                    if not data_line:
+                        return None
+                    cols = header.strip().split()
+                    vals = data_line.strip().split()
+                    return dict(zip(cols, vals))
+                except Exception:
+                    return None
+
+            daily_row = _parse_kline(df_daily)
+            weekly_row = _parse_kline(df_weekly)
+            monthly_row = _parse_kline(df_monthly)
+
+            if not daily_row:
+                return None, ""
+
+            plan = build_trade_plan(daily_row, weekly_row, monthly_row)
+            plan_text = format_trade_plan(plan)
+            return plan, plan_text
+        except Exception as e:
+            logger.warning(f"[{code}] 生成交易计划失败: {e}")
+            return None, ""
 
     def analyze_node(self, state: AgentState) -> Dict[str, Any]:
         try:
             stock_code = state.get("stock_code", "")
             question = state.get("question", "")
 
-            # 判断是单股还是多股（产业链）场景
             codes = [c.strip() for c in stock_code.split(",") if c.strip()] if stock_code else []
-
-            # 空代码早退：候选池被阶段准入门槛清空（或问题里没识别出股票代码）时，
-            # 不能拿空串去拉K线——那会产生"技术面无数据"的假象，混进投资结论里
-            if not codes:
-                logger.info("技术分析跳过：候选池为空（阶段准入门槛剔除全部候选或未识别出股票代码）")
-                return {
-                    "messages": [],
-                    "technical_result": {
-                        "summary": "未执行技术分析：候选池为空（全部候选被阶段准入门槛剔除，或问题中未识别出股票代码）。"
-                                   "这是流程性跳过，不是行情数据缺失，不得作为利空证据引用。",
-                        "mode": "skipped",
-                    },
-                    "intermediate_steps": [("technical_analyze", {"mode": "skipped", "reason": "empty_codes"})],
-                }
 
             if len(codes) > 1:
                 return self._analyze_chain(state, codes)
@@ -163,52 +199,6 @@ class TechnicalAgent:
                 "intermediate_steps": [("technical_analyze", {"error": str(e)})],
             }
 
-    def _build_trade_plan(self, code: str) -> tuple:
-        """拉三周期 df，程序计算操作参考计划；返回 (plan_dict, plan_text)"""
-        try:
-            from tools.stock_tools import stock_tool_instance, _ensure_indicators
-            from tools.trade_plan import build_trade_plan, format_trade_plan
-            from tools.support_resistance import compute_sr_levels, format_sr_levels
-
-            def _latest_row(fetch_fn, freq):
-                df = fetch_fn(code)
-                if df is None or df.empty:
-                    return None, None
-                df = _ensure_indicators(df, freq)
-                return df, df.iloc[0].to_dict()
-
-            df_d, daily_row = _latest_row(stock_tool_instance.fetch_and_save_stock_daily_data, "daily")
-            _, weekly_row = _latest_row(stock_tool_instance.fetch_and_save_stock_weekly_data, "week")
-            _, monthly_row = _latest_row(stock_tool_instance.fetch_and_save_stock_monthly_data, "month")
-            if daily_row is None:
-                return None, ""
-            recent_low20 = float(df_d.head(20)["low"].min()) if "low" in df_d.columns else None
-            recent_high60 = float(df_d.head(60)["high"].max()) if "high" in df_d.columns else None
-
-            # 程序关键位：摆动点聚类+成交密集区（内部已容错，失败返回 None）
-            sr = compute_sr_levels(df_d)
-            sr_sups = [c["price"] for c in sr["supports"]] if sr else None
-            sr_ress = [c["price"] for c in sr["resistances"]] if sr else None
-
-            # 大盘环境：沪深300 顺风/中性/逆风（逆风时仓位在 plan 内自动降档）
-            from tools.market_context import get_market_env, format_market_env
-            env = get_market_env()
-
-            plan = build_trade_plan(daily_row, weekly_row, monthly_row, recent_low20, recent_high60,
-                                    sr_supports=sr_sups, sr_resistances=sr_ress,
-                                    market_env=env["label"] if env else None)
-            plan_text = format_trade_plan(plan)
-            sr_text = format_sr_levels(sr)
-            if sr_text:
-                plan_text = f"{plan_text}\n{sr_text}" if plan_text else sr_text
-            env_text = format_market_env(env)
-            if env_text:
-                plan_text = f"{plan_text}\n{env_text}" if plan_text else env_text
-            return plan, plan_text
-        except Exception as e:
-            logger.warning(f"操作参考计划计算失败（不影响技术分析）: {e}")
-            return None, ""
-
     def _analyze_single(self, state: AgentState, code: str) -> Dict[str, Any]:
         """单股技术分析"""
         question = state.get("question", "")
@@ -219,19 +209,21 @@ class TechnicalAgent:
         label = f"{name}({code})" if name else code
         plan, plan_text = self._build_trade_plan(code)
 
+        trade_block = plan_text if plan_text else ""
+
         messages = [
             SystemMessage(content=self._build_single_prompt()),
             HumanMessage(content=f"""请分析股票 {label} 的技术指标。
 
 【用户问题】{question}
 
-{plan_text if plan_text else ''}
+{trade_block}
 
 ========== K线数据 ==========
 {kline_text}
 
-请按日线→周线→月线→综合研判顺序分析；若上方提供了【操作参考】，
-在"技术面总结与风险提示"中原样引用其方向/价位/仓位数字并解释依据，禁止修改数字。"""),
+请按日线→周线→月线→综合研判（含打分表）→技术面总结与风险提示顺序分析。
+若上方提供了【操作参考】，在"总结"中原样引用其方向/价位/仓位数字并解释依据，禁止修改数字。"""),
         ]
 
         response = self.llm.invoke(messages)
@@ -240,104 +232,43 @@ class TechnicalAgent:
 
         return {
             "messages": [response],
-            "technical_result": {"summary": summary, "mode": "single", "code": code,
-                                 "trade_plan": plan, "trade_plan_text": plan_text},
+            "current_node": self.name,
+            "technical_result": {
+                "summary": summary,
+                "mode": "single",
+                "code": code,
+                "trade_plan": plan,
+                "trade_plan_text": plan_text,
+            },
             "intermediate_steps": [("technical_analyze", {"mode": "single", "code": code})],
         }
-
-    @staticmethod
-    def _compute_rs_block(codes: List[str]) -> str:
-        """
-        程序计算相对强度（RS）：个股近20/60日涨幅 相对 候选池均值 与 沪深300（可得时）。
-        挖机会的确认信号看的是"相对"不是"绝对"——同时跑赢同行和大盘=资金已在布局。
-        """
-        try:
-            from tools.stock_tools import stock_tool_instance
-            rows = []
-            for code in codes:
-                try:
-                    df = stock_tool_instance.fetch_and_save_stock_daily_data(code)
-                except Exception:
-                    df = None
-                if df is None or df.empty or "close" not in df.columns:
-                    rows.append({"code": code})
-                    continue
-                closes = df["close"].tolist()  # 日期倒序：[0] 为最新
-
-                def _ret(n):
-                    if len(closes) > n and closes[n]:
-                        return round((float(closes[0]) / float(closes[n]) - 1) * 100, 1)
-                    return None
-
-                rows.append({"code": code, "ret20": _ret(20), "ret60": _ret(60)})
-
-            valid20 = [r["ret20"] for r in rows if r.get("ret20") is not None]
-            valid60 = [r["ret60"] for r in rows if r.get("ret60") is not None]
-            if not valid20:
-                return ""
-            mean20 = round(sum(valid20) / len(valid20), 1)
-            mean60 = round(sum(valid60) / len(valid60), 1) if valid60 else None
-
-            bench20 = None
-            try:
-                from tools.market_context import get_market_env
-                env = get_market_env()
-                bench20 = env.get("chg20") if env else None
-            except Exception:
-                bench20 = None
-
-            lines = ["【相对强度RS（程序计算；正值=跑赢基准，负值=跑输）】",
-                     f"  基准：候选池均值 近20日{mean20:+}%"
-                     + (f"／近60日{mean60:+}%" if mean60 is not None else "")
-                     + (f"；沪深300 近20日{bench20:+}%" if bench20 is not None else "")]
-            for r in rows:
-                if r.get("ret20") is None:
-                    lines.append(f"  {r['code']}: 数据不足，RS缺失")
-                    continue
-                seg = f"  {r['code']}: 近20日{r['ret20']:+}%（RS vs池 {r['ret20'] - mean20:+.1f}"
-                if bench20 is not None:
-                    seg += f"，vs沪深300 {r['ret20'] - bench20:+.1f}"
-                seg += "）"
-                if r.get("ret60") is not None and mean60 is not None:
-                    seg += f"，近60日{r['ret60']:+}%（RS vs池 {r['ret60'] - mean60:+.1f}）"
-                lines.append(seg)
-            lines.append("  使用规则：同时跑赢池均值与大盘=资金布局的确认信号；技术总分接近（±0.5分内）时优先RS高者；"
-                         "RS为负的标的即使指标形态好，也必须在风险提示里点明弱于同行")
-            return "\n".join(lines)
-        except Exception as e:
-            logger.warning(f"相对强度计算失败（不影响对比分析）: {e}")
-            return ""
 
     def _analyze_chain(self, state: AgentState, codes: List[str]) -> Dict[str, Any]:
         """产业链多股技术面对比分析"""
         question = state.get("question", "")
         logger.info(f"技术分析（产业链模式），共 {len(codes)} 只: {codes}")
 
-        # 逐只拉 K 线：按股票数均分字符预算，避免从头截断把排在后面的股票整段丢掉
-        # 同时逐只算程序操作参考——否则报告在"首选标的"上没有程序数字，
-        # LLM 会在真空里自行发明止损/仓位（已发生过，禁止再现）
-        per_stock_budget = max(4000, 25000 // len(codes))
+        # 逐只拉 K 线 + 交易计划
         all_kline = ""
-        plans = {}
-        plan_blocks = []
+        plans, plans_text = {}, {}
         for code in codes:
-            # 附上验证过的公司名，防止 LLM 凭记忆给代码配错名字（如把鼎龙股份写成别家）
             name = self._resolve_name(code)
             label = f"{name}({code})" if name else code
-            kline = self._fetch_kline(code)[:per_stock_budget]
-            all_kline += f"\n{'#'*60}\n### 股票 {label}\n{kline}\n"
-            plan, plan_text = self._build_trade_plan(code)
-            if plan_text:
-                plans[code] = plan
-                plan_blocks.append(f"### {label}\n{plan_text}")
+            all_kline += f"\n{'#'*60}\n### 股票 {label}\n{self._fetch_kline(code)}\n"
+            try:
+                plan, plan_text = self._build_trade_plan(code)
+                if plan:
+                    plans[code] = plan
+                    plans_text[code] = plan_text
+            except Exception as e:
+                logger.warning(f"[{code}] 交易计划生成失败: {e}")
 
-        plans_text = ""
-        if plan_blocks:
-            plans_text = ("【各候选操作参考（程序规则计算，与排名互相独立）】\n"
-                          + "\n\n".join(plan_blocks))
-
-        # 相对强度：绝对指标之外的横向确认信号（vs 候选池均值 / vs 沪深300）
-        rs_block = self._compute_rs_block(codes)
+        # 拼交易计划块
+        trade_block = ""
+        if plans_text:
+            trade_block = "\n\n".join(
+                f"=== 操作参考({code}) ===\n{t}" for code, t in plans_text.items())
+            trade_block = f"\n{trade_block}\n"
 
         messages = [
             SystemMessage(content=self._build_chain_prompt()),
@@ -345,14 +276,11 @@ class TechnicalAgent:
 
 【用户问题】{question}
 
-{all_kline}
+{trade_block}
 
-{rs_block}
+{all_kline[:25000]}
 
-{plans_text}
-
-请逐只打分 → 排名 → 选出技术面最强的1只；
-排名与"技术面最强"的选择必须参考【相对强度RS】的程序数字（引用原数，禁止自行推算涨幅）；
+请逐只打分 → 排名 → 选出技术面最强的1只。
 点评你选出的最强标的时，引用其【操作参考】的程序数字（方向/价位/盈亏比/仓位），禁止修改。"""),
         ]
 
@@ -362,8 +290,14 @@ class TechnicalAgent:
 
         return {
             "messages": [response],
-            "technical_result": {"summary": summary, "mode": "chain", "codes": codes,
-                                 "trade_plans": plans, "trade_plans_text": plans_text},
+            "current_node": self.name,
+            "technical_result": {
+                "summary": summary,
+                "mode": "chain",
+                "codes": codes,
+                "trade_plans": plans,
+                "trade_plans_text": plans_text,
+            },
             "intermediate_steps": [("technical_analyze", {"mode": "chain", "count": len(codes)})],
         }
 

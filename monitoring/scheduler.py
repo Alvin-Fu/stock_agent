@@ -64,6 +64,23 @@ class MonitorScheduler:
             self.condition_watcher.scan()
         except Exception as e:
             logger.error(f"[监控] 条件触发盯盘异常: {e}")
+        # 业务指标预警扫描（北向持仓/存货周转/渗透率）
+        try:
+            from monitoring.business_watcher import scan_all as scan_business
+            biz_alerts = scan_business()
+            if biz_alerts:
+                logger.info(f"业务指标扫描完成，{len(biz_alerts)} 条预警")
+        except Exception as e:
+            logger.error(f"业务指标扫描失败: {e}")
+
+        # 产业链候选池监控
+        try:
+            from monitoring.industry_watcher import scan_all as scan_industry
+            industry_alerts = scan_industry()
+            if industry_alerts:
+                logger.info(f"产业链监控扫描完成，{len(industry_alerts)} 条预警")
+        except Exception as e:
+            logger.error(f"产业链监控扫描失败: {e}")
 
     def _run_news_scan(self):
         hour = datetime.now().hour

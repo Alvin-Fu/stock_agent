@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ===================================
-AkshareFetcher - 主数据源 (Priority 0)
+AkshareFetcher - 主数据源 (Priority 1)
 ===================================
 
 数据来源：东方财富爬虫（通过 akshare 库）
@@ -44,7 +44,6 @@ import logging
 from utils.logger import logger
 import random
 import time
-import requests
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Union
 from .common import extract_last_segment_standard, _is_etf_code, _is_hk_code
@@ -223,8 +222,8 @@ _etf_realtime_cache: Dict[str, Any] = {
 class AkshareFetcher(BaseFetcher):
     """
     Akshare 数据源实现
-
-    优先级：0（最高，主数据源）
+    
+    优先级：1（最高）
     数据来源：东方财富网爬虫
     
     关键策略：
@@ -234,7 +233,7 @@ class AkshareFetcher(BaseFetcher):
     """
     
     name = "AkshareFetcher"
-    priority = 1  # 备用数据源（主源为 Tushare）
+    priority = 1
     
     def __init__(self, sleep_min: float = 10.0, sleep_max: float = 50.0):
         """
@@ -288,12 +287,7 @@ class AkshareFetcher(BaseFetcher):
     @retry(
         stop=stop_after_attempt(3),  # 最多重试3次
         wait=wait_exponential(multiplier=1, min=2, max=30),  # 指数退避：2, 4, 8... 最大30秒
-        retry=retry_if_exception_type((
-            ConnectionError,
-            TimeoutError,
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-        )),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def _fetch_raw_data(self, freq: str, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -311,52 +305,44 @@ class AkshareFetcher(BaseFetcher):
         4. 调用对应的 akshare API
         5. 处理返回数据
         """
-        # freq -> akshare period 参数映射（stock_zh_a_hist 原生支持日/周/月线）
-        period_map = {"daily": "daily", "week": "weekly", "month": "monthly"}
-        period = period_map.get(freq)
-        if period is None:
+        if freq != "daily":
             raise ValueError(f"不支持的频率: {freq}")
-        # 根据代码类型选择不同的获取方法（ETF/港股暂只支持日线）
+        # 根据代码类型选择不同的获取方法
         if _is_hk_code(stock_code):
-            if freq != "daily":
-                raise ValueError(f"港股暂不支持{freq}线")
             return self._fetch_hk_data(stock_code, start_date, end_date)
         elif _is_etf_code(stock_code):
-            if freq != "daily":
-                raise ValueError(f"ETF暂不支持{freq}线")
             return self._fetch_etf_data(stock_code, start_date, end_date)
         else:
-            return self._fetch_stock_data(stock_code, start_date, end_date, period)
+            return self._fetch_stock_data(stock_code, start_date, end_date)
     
-    def _fetch_stock_data(self, stock_code: str, start_date: str, end_date: str,
-                          period: str = "daily") -> pd.DataFrame:
+    def _fetch_stock_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
-        获取普通 A 股历史数据（period: daily/weekly/monthly，同一接口原生支持）
-
+        获取普通 A 股历史数据
+        
         数据来源：ak.stock_zh_a_hist()
         """
         import akshare as ak
 
-
+        
         # 防封禁策略 1: 随机 User-Agent
         self._set_random_user_agent()
-
+        
         # 防封禁策略 2: 强制休眠
         self._enforce_rate_limit()
-
-        logger.info(f"[API调用] ak.stock_zh_a_hist(symbol={stock_code}, period={period}, "
+        
+        logger.info(f"[API调用] ak.stock_zh_a_hist(symbol={stock_code}, period=daily, "
                    f"start_date={start_date.replace('-', '')}, end_date={end_date.replace('-', '')}, adjust=qfq)")
-
+        
         try:
-            # 调用 akshare 获取 A 股K线数据
-            # period: daily=日线 weekly=周线 monthly=月线
+            # 调用 akshare 获取 A 股日线数据
+            # period="daily" 获取日线数据
             # adjust="qfq" 获取前复权数据
             import time as _time
             api_start = _time.time()
-
+            
             df = ak.stock_zh_a_hist(
                 symbol=stock_code,
-                period=period,
+                period="daily",
                 start_date=start_date.replace('-', ''),
                 end_date=end_date.replace('-', ''),
                 adjust="qfq"  # 前复权
@@ -519,9 +505,8 @@ class AkshareFetcher(BaseFetcher):
         
         需要映射到标准列名：
         date, open, high, low, close, volume, amount, pct_chg
-        （日/周/月线的返回列结构一致，共用同一套标准化逻辑）
         """
-        if freq not in ("daily", "week", "month"):
+        if freq != "daily":
             raise ValueError(f"不支持的频率: {freq}")
 
         df = df.copy()
@@ -540,12 +525,7 @@ class AkshareFetcher(BaseFetcher):
         
         # 重命名列
         df = df.rename(columns=column_mapping)
-
-        # 成交量单位转换（akshare A股/ETF 的成交量单位是手，统一转换为股；
-        # 港股接口返回的成交量本身就是股，不重复转换）
-        if 'volume' in df.columns and not _is_hk_code(stock_code):
-            df['volume'] = df['volume'] * 100
-
+        
         # 添加股票代码列
         df['code'] = stock_code
         
@@ -1058,6 +1038,182 @@ class AkshareFetcher(BaseFetcher):
         
         return result
 
+    def new_energy_penetration(self) -> pd.DataFrame:
+        """
+        获取新能源车月度销量及渗透率数据（行业宏观数据）
+        数据来源：Akshare 乘联会 CPCA 数据
+        返回:
+            DataFrame: 包含月份、总销量、新能源车销量、渗透率等字段
+        """
+        try:
+            import akshare as ak
+            self._enforce_rate_limit()
+            logger.info("获取新能源车渗透率数据")
+
+            try:
+                total_df = ak.car_market_total_cpca()
+                fuel_df = ak.car_market_fuel_cpca()
+
+                if total_df.empty or fuel_df.empty:
+                    logger.warning("未获取到汽车销量数据")
+                    return pd.DataFrame()
+
+                result_rows = []
+                for year_col in [col for col in total_df.columns if '年' in col]:
+                    year = year_col.replace('年', '')
+                    for _, row in total_df.iterrows():
+                        month_str = str(row['月份'])
+                        month_num = int(month_str.replace('月', ''))
+                        month_date = f"{year}-{month_num:02d}"
+
+                        total_val = row.get(year_col)
+                        fuel_row = fuel_df[fuel_df['月份'] == row['月份']]
+                        fuel_val = fuel_row.iloc[0][year_col] if not fuel_row.empty else None
+
+                        if total_val is not None and fuel_val is not None and pd.notna(total_val) and pd.notna(fuel_val):
+                            new_energy = total_val - fuel_val
+                            penetration = (new_energy / total_val * 100) if total_val > 0 else None
+                            result_rows.append({
+                                'month': month_date,
+                                'total_sales': float(total_val) * 10000,
+                                'new_energy_sales': float(new_energy) * 10000,
+                                'penetration_rate': float(penetration) if penetration else None,
+                            })
+
+                if not result_rows:
+                    logger.warning("未获取到有效新能源车渗透率数据")
+                    return pd.DataFrame()
+
+                result_df = pd.DataFrame(result_rows)
+                result_df['month'] = pd.to_datetime(result_df['month'])
+                result_df = result_df.sort_values('month', ascending=False).reset_index(drop=True)
+
+                logger.info(f"获取新能源车渗透率数据成功，共 {len(result_df)} 条记录")
+                return result_df
+            except Exception as e:
+                logger.warning(f"乘联会数据获取失败，尝试其他接口: {e}")
+
+            try:
+                df = ak.energy_car_sales_yearly_em()
+                if df is not None and not df.empty:
+                    return df
+            except Exception:
+                pass
+
+            try:
+                df = ak.new_energy_vehicle_sales_rank()
+                if df is not None and not df.empty:
+                    return df
+            except Exception:
+                pass
+
+            logger.warning("未获取到新能源车渗透率数据")
+            return pd.DataFrame()
+        except ImportError:
+            logger.error("akshare 未安装，无法获取新能源车渗透率数据")
+            raise DataSourceUnavailableError("akshare 未安装")
+        except Exception as e:
+            logger.error(f"获取新能源车渗透率数据失败: {e}")
+            raise DataFetchError(f"akshare 获取新能源车渗透率失败: {e}") from e
+
+    # ===== 懂车帝 API - 车型级月销量数据 =====
+    # 数据来源：懂车帝（dongchedi.com）全国车型销量排行榜
+    # 说明：此接口非 Akshare，是本模块直接调用的 HTTP API
+    # 可以获取到指定月份全国各车型的销量数据，精确到车型级别
+
+    def get_vehicle_sales(self, month: str = None) -> pd.DataFrame:
+        """
+        通过懂车帝API获取全国车型月销量排行数据
+        Args:
+            month: 月份，格式 YYYY-MM，默认取最近完整月份
+        Returns:
+            DataFrame: 车型销量数据（车型名、品牌、月销量、指导价等）
+        """
+        from datetime import date, timedelta
+        from calendar import monthrange
+
+        try:
+            import requests
+        except ImportError:
+            logger.error("requests 未安装")
+            raise DataSourceUnavailableError("requests 未安装")
+
+        self._enforce_rate_limit()
+
+        # 默认取上个月
+        if not month:
+            today = date.today()
+            first_of_month = today.replace(day=1)
+            last_month = first_of_month - timedelta(days=1)
+            month = last_month.strftime("%Y-%m")
+        logger.info(f"get_vehicle_sales(month={month})")
+
+        try:
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/120.0.0.0 Safari/537.36"),
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Referer": "https://www.dongchedi.com/sales/rank",
+            })
+
+            # 先访问首页种 Cookie
+            session.get("https://www.dongchedi.com/sales/rank", timeout=10)
+
+            all_models = []
+            offset = 0
+            while True:
+                params = {
+                    "city_name": "全国",
+                    "rank_data_type": "2",
+                    "count": "50",
+                    "offset": str(offset),
+                    "month": month.replace('-', ''),
+                    "aid": "1839",
+                    "app_name": "auto_web_pc",
+                }
+                resp = session.get(
+                    "https://www.dongchedi.com/motor/pc/car/rank_data",
+                    params=params, timeout=15
+                )
+                data = resp.json()
+                lst = data.get('data', {}).get('list', [])
+                if not lst:
+                    break
+                all_models.extend(lst)
+                has_more = data.get('data', {}).get('paging', {}).get('has_more', False)
+                if not has_more:
+                    break
+                offset += 50
+
+            if not all_models:
+                logger.warning(f"未获取到 {month} 月份车型销量数据")
+                return pd.DataFrame()
+
+            rows = []
+            for item in all_models:
+                rows.append({
+                    'month': month,
+                    'series_name': item.get('series_name', ''),
+                    'brand_name': item.get('brand_name', ''),
+                    'sales_volume': item.get('count', 0) or 0,
+                    'min_price': item.get('min_price'),
+                    'max_price': item.get('max_price'),
+                    'price_range': item.get('price', ''),
+                    'rank': item.get('rank'),
+                    'series_id': item.get('series_id'),
+                })
+
+            result_df = pd.DataFrame(rows)
+            logger.info(f"获取 {month} 车型销量数据成功，共 {len(result_df)} 条")
+            return result_df
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"获取懂车帝车型销量数据失败: {e}")
+            raise DataFetchError(f"懂车帝车型销量获取失败: {error_msg}") from e
 
 
 if __name__ == "__main__":

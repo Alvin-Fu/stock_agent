@@ -94,6 +94,9 @@ database:
 search:
   tavily_api_key: ""
   brave_api_key: ""
+  serpapi_api_key: ""    # SerpAPI（serpapi.com，每月100次免费）
+  google_api_key: ""     # Google Custom Search API Key
+  google_cx: ""          # Google Custom Search Engine ID
 
 # 飞书机器人（python feishu_bot.py 启动；长连接模式，无需公网地址）
 feishu:

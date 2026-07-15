@@ -154,7 +154,10 @@ class ScheduledAnalyzer:
         运行调度器
         """
         while self.running:
-            schedule.run_pending()
+            try:
+                schedule.run_pending()
+            except Exception as e:
+                logger.error(f"[定时任务] 调度循环异常: {e}")
             time.sleep(1)  # 小步轮询，保证 stop() 能及时生效
 
 

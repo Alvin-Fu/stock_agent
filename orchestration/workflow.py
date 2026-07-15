@@ -128,10 +128,24 @@ class WorkflowExecutor:
             code = final_state.get("stock_code") or ""
             tag = final_state.get("industry_name") or (code.replace(",", "_") if code else "query")
             tag = _re.sub(r"[^\w一-鿿_-]", "", str(tag))[:40] or "query"
-            path = f"./data/reports/{_dt.now().strftime('%Y%m%d_%H%M%S')}_{tag}.md"
+            ts = _dt.now().strftime('%Y%m%d_%H%M%S')
+            path = f"./data/reports/{ts}_{tag}.md"
             with open(path, "w", encoding="utf-8") as f:
                 f.write(f"# {question}\n\n> 生成时间：{_dt.now().strftime('%Y-%m-%d %H:%M')}\n\n{answer}\n")
             logger.info(f"报告已归档: {path}")
+
+            # 单只个股时：额外用 full_report_fetcher 生成结构化数据报告
+            if code and "," not in code and len(code) == 6:
+                try:
+                    from tools.stock_tools import call_fetch_full_report
+                    full = call_fetch_full_report(code)
+                    if full and "❌" not in full[:10]:
+                        report_path = f"./data/reports/{ts}_{tag}_full_report.md"
+                        with open(report_path, "w", encoding="utf-8") as f:
+                            f.write(full)
+                        logger.info(f"结构化数据报告已归档: {report_path}")
+                except Exception as e:
+                    logger.warning(f"结构化数据报告生成失败（不影响回答）: {e}")
         except Exception as e:
             logger.warning(f"报告归档失败（不影响本次回答）: {e}")
 

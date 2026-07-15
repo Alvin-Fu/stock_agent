@@ -746,6 +746,412 @@ class TushareFetcher(BaseFetcher):
             list_status: L上市 D退市 P待上市
         """
 
+    def fina_indicator(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        获取财务指标数据
+        args:
+            stock_code: 股票代码
+            start_date: 开始日期 YYYY-MM-DD
+            end_date: 结束日期 YYYY-MM-DD
+        返回:
+            DataFrame: 财务指标数据（eps, roe, roa, gross_margin, inv_turn 等）
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
+        logger.info(f"fina_indicator({ts_code}, {ts_start}, {ts_end})")
+
+        try:
+            df = ts.pro_api().fina_indicator(
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+            )
+            if df.empty:
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare 配额可能超限: {e}")
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare fina_indicator err: {e}") from e
+
+    def fina_mainbz(self, stock_code: str, start_date: str, end_date: str,
+                    bz_type: str = "P") -> pd.DataFrame:
+        """
+        获取主营业务构成数据
+        args:
+            stock_code: 股票代码
+            start_date: 开始日期 YYYY-MM-DD
+            end_date: 结束日期 YYYY-MM-DD
+            bz_type: 业务类型 P按产品 D按地区 I按行业
+        返回:
+            DataFrame: 主营业务构成数据
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
+        logger.info(f"fina_mainbz({ts_code}, {ts_start}, {ts_end}, type={bz_type})")
+
+        try:
+            df = ts.pro_api().fina_mainbz(
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+                type=bz_type,
+            )
+            if df.empty:
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare 配额可能超限: {e}")
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare fina_mainbz err: {e}") from e
+
+    def holdernumber(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        获取股东户数数据
+        args:
+            stock_code: 股票代码
+            start_date: 开始日期 YYYY-MM-DD
+            end_date: 结束日期 YYYY-MM-DD
+        返回:
+            DataFrame: 股东户数数据
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
+        logger.info(f"holdernumber({ts_code}, {ts_start}, {ts_end})")
+
+        try:
+            df = ts.pro_api().stk_holdernumber(
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+            )
+            if df.empty:
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare 配额可能超限: {e}")
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare holdernumber err: {e}") from e
+
+    def hk_hold(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        获取沪深港通持股数据（北向持股）
+        args:
+            stock_code: 股票代码
+            start_date: 开始日期 YYYY-MM-DD
+            end_date: 结束日期 YYYY-MM-DD
+        返回:
+            DataFrame: 北向持股数据
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
+        logger.info(f"hk_hold({ts_code}, {ts_start}, {ts_end})")
+
+        try:
+            df = ts.pro_api().hk_hold(
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+            )
+            if df.empty:
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare 配额可能超限: {e}")
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare hk_hold err: {e}") from e
+
+    def top10_holders(self, stock_code: str, start_date: str, end_date: str,
+                      holder_type: str = "top10") -> pd.DataFrame:
+        """
+        获取十大股东数据
+        args:
+            stock_code: 股票代码
+            start_date: 开始日期 YYYY-MM-DD
+            end_date: 结束日期 YYYY-MM-DD
+            holder_type: top10十大股东 / top10_float十大流通股东
+        返回:
+            DataFrame: 十大股东数据
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
+        logger.info(f"top10_holders({ts_code}, {ts_start}, {ts_end}, type={holder_type})")
+
+        try:
+            api_method = "top10_holders" if holder_type == "top10" else "top10_floatholders"
+            df = getattr(ts.pro_api(), api_method)(
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+            )
+            if df.empty:
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare 配额可能超限: {e}")
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare top10_holders err: {e}") from e
+
+    def sw_daily(self, trade_date: str = None, start_date: str = None,
+                 end_date: str = None) -> pd.DataFrame:
+        """
+        获取申万行业日线行情（含PE/PB等估值指标）
+        注意：2000积分档无权限，返回空DataFrame，由上层通过成分股聚合计算
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        t_date = trade_date.replace('-', '') if trade_date else None
+        ts_start = start_date.replace('-', '') if start_date else None
+        ts_end = end_date.replace('-', '') if end_date else None
+        logger.info(f"sw_daily(trade_date={t_date}, start={ts_start}, end={ts_end})")
+
+        try:
+            df = ts.pro_api().sw_daily(
+                trade_date=t_date,
+                start_date=ts_start,
+                end_date=ts_end,
+            )
+            if df.empty:
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare sw_daily 无权限，将通过成分股聚合计算: {e}")
+                return pd.DataFrame()
+            raise DataFetchError(f"Tushare sw_daily err: {e}") from e
+
+    def index_member(self, index_code: str) -> pd.DataFrame:
+        """
+        获取指数成分股（含申万行业成分）
+        args:
+            index_code: 指数代码，如 801080.SI（申万电子行业）
+        返回:
+            DataFrame: 成分股列表
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        logger.info(f"index_member({index_code})")
+
+        try:
+            df = ts.pro_api().index_member(index_code=index_code)
+            if df.empty:
+                return pd.DataFrame()
+            df = df[df['out_date'].isna()] if 'out_date' in df.columns else df
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare 配额可能超限: {e}")
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare index_member err: {e}") from e
+
+    def daily_basic(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        获取股票每日基本面指标（PE/PB等）
+        args:
+            stock_code: 股票代码
+            start_date: 开始日期 YYYY-MM-DD
+            end_date: 结束日期 YYYY-MM-DD
+        返回:
+            DataFrame: 每日基本面数据
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
+        logger.info(f"daily_basic({ts_code}, {ts_start}, {ts_end})")
+
+        try:
+            df = ts.pro_api().daily_basic(
+                ts_code=ts_code,
+                start_date=ts_start,
+                end_date=ts_end,
+            )
+            if df.empty:
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare 配额可能超限: {e}")
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare daily_basic err: {e}") from e
+
+    def index_classify(self, level: str = 'L1', src: str = 'SW2021') -> pd.DataFrame:
+        """
+        获取行业分类列表
+        args:
+            level: 行业级别 L1/L2/L3
+            src: 分类来源 SW2021/SW2014
+        返回:
+            DataFrame: 行业分类列表
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        logger.info(f"index_classify(level={level}, src={src})")
+
+        try:
+            df = ts.pro_api().index_classify(level=level, src=src)
+            if df.empty:
+                return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
+                logger.warning(f"Tushare 配额可能超限: {e}")
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare index_classify err: {e}") from e
+
+    def repurchase(self, stock_code: str) -> pd.DataFrame:
+        """获取股票回购数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        ts_code, _, _ = self.fetch_common(stock_code, "", "")
+        logger.info(f"repurchase({ts_code})")
+        try:
+            df = ts.pro_api().repurchase(ts_code=ts_code)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare repurchase err: {e}") from e
+
+    def share_float(self, stock_code: str = None, ann_date: str = None) -> pd.DataFrame:
+        """获取限售解禁数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        ts_code = None
+        if stock_code:
+            ts_code, _, _ = self.fetch_common(stock_code, "", "")
+        t_ann = ann_date.replace('-', '') if ann_date else None
+        logger.info(f"share_float(ts_code={ts_code}, ann_date={t_ann})")
+        try:
+            kwargs = {}
+            if ts_code: kwargs['ts_code'] = ts_code
+            if t_ann: kwargs['ann_date'] = t_ann
+            df = ts.pro_api().share_float(**kwargs)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare share_float err: {e}") from e
+
+    def broker_recommend(self, month: str) -> pd.DataFrame:
+        """获取分析师月度评级数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info(f"broker_recommend({month})")
+        try:
+            df = ts.pro_api().broker_recommend(month=month)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare broker_recommend err: {e}") from e
+
+    def pledge_stat(self, stock_code: str) -> pd.DataFrame:
+        """获取股权质押统计数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        ts_code, _, _ = self.fetch_common(stock_code, "", "")
+        logger.info(f"pledge_stat({ts_code})")
+        try:
+            df = ts.pro_api().pledge_stat(ts_code=ts_code)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare pledge_stat err: {e}") from e
+
+    def block_trade(self, stock_code: str = None, start_date: str = None,
+                    end_date: str = None) -> pd.DataFrame:
+        """获取大宗交易数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        ts_code = None
+        if stock_code:
+            ts_code, _, _ = self.fetch_common(stock_code, "", "")
+        ts_start = start_date.replace('-', '') if start_date else None
+        ts_end = end_date.replace('-', '') if end_date else None
+        logger.info(f"block_trade(ts_code={ts_code}, {ts_start}, {ts_end})")
+        try:
+            kwargs = {}
+            if ts_code: kwargs['ts_code'] = ts_code
+            if ts_start: kwargs['start_date'] = ts_start
+            if ts_end: kwargs['end_date'] = ts_end
+            df = ts.pro_api().block_trade(**kwargs)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare block_trade err: {e}") from e
+
+    def top_list(self, trade_date: str) -> pd.DataFrame:
+        """获取龙虎榜每日明细"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        t_date = trade_date.replace('-', '') if trade_date else None
+        logger.info(f"top_list({t_date})")
+        try:
+            df = ts.pro_api().top_list(trade_date=t_date)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare top_list err: {e}") from e
+
+    def top_inst(self, trade_date: str) -> pd.DataFrame:
+        """获取龙虎榜机构席位追踪"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        t_date = trade_date.replace('-', '') if trade_date else None
+        logger.info(f"top_inst({t_date})")
+        try:
+            df = ts.pro_api().top_inst(trade_date=t_date)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare top_inst err: {e}") from e
+
 
 if __name__ == "__main__":
     # 测试代码

@@ -951,6 +951,547 @@ class AnnouncementText(Base):
     )
 
 
+class StockFinaIndicator(Base):
+    """
+    股票财务指标模型
+    数据库表: stock_fina_indicator
+    功能：存储Tushare fina_indicator 108项财务指标的核心字段
+    """
+    __tablename__ = 'stock_fina_indicator'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    report_date = Column(Date, nullable=False, index=True)
+    ann_date = Column(Date)
+    eps = Column(Float)
+    dt_eps = Column(Float)
+    total_revenue_ps = Column(Float)
+    revenue_ps = Column(Float)
+    capital_rese_ps = Column(Float)
+    undist_profit_ps = Column(Float)
+    extra_item = Column(Float)
+    profit_dedt = Column(Float)
+    gross_margin = Column(Float)
+    current_ratio = Column(Float)
+    quick_ratio = Column(Float)
+    cash_ratio = Column(Float)
+    ar_turn = Column(Float)
+    ca_turn = Column(Float)
+    fa_turn = Column(Float)
+    assets_turn = Column(Float)
+    inv_turn = Column(Float)
+    roe = Column(Float)
+    roe_waa = Column(Float)
+    roe_dt = Column(Float)
+    roa = Column(Float)
+    rop = Column(Float)
+    netprofit_margin = Column(Float)
+    grossprofit_margin = Column(Float)
+    profit_to_gr = Column(Float)
+    saleexp_to_gr = Column(Float)
+    adminexp_of_gr = Column(Float)
+    finaexp_of_gr = Column(Float)
+    impai_ttm = Column(Float)
+    op_of_gr = Column(Float)
+    ebit_of_gr = Column(Float)
+    debt_to_assets = Column(Float)
+    debt_to_eqy = Column(Float)
+    n_cashflow_to_liab = Column(Float)
+    mbrg = Column(Float)
+    nprg = Column(Float)
+    seg = Column(Float)
+    profit_yoy = Column(Float)
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'report_date', name='uix_fina_code_date'),
+        Index('ix_fina_code_date', 'code', 'report_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockFinaIndicator(code={self.code}, report_date={self.report_date}, roe={self.roe})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式，便于数据交互"""
+        return {
+            'code': self.code,
+            'report_date': self.report_date,
+            'ann_date': self.ann_date,
+            'eps': self.eps,
+            'dt_eps': self.dt_eps,
+            'total_revenue_ps': self.total_revenue_ps,
+            'revenue_ps': self.revenue_ps,
+            'gross_margin': self.gross_margin,
+            'current_ratio': self.current_ratio,
+            'quick_ratio': self.quick_ratio,
+            'cash_ratio': self.cash_ratio,
+            'ar_turn': self.ar_turn,
+            'ca_turn': self.ca_turn,
+            'fa_turn': self.fa_turn,
+            'assets_turn': self.assets_turn,
+            'inv_turn': self.inv_turn,
+            'roe': self.roe,
+            'roe_waa': self.roe_waa,
+            'roe_dt': self.roe_dt,
+            'roa': self.roa,
+            'rop': self.rop,
+            'netprofit_margin': self.netprofit_margin,
+            'grossprofit_margin': self.grossprofit_margin,
+            'debt_to_assets': self.debt_to_assets,
+            'debt_to_eqy': self.debt_to_eqy,
+            'n_cashflow_to_liab': self.n_cashflow_to_liab,
+            'mbrg': self.mbrg,
+            'nprg': self.nprg,
+            'seg': self.seg,
+            'profit_yoy': self.profit_yoy,
+            'data_source': self.data_source,
+        }
+
+
+class StockMainBusiness(Base):
+    """
+    股票主营业务构成模型
+    数据库表: stock_main_business
+    功能：存储按产品/地区拆分的收入、成本、毛利
+    """
+    __tablename__ = 'stock_main_business'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    report_date = Column(Date, nullable=False, index=True)
+    bz_type = Column(String(5), nullable=False)
+    bz_item = Column(String(100), nullable=False)
+    bz_sales = Column(Float)
+    bz_profit = Column(Float)
+    bz_cost = Column(Float)
+    gross_margin = Column(Float)
+    sales_ratio = Column(Float)
+    curr_type = Column(String(10))
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'report_date', 'bz_type', 'bz_item', name='uix_mb_code_date_type_item'),
+        Index('ix_mb_code_date', 'code', 'report_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockMainBusiness(code={self.code}, report_date={self.report_date}, item={self.bz_item})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式，便于数据交互"""
+        return {
+            'code': self.code,
+            'report_date': self.report_date,
+            'bz_type': self.bz_type,
+            'bz_item': self.bz_item,
+            'bz_sales': self.bz_sales,
+            'bz_profit': self.bz_profit,
+            'bz_cost': self.bz_cost,
+            'gross_margin': self.gross_margin,
+            'sales_ratio': self.sales_ratio,
+            'curr_type': self.curr_type,
+            'data_source': self.data_source,
+        }
+
+
+class StockHolderNumber(Base):
+    """
+    股东户数模型
+    数据库表: stock_holder_number
+    功能：存储每期末股东户数变化
+    """
+    __tablename__ = 'stock_holder_number'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    report_date = Column(Date, nullable=False, index=True)
+    ann_date = Column(Date)
+    holder_num = Column(Float)
+    holder_num_change = Column(Float)
+    holder_num_change_ratio = Column(Float)
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'report_date', name='uix_holder_num_code_date'),
+        Index('ix_holder_num_code_date', 'code', 'report_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockHolderNumber(code={self.code}, report_date={self.report_date}, holder_num={self.holder_num})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式，便于数据交互"""
+        return {
+            'code': self.code,
+            'report_date': self.report_date,
+            'ann_date': self.ann_date,
+            'holder_num': self.holder_num,
+            'holder_num_change': self.holder_num_change,
+            'holder_num_change_ratio': self.holder_num_change_ratio,
+            'data_source': self.data_source,
+        }
+
+
+class StockNorthboundHold(Base):
+    """
+    北向持股模型
+    数据库表: stock_northbound_hold
+    功能：存储沪深港通每日持股数据
+    """
+    __tablename__ = 'stock_northbound_hold'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    name = Column(String(50))
+    vol = Column(Float)
+    ratio = Column(Float)
+    exchange = Column(String(10))
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'trade_date', name='uix_north_code_date'),
+        Index('ix_north_code_date', 'code', 'trade_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockNorthboundHold(code={self.code}, trade_date={self.trade_date}, ratio={self.ratio})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式，便于数据交互"""
+        return {
+            'code': self.code,
+            'trade_date': self.trade_date,
+            'name': self.name,
+            'vol': self.vol,
+            'ratio': self.ratio,
+            'exchange': self.exchange,
+            'data_source': self.data_source,
+        }
+
+
+class StockTop10Holder(Base):
+    """
+    十大股东模型
+    数据库表: stock_top10_holder
+    功能：存储定期报告披露的十大股东/十大流通股东数据
+    """
+    __tablename__ = 'stock_top10_holder'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    report_date = Column(Date, nullable=False, index=True)
+    ann_date = Column(Date)
+    holder_type = Column(String(20), nullable=False)
+    holder_name = Column(String(200), nullable=False)
+    hold_amount = Column(Float)
+    hold_ratio = Column(Float)
+    hold_float_ratio = Column(Float)
+    hold_change = Column(String(20))
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'report_date', 'holder_type', 'holder_name', name='uix_top10_code_date_type_name'),
+        Index('ix_top10_code_date', 'code', 'report_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockTop10Holder(code={self.code}, report_date={self.report_date}, name={self.holder_name})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式，便于数据交互"""
+        return {
+            'code': self.code,
+            'report_date': self.report_date,
+            'ann_date': self.ann_date,
+            'holder_type': self.holder_type,
+            'holder_name': self.holder_name,
+            'hold_amount': self.hold_amount,
+            'hold_ratio': self.hold_ratio,
+            'hold_float_ratio': self.hold_float_ratio,
+            'hold_change': self.hold_change,
+            'data_source': self.data_source,
+        }
+
+
+class IndustryValuation(Base):
+    """
+    行业估值缓存模型
+    数据库表: industry_valuation
+    功能：存储申万行业每日估值（PE/PB/股息率等），用于同业对比
+    """
+    __tablename__ = 'industry_valuation'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    industry_code = Column(String(20), nullable=False, index=True)
+    industry_name = Column(String(50))
+    trade_date = Column(Date, nullable=False, index=True)
+    pe_static = Column(Float)
+    pe_ttm = Column(Float)
+    pb = Column(Float)
+    dividend_ratio = Column(Float)
+    stock_count = Column(Integer)
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('industry_code', 'trade_date', name='uix_iv_code_date'),
+        Index('ix_iv_code_date', 'industry_code', 'trade_date'),
+    )
+
+    def __repr__(self):
+        return f"<IndustryValuation(industry={self.industry_name}, date={self.trade_date}, pe_ttm={self.pe_ttm})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式，便于数据交互"""
+        return {
+            'industry_code': self.industry_code,
+            'industry_name': self.industry_name,
+            'trade_date': self.trade_date,
+            'pe_static': self.pe_static,
+            'pe_ttm': self.pe_ttm,
+            'pb': self.pb,
+            'dividend_ratio': self.dividend_ratio,
+            'stock_count': self.stock_count,
+            'data_source': self.data_source,
+        }
+
+
+class NewEnergyPenetration(Base):
+    """
+    新能源车渗透率模型
+    数据库表: new_energy_penetration
+    功能：存储新能源车月度销量及渗透率数据
+    """
+    __tablename__ = 'new_energy_penetration'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    month = Column(Date, nullable=False, index=True)
+    total_sales = Column(Float)
+    new_energy_sales = Column(Float)
+    penetration_rate = Column(Float)
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('month', name='uix_nep_month'),
+    )
+
+    def __repr__(self):
+        return f"<NewEnergyPenetration(month={self.month}, rate={self.penetration_rate})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """转换为字典格式，便于数据交互"""
+        return {
+            'month': self.month,
+            'total_sales': self.total_sales,
+            'new_energy_sales': self.new_energy_sales,
+            'penetration_rate': self.penetration_rate,
+            'data_source': self.data_source,
+        }
+
+
+class VehicleMonthlySales(Base):
+    """懂车帝-全国车型月销量数据"""
+    __tablename__ = 'vehicle_monthly_sales'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    month = Column(String(7), nullable=False, index=True)
+    series_name = Column(String(50), nullable=False)
+    brand_name = Column(String(50))
+    sales_volume = Column(Integer)
+    min_price = Column(Float)
+    max_price = Column(Float)
+    price_range = Column(String(50))
+    rank = Column(Integer)
+    series_id = Column(Integer)
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('month', 'series_name', name='uix_vms_month_series'),
+    )
+
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockRepurchase(Base):
+    """股票回购"""
+    __tablename__ = 'stock_repurchase'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    ann_date = Column(Date, nullable=False)
+    end_date = Column(Date)
+    proc = Column(String(50))
+    exp_date = Column(Date)
+    vol = Column(Float)
+    amount = Column(Float)
+    high_limit = Column(Float)
+    low_limit = Column(Float)
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'ann_date', name='uix_rep_code_date'),
+    )
+
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockShareFloat(Base):
+    """限售解禁"""
+    __tablename__ = 'stock_share_float'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    ann_date = Column(Date)
+    float_date = Column(Date, nullable=False, index=True)
+    float_share = Column(Float)
+    float_ratio = Column(Float)
+    holder_name = Column(String(200))
+    share_type = Column(String(50))
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'float_date', 'holder_name', name='uix_sf_code_date_holder'),
+    )
+
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockBrokerReco(Base):
+    """分析师月度评级"""
+    __tablename__ = 'stock_broker_reco'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    month = Column(String(6), nullable=False, index=True)
+    broker = Column(String(100), nullable=False)
+    name = Column(String(50))
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'month', 'broker', name='uix_br_code_month_broker'),
+    )
+
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockPledge(Base):
+    """股权质押统计"""
+    __tablename__ = 'stock_pledge'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    pledge_count = Column(Integer)
+    unrest_pledge = Column(Float)
+    rest_pledge = Column(Float)
+    total_share = Column(Float)
+    pledge_ratio = Column(Float)
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'end_date', name='uix_pg_code_date'),
+    )
+
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockBlockTrade(Base):
+    """大宗交易"""
+    __tablename__ = 'stock_block_trade'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    price = Column(Float)
+    vol = Column(Float)
+    amount = Column(Float)
+    buyer = Column(String(200))
+    seller = Column(String(200))
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'trade_date', 'price', 'vol', name='uix_bt_code_date_price'),
+    )
+
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockTopList(Base):
+    """龙虎榜每日明细"""
+    __tablename__ = 'stock_top_list'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    name = Column(String(50))
+    close = Column(Float)
+    pct_change = Column(Float)
+    turnover_rate = Column(Float)
+    amount = Column(Float)
+    l_sell = Column(Float)
+    l_buy = Column(Float)
+    l_amount = Column(Float)
+    net_amount = Column(Float)
+    net_rate = Column(Float)
+    amount_rate = Column(Float)
+    float_values = Column(Float)
+    reason = Column(String(200))
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'trade_date', name='uix_tl_code_date'),
+    )
+
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockTopInst(Base):
+    """龙虎榜机构席位追踪"""
+    __tablename__ = 'stock_top_inst'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    exalter = Column(String(50))
+    buy = Column(Float)
+    buy_rate = Column(Float)
+    sell = Column(Float)
+    sell_rate = Column(Float)
+    net_buy = Column(Float)
+    side = Column(String(10))
+    reason = Column(String(100))
+    data_source = Column(String(50))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'trade_date', name='uix_ti_code_date'),
+    )
+
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
 class AnalysisSnapshot(Base):
     """
     分析快照：每次个股分析完成后留档的「可检验判断」，复盘的对账依据
@@ -1045,6 +1586,7 @@ class IndustrySnapshot(Base):
     industry_view = Column(String(10))  # 行业判断：偏多/中性/偏空
     valuation = Column(Text)  # 行业估值与位置指标 JSON（含 overall 标签，复盘对账用）
     excluded = Column(Text)  # JSON: 被阶段门槛剔除的公司 [{"code","name","price"}]，门槛有效性对账用
+    watch = Column(Text)  # JSON: 观察备选池（距门槛≤0.5分）[{"code","name","price"}]
     benchmark_price = Column(Float)  # 沪深300 当时点位
     review_done = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.now, index=True)
@@ -1059,6 +1601,7 @@ class IndustrySnapshot(Base):
             'industry_view': self.industry_view,
             'valuation': self.valuation,
             'excluded': self.excluded,
+            'watch': self.watch,
             'benchmark_price': self.benchmark_price,
             'review_done': bool(self.review_done),
             'created_at': self.created_at,
@@ -4075,6 +4618,1128 @@ class DatabaseManager:
                 data_list['code'] = data_list['code'].astype(str)
 
             return data_list
+
+    def save_stock_fina_indicator(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存财务指标数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含财务指标数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存财务指标数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                report_dates = [parse_row_date(d) for d in df['report_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockFinaIndicator).where(
+                        and_(
+                            StockFinaIndicator.code == code,
+                            StockFinaIndicator.report_date.in_(report_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {r.report_date: r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    report_date = parse_row_date(row.get('report_date'))
+                    ann_date = parse_row_date(row.get('ann_date')) if row.get('ann_date') else None
+                    existing = existing_map.get(report_date)
+
+                    if existing:
+                        existing.ann_date = ann_date
+                        existing.eps = row.get('eps')
+                        existing.dt_eps = row.get('dt_eps')
+                        existing.total_revenue_ps = row.get('total_revenue_ps')
+                        existing.revenue_ps = row.get('revenue_ps')
+                        existing.gross_margin = row.get('gross_margin')
+                        existing.current_ratio = row.get('current_ratio')
+                        existing.quick_ratio = row.get('quick_ratio')
+                        existing.cash_ratio = row.get('cash_ratio')
+                        existing.ar_turn = row.get('ar_turn')
+                        existing.ca_turn = row.get('ca_turn')
+                        existing.fa_turn = row.get('fa_turn')
+                        existing.assets_turn = row.get('assets_turn')
+                        existing.inv_turn = row.get('inv_turn')
+                        existing.roe = row.get('roe')
+                        existing.roe_waa = row.get('roe_waa')
+                        existing.roe_dt = row.get('roe_dt')
+                        existing.roa = row.get('roa')
+                        existing.rop = row.get('rop')
+                        existing.netprofit_margin = row.get('netprofit_margin')
+                        existing.grossprofit_margin = row.get('grossprofit_margin')
+                        existing.debt_to_assets = row.get('debt_to_assets')
+                        existing.debt_to_eqy = row.get('debt_to_eqy')
+                        existing.n_cashflow_to_liab = row.get('n_cashflow_to_liab')
+                        existing.mbrg = row.get('mbrg')
+                        existing.nprg = row.get('nprg')
+                        existing.seg = row.get('seg')
+                        existing.profit_yoy = row.get('profit_yoy')
+                        existing.data_source = row.get('data_source', 'Tushare')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockFinaIndicator(
+                            code=code,
+                            report_date=report_date,
+                            ann_date=ann_date,
+                            eps=row.get('eps'),
+                            dt_eps=row.get('dt_eps'),
+                            total_revenue_ps=row.get('total_revenue_ps'),
+                            revenue_ps=row.get('revenue_ps'),
+                            gross_margin=row.get('gross_margin'),
+                            current_ratio=row.get('current_ratio'),
+                            quick_ratio=row.get('quick_ratio'),
+                            cash_ratio=row.get('cash_ratio'),
+                            ar_turn=row.get('ar_turn'),
+                            ca_turn=row.get('ca_turn'),
+                            fa_turn=row.get('fa_turn'),
+                            assets_turn=row.get('assets_turn'),
+                            inv_turn=row.get('inv_turn'),
+                            roe=row.get('roe'),
+                            roe_waa=row.get('roe_waa'),
+                            roe_dt=row.get('roe_dt'),
+                            roa=row.get('roa'),
+                            rop=row.get('rop'),
+                            netprofit_margin=row.get('netprofit_margin'),
+                            grossprofit_margin=row.get('grossprofit_margin'),
+                            debt_to_assets=row.get('debt_to_assets'),
+                            debt_to_eqy=row.get('debt_to_eqy'),
+                            n_cashflow_to_liab=row.get('n_cashflow_to_liab'),
+                            mbrg=row.get('mbrg'),
+                            nprg=row.get('nprg'),
+                            seg=row.get('seg'),
+                            profit_yoy=row.get('profit_yoy'),
+                            data_source=row.get('data_source', 'Tushare'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 财务指标数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 财务指标数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 财务指标数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_fina_indicator(self, code: str, start_date: Optional[date] = None,
+                                 end_date: Optional[date] = None) -> pd.DataFrame:
+        """
+        获取财务指标数据
+        Args:
+            code: 股票代码
+            start_date: 开始日期（可选）
+            end_date: 结束日期（可选）
+        Returns:
+            pd.DataFrame: 财务指标数据
+        """
+        with self.get_session() as session:
+            query = select(StockFinaIndicator).where(StockFinaIndicator.code == code)
+
+            if start_date:
+                query = query.where(StockFinaIndicator.report_date >= start_date)
+            if end_date:
+                query = query.where(StockFinaIndicator.report_date <= end_date)
+
+            results = session.execute(query.order_by(desc(StockFinaIndicator.report_date))).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'report_date' in data_list.columns:
+                data_list['report_date'] = data_list['report_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    def save_stock_main_business(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存主营业务构成数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含主营业务数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存主营业务数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    report_date = parse_row_date(row.get('report_date'))
+                    bz_type = row.get('bz_type', 'P')
+                    bz_item = row.get('bz_item', '')
+
+                    existing = session.execute(
+                        select(StockMainBusiness).where(
+                            and_(
+                                StockMainBusiness.code == code,
+                                StockMainBusiness.report_date == report_date,
+                                StockMainBusiness.bz_type == bz_type,
+                                StockMainBusiness.bz_item == bz_item,
+                            )
+                        )
+                    ).scalar_one_or_none()
+
+                    if existing:
+                        existing.bz_sales = row.get('bz_sales')
+                        existing.bz_profit = row.get('bz_profit')
+                        existing.bz_cost = row.get('bz_cost')
+                        existing.gross_margin = row.get('gross_margin')
+                        existing.sales_ratio = row.get('sales_ratio')
+                        existing.curr_type = row.get('curr_type')
+                        existing.data_source = row.get('data_source', 'Tushare')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockMainBusiness(
+                            code=code,
+                            report_date=report_date,
+                            bz_type=bz_type,
+                            bz_item=bz_item,
+                            bz_sales=row.get('bz_sales'),
+                            bz_profit=row.get('bz_profit'),
+                            bz_cost=row.get('bz_cost'),
+                            gross_margin=row.get('gross_margin'),
+                            sales_ratio=row.get('sales_ratio'),
+                            curr_type=row.get('curr_type'),
+                            data_source=row.get('data_source', 'Tushare'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 主营业务数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 主营业务数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 主营业务数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_main_business(self, code: str, start_date: Optional[date] = None,
+                                end_date: Optional[date] = None,
+                                bz_type: Optional[str] = None) -> pd.DataFrame:
+        """
+        获取主营业务构成数据
+        Args:
+            code: 股票代码
+            start_date: 开始日期（可选）
+            end_date: 结束日期（可选）
+            bz_type: 业务类型 P产品/D地区/I行业（可选）
+        Returns:
+            pd.DataFrame: 主营业务数据
+        """
+        with self.get_session() as session:
+            query = select(StockMainBusiness).where(StockMainBusiness.code == code)
+
+            if start_date:
+                query = query.where(StockMainBusiness.report_date >= start_date)
+            if end_date:
+                query = query.where(StockMainBusiness.report_date <= end_date)
+            if bz_type:
+                query = query.where(StockMainBusiness.bz_type == bz_type)
+
+            results = session.execute(query.order_by(desc(StockMainBusiness.report_date))).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'report_date' in data_list.columns:
+                data_list['report_date'] = data_list['report_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    def save_stock_holder_number(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存股东户数数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含股东户数数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存股东户数数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                report_dates = [parse_row_date(d) for d in df['report_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockHolderNumber).where(
+                        and_(
+                            StockHolderNumber.code == code,
+                            StockHolderNumber.report_date.in_(report_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {r.report_date: r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    report_date = parse_row_date(row.get('report_date'))
+                    ann_date = parse_row_date(row.get('ann_date')) if row.get('ann_date') else None
+                    existing = existing_map.get(report_date)
+
+                    if existing:
+                        existing.ann_date = ann_date
+                        existing.holder_num = row.get('holder_num')
+                        existing.holder_num_change = row.get('holder_num_change')
+                        existing.holder_num_change_ratio = row.get('holder_num_change_ratio')
+                        existing.data_source = row.get('data_source', 'Tushare')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockHolderNumber(
+                            code=code,
+                            report_date=report_date,
+                            ann_date=ann_date,
+                            holder_num=row.get('holder_num'),
+                            holder_num_change=row.get('holder_num_change'),
+                            holder_num_change_ratio=row.get('holder_num_change_ratio'),
+                            data_source=row.get('data_source', 'Tushare'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 股东户数数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 股东户数数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 股东户数数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_holder_number(self, code: str, start_date: Optional[date] = None,
+                                end_date: Optional[date] = None) -> pd.DataFrame:
+        """
+        获取股东户数数据
+        Args:
+            code: 股票代码
+            start_date: 开始日期（可选）
+            end_date: 结束日期（可选）
+        Returns:
+            pd.DataFrame: 股东户数数据
+        """
+        with self.get_session() as session:
+            query = select(StockHolderNumber).where(StockHolderNumber.code == code)
+
+            if start_date:
+                query = query.where(StockHolderNumber.report_date >= start_date)
+            if end_date:
+                query = query.where(StockHolderNumber.report_date <= end_date)
+
+            results = session.execute(query.order_by(desc(StockHolderNumber.report_date))).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'report_date' in data_list.columns:
+                data_list['report_date'] = data_list['report_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    def save_stock_northbound_hold(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存北向持股数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含北向持股数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存北向持股数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                trade_dates = [parse_row_date(d) for d in df['trade_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockNorthboundHold).where(
+                        and_(
+                            StockNorthboundHold.code == code,
+                            StockNorthboundHold.trade_date.in_(trade_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {r.trade_date: r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    trade_date = parse_row_date(row.get('trade_date'))
+                    existing = existing_map.get(trade_date)
+
+                    if existing:
+                        existing.name = row.get('name')
+                        existing.vol = row.get('vol')
+                        existing.ratio = row.get('ratio')
+                        existing.exchange = row.get('exchange')
+                        existing.data_source = row.get('data_source', 'Tushare')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockNorthboundHold(
+                            code=code,
+                            trade_date=trade_date,
+                            name=row.get('name'),
+                            vol=row.get('vol'),
+                            ratio=row.get('ratio'),
+                            exchange=row.get('exchange'),
+                            data_source=row.get('data_source', 'Tushare'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 北向持股数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 北向持股数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 北向持股数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_northbound_hold(self, code: str, start_date: Optional[date] = None,
+                                  end_date: Optional[date] = None) -> pd.DataFrame:
+        """
+        获取北向持股数据
+        Args:
+            code: 股票代码
+            start_date: 开始日期（可选）
+            end_date: 结束日期（可选）
+        Returns:
+            pd.DataFrame: 北向持股数据
+        """
+        with self.get_session() as session:
+            query = select(StockNorthboundHold).where(StockNorthboundHold.code == code)
+
+            if start_date:
+                query = query.where(StockNorthboundHold.trade_date >= start_date)
+            if end_date:
+                query = query.where(StockNorthboundHold.trade_date <= end_date)
+
+            results = session.execute(query.order_by(desc(StockNorthboundHold.trade_date))).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'trade_date' in data_list.columns:
+                data_list['trade_date'] = data_list['trade_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    def save_stock_top10_holder(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存十大股东数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含十大股东数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存十大股东数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    report_date = parse_row_date(row.get('report_date'))
+                    ann_date = parse_row_date(row.get('ann_date')) if row.get('ann_date') else None
+                    holder_type = row.get('holder_type', 'top10')
+                    holder_name = row.get('holder_name', '')
+
+                    existing = session.execute(
+                        select(StockTop10Holder).where(
+                            and_(
+                                StockTop10Holder.code == code,
+                                StockTop10Holder.report_date == report_date,
+                                StockTop10Holder.holder_type == holder_type,
+                                StockTop10Holder.holder_name == holder_name,
+                            )
+                        )
+                    ).scalar_one_or_none()
+
+                    if existing:
+                        existing.ann_date = ann_date
+                        existing.hold_amount = row.get('hold_amount')
+                        existing.hold_ratio = row.get('hold_ratio')
+                        existing.hold_float_ratio = row.get('hold_float_ratio')
+                        existing.hold_change = row.get('hold_change')
+                        existing.data_source = row.get('data_source', 'Tushare')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockTop10Holder(
+                            code=code,
+                            report_date=report_date,
+                            ann_date=ann_date,
+                            holder_type=holder_type,
+                            holder_name=holder_name,
+                            hold_amount=row.get('hold_amount'),
+                            hold_ratio=row.get('hold_ratio'),
+                            hold_float_ratio=row.get('hold_float_ratio'),
+                            hold_change=row.get('hold_change'),
+                            data_source=row.get('data_source', 'Tushare'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 十大股东数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 十大股东数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 十大股东数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_top10_holder(self, code: str, start_date: Optional[date] = None,
+                               end_date: Optional[date] = None,
+                               holder_type: Optional[str] = None) -> pd.DataFrame:
+        """
+        获取十大股东数据
+        Args:
+            code: 股票代码
+            start_date: 开始日期（可选）
+            end_date: 结束日期（可选）
+            holder_type: top10十大股东 / top10_float十大流通股东（可选）
+        Returns:
+            pd.DataFrame: 十大股东数据
+        """
+        with self.get_session() as session:
+            query = select(StockTop10Holder).where(StockTop10Holder.code == code)
+
+            if start_date:
+                query = query.where(StockTop10Holder.report_date >= start_date)
+            if end_date:
+                query = query.where(StockTop10Holder.report_date <= end_date)
+            if holder_type:
+                query = query.where(StockTop10Holder.holder_type == holder_type)
+
+            results = session.execute(query.order_by(desc(StockTop10Holder.report_date))).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'report_date' in data_list.columns:
+                data_list['report_date'] = data_list['report_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    def save_industry_valuation(self, df: pd.DataFrame) -> int:
+        """
+        保存行业估值数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含行业估值数据的DataFrame
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning("保存行业估值数据为空，跳过")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    trade_date = parse_row_date(row.get('trade_date'))
+                    industry_code = row.get('industry_code', '')
+
+                    existing = session.execute(
+                        select(IndustryValuation).where(
+                            and_(
+                                IndustryValuation.industry_code == industry_code,
+                                IndustryValuation.trade_date == trade_date,
+                            )
+                        )
+                    ).scalar_one_or_none()
+
+                    if existing:
+                        existing.industry_name = row.get('industry_name')
+                        existing.pe_static = row.get('pe_static')
+                        existing.pe_ttm = row.get('pe_ttm')
+                        existing.pb = row.get('pb')
+                        existing.dividend_ratio = row.get('dividend_ratio')
+                        existing.stock_count = row.get('stock_count')
+                        existing.data_source = row.get('data_source', 'Tushare')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = IndustryValuation(
+                            industry_code=industry_code,
+                            industry_name=row.get('industry_name'),
+                            trade_date=trade_date,
+                            pe_static=row.get('pe_static'),
+                            pe_ttm=row.get('pe_ttm'),
+                            pb=row.get('pb'),
+                            dividend_ratio=row.get('dividend_ratio'),
+                            stock_count=row.get('stock_count'),
+                            data_source=row.get('data_source', 'Tushare'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存行业估值数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存行业估值数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存行业估值数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_industry_valuation(self, industry_code: Optional[str] = None,
+                               trade_date: Optional[date] = None,
+                               start_date: Optional[date] = None,
+                               end_date: Optional[date] = None) -> pd.DataFrame:
+        """
+        获取行业估值数据
+        Args:
+            industry_code: 行业代码（可选）
+            trade_date: 交易日期（可选）
+            start_date: 开始日期（可选）
+            end_date: 结束日期（可选）
+        Returns:
+            pd.DataFrame: 行业估值数据
+        """
+        with self.get_session() as session:
+            query = select(IndustryValuation)
+
+            if industry_code:
+                query = query.where(IndustryValuation.industry_code == industry_code)
+            if trade_date:
+                query = query.where(IndustryValuation.trade_date == trade_date)
+            if start_date:
+                query = query.where(IndustryValuation.trade_date >= start_date)
+            if end_date:
+                query = query.where(IndustryValuation.trade_date <= end_date)
+
+            results = session.execute(query.order_by(desc(IndustryValuation.trade_date))).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'trade_date' in data_list.columns:
+                data_list['trade_date'] = data_list['trade_date'].apply(lambda x: pd.Timestamp(x))
+
+            return data_list
+
+    def save_new_energy_penetration(self, df: pd.DataFrame) -> int:
+        """
+        保存新能源车渗透率数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含新能源车渗透率数据的DataFrame
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning("保存新能源车渗透率数据为空，跳过")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    month = parse_row_date(row.get('month'))
+
+                    existing = session.execute(
+                        select(NewEnergyPenetration).where(
+                            NewEnergyPenetration.month == month
+                        )
+                    ).scalar_one_or_none()
+
+                    if existing:
+                        existing.total_sales = row.get('total_sales')
+                        existing.new_energy_sales = row.get('new_energy_sales')
+                        existing.penetration_rate = row.get('penetration_rate')
+                        existing.data_source = row.get('data_source', 'Akshare')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = NewEnergyPenetration(
+                            month=month,
+                            total_sales=row.get('total_sales'),
+                            new_energy_sales=row.get('new_energy_sales'),
+                            penetration_rate=row.get('penetration_rate'),
+                            data_source=row.get('data_source', 'Akshare'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存新能源车渗透率数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存新能源车渗透率数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存新能源车渗透率数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_new_energy_penetration(self, start_date: Optional[date] = None,
+                                    end_date: Optional[date] = None) -> pd.DataFrame:
+        """
+        获取新能源车渗透率数据
+        Args:
+            start_date: 开始日期（可选）
+            end_date: 结束日期（可选）
+        Returns:
+            pd.DataFrame: 新能源车渗透率数据
+        """
+        with self.get_session() as session:
+            query = select(NewEnergyPenetration)
+
+            if start_date:
+                query = query.where(NewEnergyPenetration.month >= start_date)
+            if end_date:
+                query = query.where(NewEnergyPenetration.month <= end_date)
+
+            results = session.execute(query.order_by(desc(NewEnergyPenetration.month))).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'month' in data_list.columns:
+                data_list['month'] = data_list['month'].apply(lambda x: pd.Timestamp(x))
+
+            return data_list
+
+    # ===== 车型月销量数据 (懂车帝) =========================================
+
+    def save_vehicle_sales(self, df: pd.DataFrame, month: str) -> int:
+        """保存车型月销量数据"""
+        if df is None or df.empty:
+            return 0
+        from sqlalchemy import delete
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                session.execute(
+                    delete(VehicleMonthlySales).where(VehicleMonthlySales.month == month)
+                )
+                for _, row in df.iterrows():
+                    session.add(VehicleMonthlySales(
+                        month=month,
+                        series_name=row.get('series_name', ''),
+                        brand_name=row.get('brand_name', ''),
+                        sales_volume=int(row.get('sales_volume', 0) or 0),
+                        min_price=row.get('min_price'),
+                        max_price=row.get('max_price'),
+                        price_range=row.get('price_range', ''),
+                        rank=int(row.get('rank', 0) or 0) if row.get('rank') else None,
+                        series_id=int(row.get('series_id', 0)) if row.get('series_id') else None,
+                        data_source='Dongchedi',
+                    ))
+                    saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存车型销量数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_vehicle_sales(self, month: str = None, brand: str = None) -> pd.DataFrame:
+        """获取车型月销量数据"""
+        with self.get_session() as session:
+            query = select(VehicleMonthlySales)
+            if month:
+                query = query.where(VehicleMonthlySales.month == month)
+            if brand:
+                query = query.where(VehicleMonthlySales.brand_name.like(f'%{brand}%'))
+            results = session.execute(
+                query.order_by(VehicleMonthlySales.sales_volume.desc())
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            return pd.DataFrame([r.to_dict() for r in results])
+
+    # ===== 第一梯队新增 save/get =========================================
+
+    def save_stock_repurchase(self, df: pd.DataFrame, code: str) -> int:
+        """保存股票回购数据"""
+        if df is None or df.empty: return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    ann_date = parse_row_date(row.get('ann_date'))
+                    existing = session.execute(
+                        select(StockRepurchase).where(
+                            and_(StockRepurchase.code == code, StockRepurchase.ann_date == ann_date)
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.proc = row.get('proc')
+                        existing.vol = row.get('vol')
+                        existing.amount = row.get('amount')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockRepurchase(
+                            code=code, ann_date=ann_date,
+                            end_date=parse_row_date(row.get('end_date')),
+                            proc=row.get('proc'), exp_date=parse_row_date(row.get('exp_date')),
+                            vol=row.get('vol'), amount=row.get('amount'),
+                            high_limit=row.get('high_limit'), low_limit=row.get('low_limit'),
+                            data_source='Tushare',
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存股票回购数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_repurchase(self, code: str) -> pd.DataFrame:
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockRepurchase).where(StockRepurchase.code == code)
+                .order_by(desc(StockRepurchase.ann_date))
+            ).scalars().all()
+            if not results: return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'ann_date' in df.columns: df['ann_date'] = pd.to_datetime(df['ann_date'])
+            return df
+
+    def save_stock_share_float(self, df: pd.DataFrame, code: str) -> int:
+        """保存限售解禁数据"""
+        if df is None or df.empty: return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    float_date = parse_row_date(row.get('float_date'))
+                    holder_name = row.get('holder_name', '')
+                    existing = session.execute(
+                        select(StockShareFloat).where(
+                            and_(StockShareFloat.code == code,
+                                 StockShareFloat.float_date == float_date,
+                                 StockShareFloat.holder_name == holder_name)
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.float_share = row.get('float_share')
+                        existing.float_ratio = row.get('float_ratio')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockShareFloat(
+                            code=code, ann_date=parse_row_date(row.get('ann_date')),
+                            float_date=float_date,
+                            float_share=row.get('float_share'), float_ratio=row.get('float_ratio'),
+                            holder_name=holder_name, share_type=row.get('share_type'),
+                            data_source='Tushare',
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存限售解禁数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_share_float(self, code: str, future_only: bool = True) -> pd.DataFrame:
+        with self.get_session() as session:
+            query = select(StockShareFloat).where(StockShareFloat.code == code)
+            if future_only:
+                query = query.where(StockShareFloat.float_date >= date.today())
+            results = session.execute(query.order_by(StockShareFloat.float_date.asc())).scalars().all()
+            if not results: return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            for c in ['ann_date', 'float_date']:
+                if c in df.columns: df[c] = pd.to_datetime(df[c])
+            return df
+
+    def save_stock_broker_reco(self, df: pd.DataFrame, code: str) -> int:
+        """保存分析师评级"""
+        if df is None or df.empty: return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    month = str(row.get('month', ''))
+                    broker = str(row.get('broker', ''))
+                    existing = session.execute(
+                        select(StockBrokerReco).where(
+                            and_(StockBrokerReco.code == code,
+                                 StockBrokerReco.month == month,
+                                 StockBrokerReco.broker == broker)
+                        )
+                    ).scalar_one_or_none()
+                    if not existing:
+                        session.add(StockBrokerReco(
+                            code=code, month=month, broker=broker,
+                            name=row.get('name'), data_source='Tushare',
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存分析师评级失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_broker_reco(self, code: str, months: int = 3) -> pd.DataFrame:
+        from datetime import timedelta
+        cutoff = (date.today().replace(day=1) - timedelta(days=months * 31)).strftime('%Y%m')
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockBrokerReco).where(
+                    and_(StockBrokerReco.code == code, StockBrokerReco.month >= cutoff)
+                ).order_by(desc(StockBrokerReco.month))
+            ).scalars().all()
+            if not results: return pd.DataFrame()
+            return pd.DataFrame([r.to_dict() for r in results])
+
+    def save_stock_pledge(self, df: pd.DataFrame, code: str) -> int:
+        """保存股权质押统计"""
+        if df is None or df.empty: return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    end_date = parse_row_date(row.get('end_date'))
+                    existing = session.execute(
+                        select(StockPledge).where(
+                            and_(StockPledge.code == code, StockPledge.end_date == end_date)
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.pledge_count = row.get('pledge_count')
+                        existing.unrest_pledge = row.get('unrest_pledge')
+                        existing.rest_pledge = row.get('rest_pledge')
+                        existing.total_share = row.get('total_share')
+                        existing.pledge_ratio = row.get('pledge_ratio')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockPledge(
+                            code=code, end_date=end_date,
+                            pledge_count=row.get('pledge_count'),
+                            unrest_pledge=row.get('unrest_pledge'),
+                            rest_pledge=row.get('rest_pledge'),
+                            total_share=row.get('total_share'),
+                            pledge_ratio=row.get('pledge_ratio'),
+                            data_source='Tushare',
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存股权质押数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_pledge(self, code: str) -> pd.DataFrame:
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockPledge).where(StockPledge.code == code)
+                .order_by(desc(StockPledge.end_date)).limit(20)
+            ).scalars().all()
+            if not results: return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'end_date' in df.columns: df['end_date'] = pd.to_datetime(df['end_date'])
+            return df
+
+    def save_stock_block_trade(self, df: pd.DataFrame, code: str) -> int:
+        """保存大宗交易"""
+        if df is None or df.empty: return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    trade_date = parse_row_date(row.get('trade_date'))
+                    price = float(row.get('price', 0))
+                    vol = float(row.get('vol', 0))
+                    existing = session.execute(
+                        select(StockBlockTrade).where(
+                            and_(StockBlockTrade.code == code,
+                                 StockBlockTrade.trade_date == trade_date,
+                                 StockBlockTrade.price == price,
+                                 StockBlockTrade.vol == vol)
+                        )
+                    ).scalar_one_or_none()
+                    if not existing:
+                        session.add(StockBlockTrade(
+                            code=code, trade_date=trade_date,
+                            price=price, vol=vol,
+                            amount=row.get('amount'),
+                            buyer=row.get('buyer'), seller=row.get('seller'),
+                            data_source='Tushare',
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存大宗交易数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_block_trade(self, code: str, days: int = 90) -> pd.DataFrame:
+        from datetime import timedelta
+        cutoff = date.today() - timedelta(days=days)
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockBlockTrade).where(
+                    and_(StockBlockTrade.code == code, StockBlockTrade.trade_date >= cutoff)
+                ).order_by(desc(StockBlockTrade.trade_date))
+            ).scalars().all()
+            if not results: return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'trade_date' in df.columns: df['trade_date'] = pd.to_datetime(df['trade_date'])
+            return df
+
+    def save_stock_top_list(self, df: pd.DataFrame, code: str) -> int:
+        """保存龙虎榜"""
+        if df is None or df.empty: return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    trade_date = parse_row_date(row.get('trade_date'))
+                    existing = session.execute(
+                        select(StockTopList).where(
+                            and_(StockTopList.code == code, StockTopList.trade_date == trade_date)
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.pct_change = row.get('pct_change')
+                        existing.turnover_rate = row.get('turnover_rate')
+                        existing.net_amount = row.get('net_amount')
+                        existing.reason = row.get('reason')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockTopList(
+                            code=code, trade_date=trade_date,
+                            name=row.get('name'), close=row.get('close'),
+                            pct_change=row.get('pct_change'),
+                            turnover_rate=row.get('turnover_rate'),
+                            amount=row.get('amount'),
+                            l_sell=row.get('l_sell'), l_buy=row.get('l_buy'),
+                            l_amount=row.get('l_amount'),
+                            net_amount=row.get('net_amount'),
+                            net_rate=row.get('net_rate'),
+                            amount_rate=row.get('amount_rate'),
+                            float_values=row.get('float_values'),
+                            reason=row.get('reason'),
+                            data_source='Tushare',
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存龙虎榜数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_top_list(self, code: str, days: int = 90) -> pd.DataFrame:
+        from datetime import timedelta
+        cutoff = date.today() - timedelta(days=days)
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockTopList).where(
+                    and_(StockTopList.code == code, StockTopList.trade_date >= cutoff)
+                ).order_by(desc(StockTopList.trade_date))
+            ).scalars().all()
+            if not results: return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'trade_date' in df.columns: df['trade_date'] = pd.to_datetime(df['trade_date'])
+            return df
+
+    def save_stock_top_inst(self, df: pd.DataFrame, code: str) -> int:
+        """保存龙虎榜机构席位"""
+        if df is None or df.empty: return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    trade_date = parse_row_date(row.get('trade_date'))
+                    existing = session.execute(
+                        select(StockTopInst).where(
+                            and_(StockTopInst.code == code, StockTopInst.trade_date == trade_date)
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.buy = row.get('buy')
+                        existing.sell = row.get('sell')
+                        existing.net_buy = row.get('net_buy')
+                        existing.side = row.get('side')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockTopInst(
+                            code=code, trade_date=trade_date,
+                            exalter=row.get('exalter'),
+                            buy=row.get('buy'), buy_rate=row.get('buy_rate'),
+                            sell=row.get('sell'), sell_rate=row.get('sell_rate'),
+                            net_buy=row.get('net_buy'),
+                            side=row.get('side'), reason=row.get('reason'),
+                            data_source='Tushare',
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存机构席位数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_top_inst(self, code: str, days: int = 90) -> pd.DataFrame:
+        from datetime import timedelta
+        cutoff = date.today() - timedelta(days=days)
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockTopInst).where(
+                    and_(StockTopInst.code == code, StockTopInst.trade_date >= cutoff)
+                ).order_by(desc(StockTopInst.trade_date))
+            ).scalars().all()
+            if not results: return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'trade_date' in df.columns: df['trade_date'] = pd.to_datetime(df['trade_date'])
+            return df
 
     # ===== 监控清单 / 监控事件 ============================================
 
