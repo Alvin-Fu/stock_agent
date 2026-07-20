@@ -73,7 +73,7 @@ def _format_weibo_text(posts: list) -> str:
     """将微博搜索结果格式化为文本块"""
     if not posts:
         return ""
-    tag = tier_tag(TIER.T3)
+    tag = tier_tag(TIER.T1)
     lines = [f"{tag}【官方微博动态】"]
     for p in posts[:6]:
         prefix = "" if p.get("source") == "weibo" else "⚠️ "
@@ -135,7 +135,7 @@ def _format_wechat_text(articles: list, account: Optional[dict] = None) -> str:
     """将公众号信息格式化为文本块"""
     if not articles and not account:
         return ""
-    tag = tier_tag(TIER.T3)
+    tag = tier_tag(TIER.T1)
     lines = [f"{tag}【微信公众号】"]
     if account:
         lines.append(f"认证公众号：{account.get('name', '')}")
