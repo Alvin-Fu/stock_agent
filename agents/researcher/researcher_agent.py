@@ -880,16 +880,153 @@ class ResearcherAgent:
             text += f"\n{'='*40}\n【{q}】\n{r}\n"
         return text
 
+    # ---------- ETF 分析 ----------
+
+    @staticmethod
+    def _build_etf_system_prompt(has_holdings: bool = True) -> str:
+        today = date.today().strftime("%Y-%m-%d")
+
+        holdings_rule = (
+            "【持仓穿透规则】\n"
+            "- 对前 5 大重仓股逐只做简要基本面分析（主营业务、近期业绩趋势、估值水平）\n"
+            "- 评估每只股票对 ETF 净值的贡献风险（占比过高则集中度高，单一标的风险大）\n"
+            "- 汇总判断：持仓组合的整体质量——是否涵盖龙头、是否有过度集中风险\n\n"
+            "【输出要求】\n"
+            "- 结构化、分维度的研究报告形式\n"
+            "- 需要数据支撑的观点请注明数据来源\n"
+            "- 重点标注折溢价异常（绝对值>1%）、份额大幅变动（>5%）、行业集中度\n"
+            "- 持仓分析要给出具体评判，而非泛泛描述"
+            if has_holdings else
+            "【数据缺失说明】\n"
+            "- 持仓穿透数据暂不可用，分析将聚焦于行情面（价格、折溢价、份额、成交额）\n"
+            "- 以及行业配置（行业集中度与风格暴露）\n"
+            "- 可基于 ETF 名称和追踪指数类型来推断其持仓风格（宽基/行业/主题）\n\n"
+            "【输出要求】\n"
+            "- 结构化、分维度的研究报告形式\n"
+            "- 需要数据支撑的观点请注明数据来源\n"
+            "- 重点标注折溢价异常（绝对值>1%）、份额大幅变动（>5%）、行业集中度\n"
+            "- 明确标注哪些数据因数据源不可用而无法分析"
+        )
+
+        return f"""你是一个专业的 ETF 研究员和基金分析师。今天的日期是 {today}，请以此为时间基准判断"近期/最新"。
+
+【分析框架——覆盖以下维度，逐项分析】
+1. **ETF 基本信息**：名称、类型（宽基/行业/主题/跨境）、规模（AUM）、成立日期
+2. **行情与折溢价**：最新价 vs IOPV（实时净值）、折溢价率、成交额、换手率
+3. **份额与资金流向**：最新份额变动趋势、主力资金流向（净流入/净占比）
+4. **行业配置**：前 5 大行业及其占比，判断行业集中度与风格
+5. **前 5 大重仓股穿透**：逐只分析其基本面亮点与风险，评估持仓质量
+
+{holdings_rule}
+
+【信源优先级】
+🟢 T1 权威（经认证的官方社交账号/公告）> 🔵 T2 结构化（财经媒体）> ⚪ T4 网络搜索
+数据冲突时以高等级为准。"""
+
+    def _analyze_etf(self, state: AgentState) -> Dict[str, Any]:
+        """ETF 分析：行情数据 + 前 5 大重仓股穿透分析"""
+        stock_code = state.get("stock_code", "")
+        question = state.get("question", "")
+        logger.info(f"研究 Agent（ETF 模式），代码: {stock_code}")
+
+        # ---- 1. ETF 行情与基本信息 ----
+        from tools.etf_tools import (
+            fetch_etf_spot, fetch_etf_holdings, fetch_etf_industry_allocation, format_etf_report)
+
+        spot = fetch_etf_spot(stock_code)
+        etf_name = spot.get("名称", stock_code) if spot else stock_code
+
+        holdings = fetch_etf_holdings(stock_code, year=str(date.today().year))
+        industry = fetch_etf_industry_allocation(stock_code, year=str(date.today().year))
+        etf_data_block = format_etf_report(spot, holdings, industry)
+        logger.info(f"[ETF] 数据获取完成: spot={'Y' if spot else 'N'}, "
+                    f"holdings={len(holdings)}, industry={len(industry)}")
+
+        # ---- 2. 持有股票搜索 ----
+        top5 = holdings[:5]
+        holding_reports = []
+        for h in top5:
+            code = h.get("code", "")
+            name = h.get("name", "")
+            ratio = h.get("ratio", "")
+            if not code:
+                continue
+            try:
+                from tools.company_code_validator import find_company_name
+                from tools.main_business import fetch_main_business_text
+                cname = find_company_name(code) or name
+                business = fetch_main_business_text(code)
+                biz_snippet = business[:300] if business else "（无业务数据）"
+                # 网页搜索补充
+                q_results = self._do_search([
+                    f"{cname} {name} 主营业务 营收 净利润 市盈率 2026",
+                ])
+                search_snippet = ""
+                for q, r in q_results.items():
+                    search_snippet = r[:500]
+                    break
+                holding_reports.append(
+                    f"【持仓 {name}({code}) 占比{ratio}】\n"
+                    f"公司全称：{cname}\n"
+                    f"主营业务：{biz_snippet}\n"
+                    f"搜索补充：{search_snippet}\n"
+                )
+            except Exception as e:
+                logger.warning(f"[ETF] 重仓股 {code} 基础信息获取失败: {e}")
+                holding_reports.append(f"【持仓 {name}({code}) 占比{ratio}】\n数据获取失败\n")
+
+        holdings_block = "\n\n".join(holding_reports) if holding_reports else "（无持仓数据）"
+
+        # ---- 3. 额外搜索补充 ----
+        extra_queries = self._build_stock_queries(stock_code)
+        extra_results = self._do_search(extra_queries)
+        extra_text = self._search_text(extra_results)
+
+        # ---- 4. LLM 综合（根据数据可用性调整 prompt） ----
+        has_holdings = bool(holdings)
+        prompt = self._build_etf_system_prompt(has_holdings=has_holdings)
+
+        # holdings_block 可能有也可能空，都塞给 LLM（LLM 能看到"暂无数据"）
+        messages = [
+            SystemMessage(content=prompt),
+            HumanMessage(content=f"""用户问题：{question}
+ETF 代码：{stock_code}
+ETF 名称：{etf_name}
+
+========== ETF 行情与持仓数据（🟢 T1 程序采集） ==========
+{etf_data_block}
+
+========== 前 5 大重仓股穿透分析（程序采集） ==========
+{holdings_block}
+
+========== 全网搜索结果（⚪ T4 补充） ==========
+{extra_text[:8000]}
+请基于以上数据对该 ETF 进行全面多维度的分析报告。"""),
+        ]
+
+        logger.info("ETF LLM 综合分析中...")
+        response = self.llm.invoke(messages)
+        summary = response.content if hasattr(response, 'content') else str(response)
+
+        return {
+            "messages": [response],
+            "research_result": {"summary": summary, "sources": extra_queries},
+            "intermediate_steps": [("researcher", {"mode": "etf", "stock_code": stock_code})],
+        }
+
     # ========== 统一入口 ==========
 
     def analyze_node(self, state: AgentState) -> Dict[str, Any]:
         try:
             stock_code = state.get("stock_code", "")
             industry_name = state.get("industry_name", "")
+            stock_type = state.get("stock_type", "")
             question = state.get("question", "")
 
             if industry_name and not stock_code:
                 return self._analyze_industry(state)
+            if stock_type == "etf":
+                return self._analyze_etf(state)
             else:
                 return self._analyze_stock(state)
 

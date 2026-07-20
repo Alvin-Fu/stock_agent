@@ -30,15 +30,21 @@ def _resolve_stock_code(llm_code: str, company_name: str, fallback_code: str) ->
     """
     确定最终的股票代码：
     1. LLM 给出的代码必须能在 tushare stock_basic 里反查到公司名，否则视为幻觉丢弃
+       (ETF 代码例外——它们不在 stock_basic 中，直接放行)
     2. 没有有效代码时，用公司名通过 tushare 数据查代码
     3. 都没有则回退到上游传入的代码
     """
     from tools.company_code_validator import find_stock_code, find_company_name
+    from tools.stock_type import is_etf
 
     llm_code = (llm_code or "").strip()
     company_name = (company_name or "").strip()
 
     if llm_code and re.match(r'^\d{6}$', llm_code):
+        # ETF 代码不在 stock_basic 表中，直接放行
+        if is_etf(code=llm_code):
+            logger.info(f"ETF 代码无需验证: {llm_code}")
+            return llm_code
         try:
             real_name = find_company_name(llm_code)
         except Exception as e:
@@ -92,9 +98,18 @@ class RouterAgent:
             state.get("stock_code", ""),
         )
 
+        # 判断标的类型 → 管线分流
+        from tools.stock_type import classify
+        stock_type, _ = classify(code=stock_code, name=route_result.get("company_name"))
+
         # 队列只保留合法节点名；compliance 固定在最后由图保证，不进队列
         raw_agents = route_result.get("next_agents") or []
         next_agents = [a for a in raw_agents if a in VALID_AGENT_NODES]
+
+        # ETF 无财报数据，跳过 analyst
+        if stock_type == "etf" and "analyst" in next_agents:
+            logger.info("ETF 模式：跳过 analyst（无财报数据）")
+            next_agents.remove("analyst")
 
         # 个股分析类意图但没解析出代码时，去掉依赖代码的节点，交给 researcher 联网研究
         if not stock_code and not industry_name:
@@ -104,17 +119,20 @@ class RouterAgent:
                 next_agents = [a for a in next_agents if a not in code_dependent]
 
         logger.info(f"路由结果: intent={intent}, stock_code={stock_code}, "
-                    f"industry={industry_name}, next_agents={next_agents}, confidence={confidence}")
+                    f"stock_type={stock_type}, industry={industry_name}, "
+                    f"next_agents={next_agents}, confidence={confidence}")
 
         return {
             "intent": intent,
             "stock_code": stock_code,
+            "stock_type": stock_type,
             "industry_name": industry_name,
             "next_agents": next_agents,
             "confidence": confidence,
             "intermediate_steps": [("router", {
                 "intent": intent,
                 "stock_code": stock_code,
+                "stock_type": stock_type,
                 "industry_name": industry_name,
                 "next_agents": list(next_agents),
                 "reasoning": reasoning,
@@ -144,6 +162,18 @@ class RouterAgent:
     def _rule_based_route(self, question: str) -> Dict[str, Any]:
         """基于规则的兜底路由（不含 stock_code 字段，保留上游传入值）"""
         question_lower = question.lower()
+
+        # 检测 ETF 代码（6 位数字，ETF 前缀）
+        from tools.stock_type import is_etf
+        etf_match = re.search(r'\b(5[12568]\d{4}|1[568]\d{4})\b', question)
+        if etf_match:
+            return {
+                "intent": IntentType.FINANCIAL_ANALYSIS,
+                "stock_code": etf_match.group(1),
+                "next_agents": ["researcher", "technical"],
+                "confidence": 0.9,
+                "reasoning": "规则匹配 ETF 代码，路由至 researcher → technical",
+            }
 
         industry_keywords = ["行业", "产业", "产业链", "龙头", "龙一", "龙二", "景气", "赛道"]
         is_industry = any(kw in question_lower for kw in industry_keywords)

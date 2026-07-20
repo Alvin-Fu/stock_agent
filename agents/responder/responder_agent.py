@@ -81,6 +81,9 @@ _STOCK_RULES = """
 - 报告须包含「股东筹码与事件日历」一节：减持/增持/解禁/回购公告、股东户数变化、
   临近的除权除息与解禁日——材料里有必须列出（解禁减持是确定性抛压，必须进风险）；
   材料里没有该块就写"本次未获取到股东筹码数据"
+- 报告须包含「关键支撑压力位」一节：引用程序计算的关键位（支撑由近及远/压力由近及远）
+  的具体价位与强度依据，结合均线/BOLL位给出多空分水岭判断；程序未计算时写
+  "本次未获取到程序关键位数据（参考均线支撑/压力）"并自行从 K 线数据读出近期高低点
 - 估值一节的次序：先同行对比（相对贵贱）→ 再历史分位与 PEG →
   材料提供了分部估值（SOTP）计算时引用其区间结论并保留"极粗略参考，非目标价"标注；
   材料没做 SOTP 时禁止自行拼分部估值
@@ -105,6 +108,23 @@ _STOCK_RULES = """
 - 材料含「重估触发条件」时必须原样列出，并说明加入监控后系统自动盯梢、命中会推送；
   方向结论为"观望/回避"时必须带上"等什么"——引用触发条件或观察区价位，
   禁止给没有后续动作的死结论"""
+
+_ETF_RULES = """
+【ETF 类问题的额外结构要求】
+- 报告须包含以下独立小节（顺序固定）：
+  1. **ETF 基本信息**：ETF 名称、类型（宽基/行业/主题/跨境）、规模（AUM）、成立日期
+  2. **行情与折溢价**：最新价 vs IOPV（实时净值）、折溢价率、成交额、换手率
+  3. **份额与资金流向**：最新份额、份额趋势（变动方向与幅度）、主力资金净流入/占比
+  4. **行业配置**：前5大行业及占比，判断集中度与风格暴露
+  5. **前5大重仓股穿透**：逐只分析基本面亮点与风险，附占净值比例
+  6. **持仓组合评估**：持仓整体质量、集中度风险、是否涵盖龙头
+- 折溢价异常（绝对值>1%）、份额大幅变动（>5%）必须单独警示
+- 重仓股穿透分析引用研究材料中的个股信息，禁止自行捏造财务数字
+- 不适用个股分析的维度（护城河/利润驱动/飞轮/股东筹码等）不写
+- 不给出买卖操作建议，仅做客观分析与评估
+- 不包含「情景推演」和「操作参考」段落
+- 若材料提供了程序计算的关键位，须包含「行情关键位置」小节，引用支撑压力位价位；
+  未计算时跳过该小节"""
 
 _INDUSTRY_RULES = """
 【产业链/行业类问题的额外结构要求】
@@ -157,16 +177,65 @@ class ResponderAgent:
 
     @staticmethod
     def _build_system_prompt(state: AgentState) -> str:
-        """按本次模式拼装规则：通用段 + 个股段或产业链段（互斥，不给无关规则）"""
+        """按本次模式拼装规则：通用段 + 专项段（个股/ETF/产业链互斥，不给无关规则）"""
         prompt = _COMMON_RULES.format(today=date.today().strftime('%Y-%m-%d'),
                                       style_rules=STYLE_RULES,
                                       source_enum=ALLOWED_SOURCES_TEXT)
         stock_code = state.get("stock_code") or ""
-        if state.get("industry_name") or "," in stock_code:
+        stock_type = state.get("stock_type") or ""
+        if stock_type == "etf":
+            prompt += _ETF_RULES
+        elif state.get("industry_name") or "," in stock_code:
             prompt += _INDUSTRY_RULES
         elif stock_code:
             prompt += _STOCK_RULES
         return prompt
+
+    @staticmethod
+    def _build_title(stock_code: str, stock_type: str,
+                     industry_name: str, raw_answer: str,
+                     research_result: dict) -> str:
+        """构建报告标题行：标的身份标识"""
+        # ETF：优先从回答提取名称，否则用代码
+        if stock_type == "etf":
+            name = ""
+            # 从 raw_answer 开头提取 ETF 名称
+            for line in raw_answer.split("\n")[:3]:
+                line = line.strip().strip("#").strip()
+                if line:
+                    name = line
+                    break
+            if name:
+                return f"{name}({stock_code})"
+            return f"ETF {stock_code}"
+
+        # 行业/产业链：用 industry_name
+        if industry_name or ("," in stock_code):
+            ind = industry_name or stock_code
+            return f"【{ind}】产业链分析"
+
+        # 个股：从 research_result 或回答中提取公司名
+        code = stock_code
+        if not code:
+            return ""
+
+        # 尝试从 research_result 取公司名
+        research = research_result or {}
+        sources = research.get("sources") or []
+        company_name = ""
+
+        # 方法1：从回答第一行取
+        for line in raw_answer.split("\n")[:5]:
+            stripped = line.strip().strip("#").strip()
+            if stripped and len(stripped) > 2:
+                # 跳过 "结论" 这类标题行
+                if stripped not in ("结论", "核心结论", "公司概况与业务拆解"):
+                    company_name = stripped
+                    break
+
+        if company_name:
+            return f"{company_name}({code})"
+        return f"代码 {code}"
 
     def generate_node(self, state: AgentState) -> Dict[str, Any]:
         try:
@@ -180,8 +249,9 @@ class ResponderAgent:
 
             context = self._format_context(documents, analysis, research, technical)
 
-            # 分析连续性：单只个股时注入上次分析快照与复盘结论
-            history = self._format_history(state.get("stock_code") or "")
+            # 分析连续性：单只个股时注入上次分析快照与复盘结论（ETF 跳过）
+            history = self._format_history(state.get("stock_code") or "",
+                                           state.get("stock_type") or "")
             if history:
                 context += f"\n\n{history}"
 
@@ -206,9 +276,35 @@ class ResponderAgent:
             ]
 
             response = self.llm.invoke(messages)
-            final_answer = response.content
+            raw_answer = response.content
 
-            logger.info("回答生成完成")
+            # 报告格式后处理：内容重排、维度补缺
+            stock_code = state.get("stock_code", "")
+            stock_type = state.get("stock_type", "")
+            industry_name = state.get("industry_name", "")
+            if stock_type == "etf":
+                formatter_mode = "etf"
+            elif industry_name or ("," in stock_code):
+                formatter_mode = "industry"
+            elif stock_code:
+                formatter_mode = "stock"
+            else:
+                formatter_mode = None
+
+            if formatter_mode:
+                from tools.report_formatter import format_report
+                final_answer = format_report(raw_answer, formatter_mode)
+            else:
+                final_answer = raw_answer
+
+            # 标题行：分析标的身份标识（标准格式一致，便于长报告阅读）
+            title = self._build_title(stock_code, stock_type, industry_name,
+                                      raw_answer,
+                                      state.get("research_result") or {})
+            if title:
+                final_answer = f"**{title}**\n\n{final_answer}"
+
+            logger.info(f"回答生成完成（{formatter_mode or '通用'}模式）")
 
             return {
                 "final_answer": final_answer,
@@ -242,9 +338,9 @@ class ResponderAgent:
             logger.warning(f"读取用户纠错记录失败（不影响本次回答）: {e}")
             return ""
 
-    def _format_history(self, stock_code: str) -> str:
+    def _format_history(self, stock_code: str, stock_type: str = "") -> str:
         """取上次分析快照与最近复盘，形成「较上次分析…」的连续性素材"""
-        if not stock_code or "," in stock_code:
+        if not stock_code or "," in stock_code or stock_type == "etf":
             return ""
         try:
             from storage.sqlite.stock_storage import get_db
@@ -309,6 +405,12 @@ class ResponderAgent:
             if technical.get("trade_plans_text"):
                 v = technical["trade_plans_text"]
                 parts.append(str(v) if not isinstance(v, str) else v)
+            # 支撑压力位（独立于操作参考，供报告「关键支撑压力位」小节引用具体价位）
+            if technical.get("sr_levels_text"):
+                parts.append(str(technical["sr_levels_text"]))
+            if technical.get("sr_levels_texts"):
+                for code, t in technical["sr_levels_texts"].items():
+                    parts.append(f"关键位({code}):\n{t}")
             if technical.get("mode"):
                 parts.append(f"分析模式：{technical['mode']}")
         return "\n\n".join(parts) if parts else "无参考资料"

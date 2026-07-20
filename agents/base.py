@@ -23,6 +23,7 @@ class AgentState(TypedDict):
     字段说明：
         - messages: 对话消息历史（自动合并）
         - stock_code: 股票代码
+        - stock_type: 标的类型（a_stock / etf / hk_stock），由路由器设置，用于管线分流
         - industry_name: 行业名称（行业/产业链分析时使用）
         - chain_leaders: 行业龙头股列表 [{code, name, rank}]（龙一龙二）
         - question: 当前用户问题
@@ -41,6 +42,7 @@ class AgentState(TypedDict):
     """
     messages: Annotated[List[BaseMessage], add_messages]
     stock_code: str
+    stock_type: Optional[str]  # a_stock / etf / hk_stock
     industry_name: Optional[str]
     chain_leaders: Optional[Dict[str, Any]]
     question: str

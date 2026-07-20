@@ -93,7 +93,7 @@ _INDUSTRY_SKELETON_LINES = (
 
 
 def check_conclusion_skeleton(text: str, mode: str) -> list:
-    """检查结论骨架是否完整：个股/产业链必须有固定骨架行且不缺行"""
+    """检查结论骨架是否完整：个股/ETF/产业链必须有固定骨架行且不缺行"""
     issues = []
     text = text or ""
 
@@ -104,7 +104,7 @@ def check_conclusion_skeleton(text: str, mode: str) -> list:
         return issues
 
     # 2) 骨架行检查（在 📌 结论 段附近查找）
-    skeleton_lines = _STOCK_SKELETON_LINES if mode == "stock" else _INDUSTRY_SKELETON_LINES
+    skeleton_lines = _STOCK_SKELETON_LINES if mode in ("stock", "etf") else _INDUSTRY_SKELETON_LINES
 
     # 取 📌 结论 之后、下一个 ##/### 之前的内容作为结论段
     conclusion_section = ""
@@ -121,11 +121,11 @@ def check_conclusion_skeleton(text: str, mode: str) -> list:
             if line_name not in text:
                 issues.append(f"结论骨架缺行：「{line_name}」")
 
-    # 3) 个股必须包含「情景推演」
+    # 3) 个股必须包含「情景推演」（ETF 不检查）
     if mode == "stock" and "情景推演" not in text:
         issues.append("缺少「情景推演」小节")
 
-    # 4) 个股必须包含「利润驱动与飞轮」
+    # 4) 个股必须包含「利润驱动与飞轮」（ETF 不检查）
     if mode == "stock" and "利润驱动" not in text and "利润驱动与飞轮" not in text:
         issues.append("缺少「利润驱动与飞轮」小节")
 

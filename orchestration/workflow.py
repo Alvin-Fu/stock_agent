@@ -37,6 +37,7 @@ class WorkflowExecutor:
             "messages": [HumanMessage(content=question)],
             "question": question,
             "stock_code": kwargs.pop("stock_code", ""),
+            "stock_type": kwargs.pop("stock_type", None),
             "industry_name": kwargs.pop("industry_name", ""),
             "chain_leaders": kwargs.pop("chain_leaders", []),
             "intent": None,

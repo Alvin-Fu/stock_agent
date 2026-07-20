@@ -179,6 +179,48 @@ class TechnicalAgent:
             logger.warning(f"[{code}] 生成交易计划失败: {e}")
             return None, ""
 
+    def _compute_sr_text(self, code: str) -> str:
+        """计算支撑压力位文本块（独立于交易计划，供报告直接引用）"""
+        try:
+            raw = self._call_tool("stock_daily_fetcher", code)
+            if not raw or "获取失败" in raw:
+                return ""
+            import pandas as pd
+            from io import StringIO
+            lines = raw.strip().split("\n")
+            table_start = None
+            for i, line in enumerate(lines):
+                if "date" in line.lower() or "日期" in line:
+                    table_start = i
+                    break
+            if table_start is None:
+                return ""
+            header = [c.strip() for c in lines[table_start].strip().split()]
+            data_rows = []
+            for line in lines[table_start + 1:]:
+                line = line.strip()
+                if not line:
+                    continue
+                vals = line.split()
+                if len(vals) == len(header):
+                    row = dict(zip(header, vals))
+                    numeric = {}
+                    for key in ("close", "high", "low", "volume"):
+                        try:
+                            numeric[key] = float(row[key])
+                        except (ValueError, TypeError, KeyError):
+                            numeric[key] = None
+                    data_rows.append(numeric)
+            if len(data_rows) < 10:
+                return ""
+            df = pd.DataFrame(data_rows)
+            from tools.support_resistance import compute_sr_levels, format_sr_levels
+            sr = compute_sr_levels(df)
+            return format_sr_levels(sr) if sr else ""
+        except Exception as e:
+            logger.warning(f"[{code}] 支撑压力位计算失败: {e}")
+            return ""
+
     def analyze_node(self, state: AgentState) -> Dict[str, Any]:
         try:
             stock_code = state.get("stock_code", "")
@@ -209,7 +251,12 @@ class TechnicalAgent:
         label = f"{name}({code})" if name else code
         plan, plan_text = self._build_trade_plan(code)
 
+        # 支撑压力位（独立于交易计划，供 LLM 引用具体价位）
+        sr_text = self._compute_sr_text(code)
+
         trade_block = plan_text if plan_text else ""
+        if sr_text:
+            trade_block = f"{sr_text}\n\n{trade_block}" if trade_block else sr_text
 
         messages = [
             SystemMessage(content=self._build_single_prompt()),
@@ -239,6 +286,7 @@ class TechnicalAgent:
                 "code": code,
                 "trade_plan": plan,
                 "trade_plan_text": plan_text,
+                "sr_levels_text": sr_text,  # 供 responder 报告引用
             },
             "intermediate_steps": [("technical_analyze", {"mode": "single", "code": code})],
         }
@@ -248,9 +296,10 @@ class TechnicalAgent:
         question = state.get("question", "")
         logger.info(f"技术分析（产业链模式），共 {len(codes)} 只: {codes}")
 
-        # 逐只拉 K 线 + 交易计划
+        # 逐只拉 K 线 + 交易计划 + 支撑压力位
         all_kline = ""
         plans, plans_text = {}, {}
+        sr_texts = {}  # code → sr_levels_text
         for code in codes:
             name = self._resolve_name(code)
             label = f"{name}({code})" if name else code
@@ -262,6 +311,13 @@ class TechnicalAgent:
                     plans_text[code] = plan_text
             except Exception as e:
                 logger.warning(f"[{code}] 交易计划生成失败: {e}")
+            # 支撑压力位
+            try:
+                sr_t = self._compute_sr_text(code)
+                if sr_t:
+                    sr_texts[code] = sr_t
+            except Exception:
+                pass
 
         # 拼交易计划块
         trade_block = ""
@@ -269,6 +325,12 @@ class TechnicalAgent:
             trade_block = "\n\n".join(
                 f"=== 操作参考({code}) ===\n{t}" for code, t in plans_text.items())
             trade_block = f"\n{trade_block}\n"
+        # 拼支撑压力位块
+        sr_block = ""
+        if sr_texts:
+            sr_block = "\n\n".join(
+                f"=== 关键位({code}) ===\n{t}" for code, t in sr_texts.items())
+            sr_block = f"\n{sr_block}\n"
 
         messages = [
             SystemMessage(content=self._build_chain_prompt()),
@@ -276,7 +338,7 @@ class TechnicalAgent:
 
 【用户问题】{question}
 
-{trade_block}
+{trade_block}{sr_block}
 
 {all_kline[:25000]}
 
@@ -297,6 +359,7 @@ class TechnicalAgent:
                 "codes": codes,
                 "trade_plans": plans,
                 "trade_plans_text": plans_text,
+                "sr_levels_texts": sr_texts,  # 逐股的支撑压力位
             },
             "intermediate_steps": [("technical_analyze", {"mode": "chain", "count": len(codes)})],
         }
