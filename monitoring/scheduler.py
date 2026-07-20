@@ -45,6 +45,12 @@ class MonitorScheduler:
         self.golden_time = str(cfg.get("golden_time", "09:00"))
         self._golden_running = False
 
+        # 周六早期信号巡逻
+        self.scout_enabled = bool(cfg.get("scout_enabled", True))
+        self.scout_day = str(cfg.get("scout_day", "saturday")).lower()
+        self.scout_time = str(cfg.get("scout_time", "08:00"))
+        self._scout_running = False
+
         self._running = False
         self._thread = None
         # 用独立的 Scheduler 实例，避免与 tasks/scheduled_analyzer 的全局 schedule 相互干扰
@@ -82,6 +88,22 @@ class MonitorScheduler:
         except Exception as e:
             logger.error(f"产业链监控扫描失败: {e}")
 
+        # 低位价值发现扫描
+        try:
+            from tools.stock_tools import call_fetch_value_discovery
+            result = call_fetch_value_discovery()
+            if result and "❌" not in result:
+                # 推送简短摘要到飞书
+                lines = result.strip().split("\n")
+                summary_lines = [l for l in lines if l.startswith("|")]
+                summary = "\n".join(summary_lines[:15]) if summary_lines else result[:500]
+                from monitoring.notifier import FeishuNotifier
+                notifier = FeishuNotifier()
+                notifier.send(f"📊 **低位价值发现扫描**\n\n{summary[:2000]}")
+                logger.info("低位价值发现扫描完成")
+        except Exception as e:
+            logger.error(f"低位价值发现扫描失败: {e}")
+
     def _run_news_scan(self):
         hour = datetime.now().hour
         if not (8 <= hour <= 22):
@@ -98,6 +120,27 @@ class MonitorScheduler:
             self.review_runner.run_due_reviews(self.review_after_days, self.industry_review_after_days)
         except Exception as e:
             logger.error(f"[复盘] 定时复盘异常: {e}")
+
+    def _run_early_scout(self):
+        """周六早期信号巡逻：扫描热门行业 → 选低位企稳的 → 自动深度分析 → 保存触发条件"""
+        if self._scout_running:
+            logger.warning("[EarlyScout] 上一轮巡逻尚未结束，本次跳过")
+            return
+
+        def job():
+            self._scout_running = True
+            try:
+                logger.info("[EarlyScout] 周六早期信号巡逻开始...")
+                from .early_scout import run_early_scout
+                report = run_early_scout()
+                logger.info(f"[EarlyScout] 巡逻完成，报告长度 {len(report)} 字符")
+            except Exception as e:
+                logger.error(f"[EarlyScout] 巡逻异常: {e}\n{traceback.format_exc()}")
+                self.notifier.send(f"【早期信号巡逻】运行失败: {e}")
+            finally:
+                self._scout_running = False
+
+        threading.Thread(target=job, name="early-scout", daemon=True).start()
 
     def _run_golden(self):
         """周度 golden 回归：改 prompt/规则后的裸奔检测例行化。
@@ -166,12 +209,20 @@ class MonitorScheduler:
                 day_job = self._schedule.every().saturday
             day_job.at(self.golden_time).do(self._run_golden)
 
+        if self.scout_enabled:
+            day_job = getattr(self._schedule.every(), self.scout_day, None)
+            if day_job is None:
+                logger.warning(f"[Scout] scout_day 配置无效（{self.scout_day}），回退 saturday")
+                day_job = self._schedule.every().saturday
+            day_job.at(self.scout_time).do(self._run_early_scout)
+
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="monitor-scheduler", daemon=True)
         self._thread.start()
         logger.info(f"[监控] 调度已启动：盘后信号 {self.signal_scan_time}，新闻每 {self.news_interval} 分钟，"
                     f"复盘 {self.review_time}（分析满 {self.review_after_days} 天）"
-                    + (f"，golden 回归每周 {self.golden_day} {self.golden_time}" if self.golden_enabled else ""))
+                    + (f"，golden 回归每周 {self.golden_day} {self.golden_time}" if self.golden_enabled else "")
+                    + (f"，早期信号巡逻每周 {self.scout_day} {self.scout_time}" if self.scout_enabled else ""))
 
     def _loop(self):
         while self._running:

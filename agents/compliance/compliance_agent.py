@@ -85,6 +85,69 @@ def run_quality_checks(text: str) -> list:
     return issues
 
 
+# 结论骨架固定行名（个股/产业链）
+_STOCK_SKELETON_LINES = (
+    "方向", "操作", "核心逻辑", "最大风险", "护城河", "大盘环境")
+_INDUSTRY_SKELETON_LINES = (
+    "方向", "操作", "核心逻辑", "最大风险", "行业阶段与门槛")
+
+
+def check_conclusion_skeleton(text: str, mode: str) -> list:
+    """检查结论骨架是否完整：个股/产业链必须有固定骨架行且不缺行"""
+    issues = []
+    text = text or ""
+
+    # 1) 必须包含 📌 结论 开头标记
+    if "📌" not in text and "结论" not in text[:200]:
+        issues.append("缺少「📌 结论」开头标记")
+        # 连结论段都没有，后续骨架行检查无意义
+        return issues
+
+    # 2) 骨架行检查（在 📌 结论 段附近查找）
+    skeleton_lines = _STOCK_SKELETON_LINES if mode == "stock" else _INDUSTRY_SKELETON_LINES
+
+    # 取 📌 结论 之后、下一个 ##/### 之前的内容作为结论段
+    conclusion_section = ""
+    m = re.search(r"📌\s*结论", text)
+    if m:
+        after = text[m.end():]
+        # 截到下一个二级/三级标题或文件末尾
+        end_m = re.search(r"\n#{2,3}\s+", after)
+        conclusion_section = after[:end_m.start()] if end_m else after
+
+    for line_name in skeleton_lines:
+        if f"**{line_name}**" not in conclusion_section and f"- **{line_name}**" not in text:
+            # 宽松匹配：行名可能在结论段外（有的模型会整理成列表）
+            if line_name not in text:
+                issues.append(f"结论骨架缺行：「{line_name}」")
+
+    # 3) 个股必须包含「情景推演」
+    if mode == "stock" and "情景推演" not in text:
+        issues.append("缺少「情景推演」小节")
+
+    # 4) 个股必须包含「利润驱动与飞轮」
+    if mode == "stock" and "利润驱动" not in text and "利润驱动与飞轮" not in text:
+        issues.append("缺少「利润驱动与飞轮」小节")
+
+    # 5) 产业链必须包含「⭐ 最值得投资标的」
+    if mode == "industry" and "⭐" not in text and "最值得投资" not in text:
+        issues.append("缺少「⭐ 最值得投资标的」收尾节")
+
+    # 6) 产业链必须包含「行业风险」
+    if mode == "industry" and "行业风险" not in text:
+        issues.append("缺少「行业风险」小节")
+
+    # 7) 必须包含「分析局限性说明」
+    if "分析局限性" not in text and "局限性说明" not in text:
+        issues.append("缺少「分析局限性说明」小节")
+
+    # 8) 产业链必须包含「环节利润迁移」
+    if mode == "industry" and "环节利润迁移" not in text and "利润迁移" not in text:
+        issues.append("缺少「环节利润迁移判断」小节")
+
+    return issues
+
+
 class ComplianceAgent:
     def __init__(self):
         self.llm = get_default_llm()

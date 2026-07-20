@@ -16,6 +16,7 @@ from typing import List, Dict, Optional
 
 from utils.logger import logger
 from tools.source_health import report_source
+from tools.source_tiers import TIER, tier_tag
 
 # 财联社电报当日内存缓存（快讯流全市场共用，避免每个标的重复拉）
 _CLS_CACHE = {"ts": 0.0, "items": None}
@@ -270,11 +271,13 @@ def fetch_cls_telegraph(keywords: Optional[List[str]] = None, limit: int = 20) -
     return items[:limit]
 
 
-def format_info_block(title: str, items: List[Dict[str, str]], with_content: bool = True) -> str:
-    """把信源条目格式化为 prompt 文本块；空列表返回空串"""
+def format_info_block(title: str, items: List[Dict[str, str]],
+                      with_content: bool = True, tier: TIER = TIER.T2) -> str:
+    """把信源条目格式化为 prompt 文本块；空列表返回空串。tier 标注信源等级。"""
     if not items:
         return ""
-    lines = [f"【{title}】"]
+    tag = tier_tag(tier)
+    lines = [f"{tag}【{title}】"]
     for it in items:
         line = f"- [{it.get('time', '')}] {it.get('title', '')}"
         src = it.get("source")

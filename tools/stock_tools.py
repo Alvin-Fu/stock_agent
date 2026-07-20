@@ -1341,7 +1341,7 @@ class StockTools:
             logger.error("股票代码为空")
             return None
         try:
-            today = date.today()
+            today = pd.Timestamp.today()
             old_data = self.db.get_stock_pledge(stock_code)
             if old_data is not None and not old_data.empty:
                 latest_date = pd.to_datetime(old_data.iloc[0].get('end_date'))
@@ -2076,6 +2076,10 @@ class StopLossInput(BaseModel):
 
 class RawMaterialSensitivityInput(BaseModel):
     stock_code: str = Field(description="A股股票代码，例如：002594、600519")
+
+
+class IndustryCodesInput(BaseModel):
+    industry_codes: str = Field(default="", description="逗号分隔的申万二级指数代码，如 801730.SI,801740.SI；留空则扫描默认20个热门行业")
 
 
 stock_fetcher_tools = [
@@ -4969,7 +4973,226 @@ def call_fetch_full_report(stock_code: str) -> str:
         return f"❌ 生成全套研报失败：{e}"
 
 
+def call_fetch_value_discovery(industry_codes: str = "") -> str:
+    """
+    低位价值发现：扫描指定行业（或默认20个热门行业）的20/60日跌幅，
+    找到跌幅最大的行业→成分股→PE分位排序，输出低位关注清单。
+    入参 industry_codes: 逗号分隔的申万二级指数代码，如 "801730.SI,801740.SI"，为空则扫描默认热门行业。
+    """
+    try:
+        import tushare as ts
+        from utils.config import get_stock_tools_config
+        cfg = get_stock_tools_config()
+        ts.set_token(cfg["tushare_token"])
+        pro = ts.pro_api()
+
+        # ── 默认20个热门申万二级行业 ──
+        DEFAULT_INDUSTRIES = [
+            ("801730.SI", "汽车零部件"), ("801740.SI", "乘用车"),
+            ("801081.SI", "半导体"), ("801082.SI", "元器件"),
+            ("801771.SI", "航空装备"), ("801772.SI", "航天装备"),
+            ("801736.SI", "电池"), ("801735.SI", "电网设备"),
+            ("801761.SI", "医疗服务"), ("801762.SI", "医疗器械"),
+            ("801153.SI", "白酒"), ("801151.SI", "食品加工"),
+            ("801881.SI", "软件开发"), ("801882.SI", "IT服务"),
+            ("801741.SI", "商用车"), ("801731.SI", "电机"),
+            ("801884.SI", "通信服务"), ("801883.SI", "通信设备"),
+            ("801711.SI", "装修建材"), ("801712.SI", "工程机械"),
+        ]
+
+        if industry_codes and industry_codes.strip():
+            codes_in = [c.strip() for c in industry_codes.split(",") if c.strip()]
+            targets = [(c, "") for c in codes_in]
+        else:
+            targets = DEFAULT_INDUSTRIES
+
+        # ── 1. 查每个行业的20/60日涨跌幅 ──
+        today_str = date.today().strftime("%Y%m%d")
+        start_60 = (date.today() - timedelta(days=90)).strftime("%Y%m%d")
+
+        industry_perf = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _get_perf(code, name):
+            try:
+                df = pro.index_daily(ts_code=code, start_date=start_60, end_date=today_str,
+                                     fields="trade_date,pct_chg")
+                if df is None or df.empty:
+                    return None
+                df = df.sort_values("trade_date")
+                ret20 = df["pct_chg"].tail(20).sum()
+                ret60 = df["pct_chg"].tail(60).sum()
+                # 当前PE（取最新一天的PE）
+                pe_latest = None
+                try:
+                    idx_d = pro.index_dailybasic(ts_code=code, start_date=today_str, end_date=today_str,
+                                                  fields="pe")
+                    if idx_d is not None and not idx_d.empty and "pe" in idx_d.columns:
+                        pe_latest = idx_d.iloc[0].get("pe")
+                except Exception:
+                    pass
+                return {"code": code, "name": name or code, "ret20": round(ret20, 2),
+                        "ret60": round(ret60, 2), "pe": pe_latest}
+            except Exception as e:
+                logger.debug(f"行业指数[{code}]获取失败: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_get_perf, c, n): c for c, n in targets}
+            for f in as_completed(futures):
+                r = f.result()
+                if r:
+                    industry_perf.append(r)
+
+        if not industry_perf:
+            return "❌ 未获取到任何行业指数数据（Tushare 可能无可用积分）"
+
+        # 按60日跌幅排序（跌幅最大排最前）
+        industry_perf.sort(key=lambda x: x["ret60"])
+
+        # ── 2. 取跌幅前5行业，查成分股PE/PB分位 ──
+        top_n = min(5, len(industry_perf))
+        top_decliners = industry_perf[:top_n]
+
+        lines = []
+        lines.append(f"# 📊 低位价值发现扫描")
+        lines.append(f"> 扫描时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        lines.append(f"> 扫描范围：{len(targets)} 个申万二级行业")
+        lines.append("")
+        lines.append(f"## 行业跌幅排名（按60日涨跌幅排序）")
+        lines.append("")
+        lines.append(f"| 排名 | 行业 | 20日涨跌幅 | 60日涨跌幅 | 当前PE |")
+        lines.append(f"|------|------|-----------|-----------|-------|")
+        for i, ind in enumerate(industry_perf):
+            pe_str = f"{ind['pe']:.1f}" if ind['pe'] else "N/A"
+            marker = " 🟢" if i < top_n else ""
+            lines.append(f"| {i+1} | {ind['name']}{marker} | {ind['ret20']:+.1f}% | {ind['ret60']:+.1f}% | {pe_str} |")
+
+        lines.append("")
+        lines.append(f"---")
+        lines.append("")
+
+        # ── 3. 对跌幅前5的行业，查成分股PE分位 ──
+        for ind in top_decliners:
+            lines.append(f"### {ind['name']}（{ind['code']}）20日{ind['ret20']:+.1f}% / 60日{ind['ret60']:+.1f}%")
+            lines.append("")
+            try:
+                member_df = pro.index_member(ind["code"])
+                if member_df.empty:
+                    lines.append("  无成分股数据")
+                    lines.append("")
+                    continue
+
+                codes_list = [c.replace(".SZ", "").replace(".SH", "").replace(".BJ", "")
+                              for c in member_df["con_code"].tolist()[:50]]
+
+                # 查所有成分股最近60天的 daily_basic（含PE/PB）— 并行查询
+                all_daily = []
+
+                def _get_daily_basic(c):
+                    try:
+                        ts_c = f"{c}.SZ" if c.startswith("0") or c.startswith("3") else f"{c}.SH"
+                        df_db = pro.daily_basic(ts_code=ts_c,
+                                                start_date=start_60, end_date=today_str,
+                                                fields="ts_code,trade_date,pe_ttm,pb,total_mv")
+                        if df_db is not None and not df_db.empty:
+                            return df_db
+                    except Exception:
+                        try:
+                            df_db = pro.daily_basic(ts_code=f"{c}.SH",
+                                                    start_date=start_60, end_date=today_str,
+                                                    fields="ts_code,trade_date,pe_ttm,pb,total_mv")
+                            if df_db is not None and not df_db.empty:
+                                return df_db
+                        except Exception:
+                            pass
+                    return None
+
+                with ThreadPoolExecutor(max_workers=8) as pe_executor:
+                    pe_futures = {pe_executor.submit(_get_daily_basic, c): c for c in codes_list}
+                    for pe_f in as_completed(pe_futures):
+                        r = pe_f.result()
+                        if r is not None:
+                            all_daily.append(r)
+
+                if not all_daily:
+                    lines.append("  无成分股估值数据")
+                    lines.append("")
+                    continue
+
+                import pandas as pd
+                combined = pd.concat(all_daily, ignore_index=True)
+                if combined.empty or "ts_code" not in combined.columns:
+                    lines.append("  无成分股估值数据")
+                    lines.append("")
+                    continue
+
+                # 取每只股票最新的PE_TTM、PB
+                latest = combined.sort_values("trade_date").groupby("ts_code").last().reset_index()
+                latest["code_short"] = latest["ts_code"].str[:6]
+
+                # 找该行业已持有的DB数据算52周PE分位（简化：用当前PE值排序，越低越"价值"）
+                valid_pe = latest.dropna(subset=["pe_ttm"])
+                if valid_pe.empty:
+                    lines.append("  成分股PE数据不足，跳过")
+                    lines.append("")
+                    continue
+
+                valid_pe = valid_pe[valid_pe["pe_ttm"] > 0]
+                if valid_pe.empty:
+                    lines.append("  成分股PE均为负值（行业亏损），跳过")
+                    lines.append("")
+                    continue
+
+                # 按PE排序取最低的6只
+                candidates = valid_pe.sort_values("pe_ttm").head(6)
+                lines.append(f"  **估值最低成分股（PE_TTM排序）**")
+                lines.append("")
+                lines.append(f"  | 代码 | PE_TTM | PB | 总市值(亿) |")
+                lines.append(f"  |------|--------|-----|-----------|")
+                for _, row in candidates.iterrows():
+                    mv = f"{row['total_mv']/1e8:.0f}" if pd.notna(row.get("total_mv")) else "N/A"
+                    pb = f"{row['pb']:.2f}" if pd.notna(row.get("pb")) else "N/A"
+                    lines.append(f"  | {row['code_short']} | {row['pe_ttm']:.1f} | {pb} | {mv} |")
+                lines.append("")
+
+                # 底部提示
+                lines.append('  > 💡 低PE可能是价值洼地，也可能是「价值陷阱」（利润下滑导致PE被动降低）。')
+                lines.append("  > 如需完整分析，发送「分析 股票代码」（如：分析 000625）")
+                lines.append("")
+
+            except Exception as e:
+                logger.warning(f"[价值发现] {ind['name']} 成分股分析失败: {e}")
+                lines.append(f"  ⚠️ 成分股分析失败: {e}")
+                lines.append("")
+
+        lines.append("---")
+        lines.append("")
+        lines.append("📌 **使用说明**")
+        lines.append("  · 扫描频率：每日盘后自动执行，交易日有效")
+        lines.append("  · 行业范围：20个热门申万二级行业（可自定义industry_codes参数）")
+        lines.append("  · PE低≠值得买——请结合基本面/资金面综合判断")
+        lines.append("  · 对某只标的感兴趣，发送「分析 股票代码」获取完整研报")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"价值发现扫描失败: {e} {traceback.format_exc()}")
+        return f"❌ 价值发现扫描失败：{e}"
+
+
 stock_analyst_tools = [
+    StructuredTool(
+        name="value_discovery_fetcher",
+        func=call_fetch_value_discovery,
+        args_schema=IndustryCodesInput,
+        description="""
+        低位价值发现扫描：自动扫描20个热门申万二级行业的20/60日涨跌幅，
+        找出跌幅最大的行业，再查其成分股的PE_TTM排序，输出低位关注清单。
+        可选入参 industry_codes：逗号分隔的申万二级指数代码，留空则扫描默认热门行业。
+        例如：801730.SI,801740.SI（扫描汽车零部件和乘用车行业）
+        """
+    ),
     StructuredTool(
         name="stock_research_report_fetcher",
         func=call_fetch_stock_research_report,

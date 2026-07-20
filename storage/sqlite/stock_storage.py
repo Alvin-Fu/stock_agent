@@ -1881,6 +1881,33 @@ class DailyTask(Base):
             'date': self.date,
         }
 
+
+class CompanySocialAccount(Base):
+    """
+    公司社交媒体官方账号缓存：微博 UID / 公众号名称等。
+    每次分析时先查表，有缓存直接复用；没有则搜索并存入。
+    """
+    __tablename__ = 'company_social_account'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)  # 股票代码
+    company_name = Column(String(50), nullable=False)
+    weibo_uid = Column(String(20))           # 微博 UID（数字ID）
+    weibo_name = Column(String(100))         # 微博官方账号名
+    wechat_name = Column(String(100))        # 公众号名称
+    wechat_id = Column(String(100))          # 微信号（gh_xxx 或英文ID）
+    weibo_posts = Column(Text)               # 最近微博缓存 JSON
+    wechat_articles = Column(Text)           # 最近公众号文章缓存 JSON
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', name='uix_social_account_code'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
 class DatabaseManager:
     """
     数据库管理器
@@ -2036,7 +2063,8 @@ class DatabaseManager:
                 if 'industry_snapshot' in table_names:
                     snap_cols = [c['name'] for c in inspector.get_columns('industry_snapshot')]
                     for col_name, col_desc in (('valuation', '行业估值指标 JSON'),
-                                               ('excluded', '门槛剔除公司 JSON')):
+                                               ('excluded', '门槛剔除公司 JSON'),
+                                               ('watch', '观察备选池 JSON')):
                         if col_name not in snap_cols:
                             conn.execute(text(f'ALTER TABLE industry_snapshot ADD COLUMN {col_name} TEXT'))
                             conn.commit()
@@ -6228,6 +6256,46 @@ class DatabaseManager:
                 "correct": correct,
                 "accuracy": round(correct / len(judged) * 100, 1) if judged else None,
             }
+
+    # ===== 社交媒体账号缓存 ===================================================
+
+    def get_social_account(self, code: str) -> Optional[Dict[str, Any]]:
+        """获取某股票缓存的社交媒体账号信息"""
+        with self.get_session() as session:
+            found = session.execute(
+                select(CompanySocialAccount).where(CompanySocialAccount.code == code)
+            ).scalar_one_or_none()
+            return found.to_dict() if found else None
+
+    def save_social_account(self, code: str, company_name: str,
+                            weibo_uid: str = None, weibo_name: str = None,
+                            wechat_name: str = None, wechat_id: str = None,
+                            weibo_posts: str = None, wechat_articles: str = None) -> bool:
+        """保存/更新公司社交媒体账号信息（code 唯一，upsert）"""
+        with self.get_session() as session:
+            try:
+                existing = session.execute(
+                    select(CompanySocialAccount).where(CompanySocialAccount.code == code)
+                ).scalar_one_or_none()
+                if existing:
+                    if weibo_uid is not None: existing.weibo_uid = weibo_uid
+                    if weibo_name is not None: existing.weibo_name = weibo_name
+                    if wechat_name is not None: existing.wechat_name = wechat_name
+                    if wechat_id is not None: existing.wechat_id = wechat_id
+                    if weibo_posts is not None: existing.weibo_posts = weibo_posts
+                    if wechat_articles is not None: existing.wechat_articles = wechat_articles
+                    existing.updated_at = datetime.now()
+                else:
+                    session.add(CompanySocialAccount(
+                        code=code, company_name=company_name,
+                        weibo_uid=weibo_uid, weibo_name=weibo_name,
+                        wechat_name=wechat_name, wechat_id=wechat_id,
+                        weibo_posts=weibo_posts, wechat_articles=wechat_articles))
+                session.commit()
+                return True
+            except Exception:
+                session.rollback()
+                return False
 
 # ===== 便捷函数 (Convenience Function) ====================================
 

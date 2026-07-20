@@ -3,6 +3,8 @@
 # 2026-07 曾因未锁 pandas 装到 3.x 触发 akshare 正则不兼容）
 #
 # 建议：环境首次跑通后执行  pip freeze > requirements.lock
+wechatsogou>=4.5.4
+Werkzeug<2.1.0  # wechatsogou 需要 werkzeug.contrib.cache（2.1+ 已移除）
 # 之后重建环境用  pip install -r requirements.lock  精确复原
 # =====================================================================
 

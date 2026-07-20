@@ -904,6 +904,7 @@ class ResearcherAgent:
         # ---- 结构化信源（主）：东财新闻 / 巨潮公告 / 财联社快讯 ----
         from tools.info_sources import (
             fetch_stock_news, fetch_stock_announcements, fetch_cls_telegraph, format_info_block)
+        from tools.source_tiers import TIER
         try:
             company_name = find_company_name(stock_code) or ""
         except Exception:
@@ -911,6 +912,7 @@ class ResearcherAgent:
         from tools.main_business import fetch_main_business_text
         from tools.info_sources import fetch_sales_flash_text
         from tools.holder_events import fetch_holder_events_text
+        from tools.social_media import fetch_social_media_text
         structured_blocks = []
         for block in (
             fetch_sales_flash_text(stock_code),
@@ -924,6 +926,13 @@ class ResearcherAgent:
         ):
             if block:
                 structured_blocks.append(block)
+        # 社交媒体（微博+公众号），比新闻更早释放经营信号
+        try:
+            social_text = fetch_social_media_text(stock_code, company_name)
+            if social_text:
+                structured_blocks.append(social_text)
+        except Exception as e:
+            logger.debug(f"社交媒体信息获取跳过（不影响主流程）: {e}")
         structured_text = "\n\n".join(structured_blocks) if structured_blocks else "（结构化信源暂无数据）"
 
         # ---- 网页搜索（补充） ----

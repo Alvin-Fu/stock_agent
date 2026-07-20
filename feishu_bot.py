@@ -18,6 +18,7 @@ feishu:
 """
 
 import json
+import logging
 import re
 import time
 import traceback
@@ -81,9 +82,13 @@ class FeishuBot:
         self.db = get_db()
         self.notifier = FeishuNotifier()
         self.monitor = MonitorScheduler(self.notifier)
-        # 分析耗时较长，串行池防止并发打爆 LLM/数据源
-        self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="feishu-worker")
+        # 分析耗时较长，有限线程池防止并发打爆 LLM/数据源
+        self.pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="feishu-worker")
         self._executor = None  # WorkflowExecutor 延迟创建（首条消息时）
+
+        # WebSocket 健康监控
+        self._last_message_time = time.time()
+        self._ws_watchdog_running = False
 
     # ---------- 工作流 ----------
 
@@ -309,8 +314,19 @@ class FeishuBot:
             def reply(msg: str):
                 self.notifier.send_to(receive_id, msg, receive_type)
 
+            # 记录消息时间（watchdog 检测连接用）
+            now = time.time()
+            gap = now - self._last_message_time
+            self._last_message_time = now
+            if gap > 120:
+                logger.warning(f"[飞书] 消息间隔 {gap:.0f} 秒，WebSocket 可能曾断开")
             logger.info(f"[飞书] 收到消息 [{chat_type}] {sender_open_id}: {text[:80]}"
                         f"（push_open_id 未配置时可将此 open_id 填入 local.yaml）")
+
+            # 线程池排队提醒
+            queue_size = self.pool._work_queue.qsize()
+            if queue_size > 0:
+                reply(f"⏳ 当前排队 {queue_size} 个任务，前序分析完成后立即处理…")
 
             command_result = self._handle_command(text)
             if command_result == "__SCAN__":
@@ -332,6 +348,51 @@ class FeishuBot:
 
         except Exception as e:
             logger.error(f"[飞书] 处理消息异常: {e}\n{traceback.format_exc()}")
+
+    def _ws_watchdog(self):
+        """WebSocket 健康看门狗：每 2 分钟检查，断连超过 8 分钟主动触发重连"""
+        self._ws_watchdog_running = True
+        while self._ws_watchdog_running:
+            time.sleep(120)
+            gap = time.time() - self._last_message_time
+            if gap > 300:
+                logger.warning(f"[飞书WS] 已 {gap:.0f} 秒未收到消息，连接可能已断开")
+
+            # 断连超过 8 分钟 → 主动触发重连
+            if gap > 480:
+                logger.warning(f"[飞书WS] 断连超过 8 分钟，强制重启 WebSocket")
+                try:
+                    self._ws_client.stop()
+                except Exception:
+                    pass
+
+    def _ws_connect_loop(self):
+        """WebSocket 连接主循环：断连后自动重连（每隔 30 秒重试一次）"""
+        import lark_oapi as lark
+        # 抑制 lark SDK 自身的 ERROR 日志（"no close frame" 等底层断连日志由我们自行处理）
+        logging.getLogger("lark_oapi").setLevel(logging.WARNING)
+        while True:
+            try:
+                handler = lark.EventDispatcherHandler.builder("", "") \
+                    .register_p2_im_message_receive_v1(self.on_message) \
+                    .build()
+                self._ws_client = lark.ws.Client(
+                    self.app_id, self.app_secret,
+                    event_handler=handler, log_level=lark.LogLevel.INFO,
+                )
+                logger.info("🚀 飞书 WebSocket 连接已建立")
+                self._ws_client.start()  # 阻塞，断开时返回
+            except Exception as e:
+                logger.error(f"[飞书WS] 连接异常: {e}")
+            # 无论是异常退出还是看门狗触发 stop，都等待后重连
+            logger.info("[飞书WS] 连接断开，30 秒后重连…")
+            time.sleep(30)
+
+    def _start_watchdog(self):
+        import threading
+        t = threading.Thread(target=self._ws_watchdog, name="feishu-ws-watchdog", daemon=True)
+        t.start()
+        logger.info("[飞书WS] 健康看门狗已启动（每5分钟检查一次）")
 
     def _safe_scan(self, reply):
         try:
@@ -377,20 +438,9 @@ class FeishuBot:
                 self.monitor.stop()
             return
 
-        import lark_oapi as lark
-
-        handler = lark.EventDispatcherHandler.builder("", "") \
-            .register_p2_im_message_receive_v1(self.on_message) \
-            .build()
-
-        ws_client = lark.ws.Client(
-            self.app_id,
-            self.app_secret,
-            event_handler=handler,
-            log_level=lark.LogLevel.INFO,
-        )
-        logger.info("🚀 飞书机器人启动（长连接模式），给机器人发「帮助」查看用法")
-        ws_client.start()  # 阻塞运行
+        # 启动 WebSocket 健康看门狗 + 可自动重连的长连主循环
+        self._start_watchdog()
+        self._ws_connect_loop()
 
 
 if __name__ == "__main__":
