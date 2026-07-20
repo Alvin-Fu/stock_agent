@@ -396,6 +396,9 @@ class ResearcherAgent:
 
 {INTERMEDIATE_PRODUCT_NOTE}
 
+【信源优先级】🟢 T1 权威（公告/财报）> 🔵 T2 结构化（财经媒体）> 🟡 T3 官方社交（认证微博/公众号）> ⚪ T4 网络搜索
+- 数据不一致时以高等级为准并标注差异；以下数据块前的等级标签代表其信誉级别
+
 请基于下方搜索结果，对该公司的以下维度进行客观分析并给出核心结论：
 
 1. **公司公告与重大事项**：近期是否有重大公告及影响
@@ -715,6 +718,9 @@ class ResearcherAgent:
 
 {INTERMEDIATE_PRODUCT_NOTE}
 
+【信源优先级】🟢 T1 权威（公告/财报）> 🔵 T2 结构化（财经媒体）> 🟡 T3 官方社交（认证微博/公众号）> ⚪ T4 网络搜索
+- 数据不一致时以高等级为准并标注差异；以下数据块前的等级标签代表其信誉级别
+
 本行业已判定为【{stage}】{f'（{stage_reason}）' if stage_reason else ''}。
 评分权重与准入门槛随阶段切换（程序执行）：本次权重为
 业务{w['business']:.0%}+基本面{w['fundamental']:.0%}+护城河{w['moat']:.0%}+边际变化{w['momentum']:.0%}，
@@ -919,10 +925,11 @@ class ResearcherAgent:
             fetch_main_business_text(stock_code),
             fetch_holder_events_text(stock_code, company_name),
             format_info_block("巨潮公告（最近30天，重大事项第一手来源）",
-                              fetch_stock_announcements(stock_code), with_content=False),
-            format_info_block("东财个股新闻（最新15条）", fetch_stock_news(stock_code)),
+                              fetch_stock_announcements(stock_code), with_content=False, tier=TIER.T1),
+            format_info_block("东财个股新闻（最新15条）", fetch_stock_news(stock_code), tier=TIER.T2),
             format_info_block("财联社快讯（含该公司的条目）",
-                              fetch_cls_telegraph(keywords=[company_name] if company_name else None, limit=10)),
+                              fetch_cls_telegraph(keywords=[company_name] if company_name else None, limit=10),
+                              tier=TIER.T2),
         ):
             if block:
                 structured_blocks.append(block)
@@ -968,20 +975,22 @@ class ResearcherAgent:
             HumanMessage(content=f"""用户问题：{question}
 股票代码：{stock_code}{f'（{company_name}）' if company_name else ''}
 
-========== 结构化信源（公告/新闻/快讯，可信度高，与搜索结果冲突时以此为准） ==========
+========== 信源优先级规则 ==========
+🟢 T1 权威（公告/财报）> 🔵 T2 结构化（财经媒体）> 🟡 T3 官方社交（认证账号）> ⚪ T4 网络搜索
+- 高等级信源与低等级信源数据不一致时，以高等级为准并标注差异
+- 销量/产销类数字：提供了【产销快报公告原文】时**只能引用该原文的数字**并注明"根据公司公告"
+- 运营数据（销量/出货量等）优先引用【程序提取的结构化数据】区块中的时序数字
+
+========== 结构化信源 ==========
 {structured_text[:8000]}
 
 {structured_section}
 
 {industry_section}
 
-========== 全网搜索结果（补充信息） ==========
+========== 全网搜索结果（补充信息，T4） ==========
 {search_text[:10000]}
-请基于以上信息进行全面分析。
-销量/产销类数字的引用规则：提供了【产销快报公告原文】时**只能引用该原文的数字**并注明
-"根据公司公告"；搜索结果里与之冲突的销量数字一律弃用；未提供该块时才可引用搜索结果的
-销量数字，且必须注明具体出处与统计口径（乘用车/含商用车/单月/累计）。
-运营数据（销量/出货量/交付量等）优先引用【程序提取的结构化数据】区块中的时序数字。"""),
+请基于以上信息进行全面分析。"""),
         ]
 
         logger.info("LLM 综合分析中...")
@@ -1199,6 +1208,11 @@ class ResearcherAgent:
             SystemMessage(content=self._build_chain_system_prompt(stage, stage_reason)),
             HumanMessage(content=f"""用户问题：{question}
 目标行业：{industry_name}（行业阶段：{stage}{f'，{stage_reason}' if stage_reason else ''}）
+
+========== 信源优先级规则 ==========
+🟢 T1 权威（公告/财报）> 🔵 T2 结构化（财经媒体）> 🟡 T3 官方社交（认证账号）> ⚪ T4 网络搜索
+- 高等级信源与低等级信源数据不一致时，以高等级为准并标注差异
+- 【程序提取的结构化数据】（主营构成/财务指标/估值数据）置信度高于搜索结果中的碎片信息
 
 {cls_block if cls_block else ''}
 
