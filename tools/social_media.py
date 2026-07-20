@@ -12,12 +12,35 @@
 
 import json
 import re
+import threading
+import time
 from datetime import datetime
 from typing import Optional
 
 from storage.sqlite.stock_storage import get_db
 from utils.logger import logger
 from tools.source_tiers import TIER, tier_tag
+
+# ===== 全局限速（wechatsogou 并发保护） =====
+# 搜狗微信搜索没有公开 API 配额，短时间高频请求会被封 IP。
+# 全局锁 + 3 秒最小间隔，确保串行调用。
+_WECHAT_LOCK = threading.Lock()
+_LAST_WECHAT_TS = 0.0
+_WECHAT_MIN_INTERVAL = 3.0  # 秒
+
+
+def _wechat_throttled_call(func, *args, **kwargs):
+    """全局限速包装器：确保 wechatsogou 串行调用，间隔不低于 _WECHAT_MIN_INTERVAL 秒"""
+    global _LAST_WECHAT_TS
+    with _WECHAT_LOCK:
+        elapsed = time.time() - _LAST_WECHAT_TS
+        if elapsed < _WECHAT_MIN_INTERVAL:
+            time.sleep(_WECHAT_MIN_INTERVAL - elapsed)
+        try:
+            result = func(*args, **kwargs)
+            return result
+        finally:
+            _LAST_WECHAT_TS = time.time()
 
 
 # ========== 微博：用 web search 精确搜索认证账号 ==========
@@ -88,7 +111,7 @@ def _search_wechat_account(company_name: str) -> Optional[dict]:
     try:
         import wechatsogou
         ws_api = wechatsogou.WechatSogouAPI(timeout=10)
-        info = ws_api.get_gzh_info(company_name)
+        info = _wechat_throttled_call(ws_api.get_gzh_info, company_name)
         if info:
             wechat_name = info.get("wechat_name") or info.get("name") or ""
             wechat_id = info.get("wechat_id") or info.get("id") or ""
@@ -106,7 +129,7 @@ def _search_wechat_articles(company_name: str, official_name: str = None, limit:
     try:
         import wechatsogou
         ws_api = wechatsogou.WechatSogouAPI(timeout=10)
-        results = ws_api.search_article(company_name, page=1)
+        results = _wechat_throttled_call(ws_api.search_article, company_name, page=1)
         articles = []
         for art in (results or [])[:limit * 3]:  # 多取一些以便过滤
             source = (art.get("source") or "").strip()
