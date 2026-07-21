@@ -19,6 +19,7 @@ import time
 from datetime import date
 from typing import Dict, List, Optional
 
+import pandas as pd
 import requests
 
 from utils.logger import logger
@@ -89,15 +90,54 @@ def fetch_etf_spot(code: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _match_etf_code(df: pd.DataFrame, code: str) -> pd.DataFrame:
+    """在 fund_etf_spot_em 返回的 DataFrame 中多策略匹配 ETF 代码。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # 策略1：精确字符串匹配（尝试可能存在的代码列名）
+    for col in ("代码", "symbol", "fund_code"):
+        if col in df.columns:
+            match = df[df[col].astype(str) == code]
+            if not match.empty:
+                return match
+
+    # 策略2：去前导零后匹配
+    stripped = code.lstrip("0")
+    for col in ("代码", "symbol", "fund_code"):
+        if col in df.columns:
+            match = df[df[col].astype(str) == stripped]
+            if not match.empty:
+                return match
+
+    # 策略3：数值匹配（列可能是 int 类型）
+    try:
+        code_int = int(code)
+        for col in ("代码", "symbol", "fund_code"):
+            if col in df.columns:
+                match = df[df[col] == code_int]
+                if not match.empty:
+                    return match
+    except (ValueError, TypeError):
+        pass
+
+    # 策略4：列值包含代码（某些源列带前缀，如 '159740.SZ'）
+    for col in ("代码", "symbol", "fund_code"):
+        if col in df.columns:
+            match = df[df[col].astype(str).str.contains(code, na=False)]
+            if not match.empty:
+                return match
+
+    return pd.DataFrame()
+
+
 def _fetch_spot_akshare(code: str) -> Optional[Dict[str, str]]:
     """主源：Akshare fund_etf_spot_em"""
     for attempt in range(3):
         try:
             import akshare as ak
             df = ak.fund_etf_spot_em()
-            match = df[df["代码"] == code]
-            if match.empty:
-                match = df[df["代码"] == code.lstrip("0")]
+            match = _match_etf_code(df, code)
             if match.empty:
                 return None
             row = match.iloc[0]
@@ -301,13 +341,193 @@ def fetch_etf_industry_allocation(code: str, year: Optional[str] = None) -> List
         return []
 
 
+# =========================== 估值计算（成分股加权 PE/PB） ===========================
+
+# 单只股票 PE/PB 缓存 { code: {pe, pb} }，TTL 5 分钟
+_STOCK_PE_CACHE: Dict[str, tuple] = {}  # code → (expire_ts, {"pe": ..., "pb": ...})
+
+# 东方财富单股行情 API（轻量，只拉需要的字段）
+_EM_QUOTE_URL = "https://push2.eastmoney.com/api/qt/stock/get"
+_EM_QUOTE_FIELDS = "f162,f167"  # f162=动态市盈率, f167=市净率
+_EM_QUOTE_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/120.0.0.0 Safari/537.36"),
+    "Referer": "https://quote.eastmoney.com/",
+}
+
+
+def _is_hk_code(code: str) -> bool:
+    """判断股票代码是否为港股"""
+    clean = code.lower().replace("hk", "").strip()
+    return clean.isdigit() and len(clean) <= 5
+
+
+def _a_market(code: str) -> int:
+    """A 股市场代码：1=上海, 0=深圳"""
+    return 1 if code.startswith(("6", "9")) else 0
+
+
+def _normalize_hk_code(code: str) -> str:
+    """港股代码统一格式：5位数字"""
+    return code.lower().replace("hk", "").zfill(5)
+
+
+def _format_pe(p) -> str:
+    """格式化 PE，亏损公司返回 '亏损'"""
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return "—"
+    if p == 0 or abs(p) < 0.01:
+        return "—"
+    if p < 0:
+        return "亏损"
+    return f"{p:.1f}"
+
+
+def _format_pb(p) -> str:
+    """格式化 PB"""
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return "—"
+    if p <= 0:
+        return "—"
+    return f"{p:.2f}"
+
+
+def _fetch_single_pe_pb(code: str) -> Dict[str, Optional[float]]:
+    """
+    单只股票查 PE/PB（东方财富 API），带进程级缓存。
+
+    Args:
+        code: 6 位 A 股代码 / 5 位港股代码
+
+    Returns:
+        {"pe": float|None, "pb": float|None}
+    """
+    # 缓存命中
+    now = time.time()
+    cached = _STOCK_PE_CACHE.get(code)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    code_clean = code.strip().upper()
+    try:
+        if _is_hk_code(code_clean):
+            ncode = _normalize_hk_code(code_clean)
+            secid = f"4.{ncode}"
+        else:
+            market = _a_market(code_clean)
+            secid = f"{market}.{code_clean}"
+
+        resp = requests.get(
+            _EM_QUOTE_URL,
+            params={"secid": secid, "fields": _EM_QUOTE_FIELDS},
+            headers=_EM_QUOTE_HEADERS,
+            timeout=8,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        d = body.get("data") or {}
+        pe = d.get("f162")
+        pb = d.get("f167")
+        result = {
+            "pe": float(pe) if pe is not None and float(pe) > 0 else None,
+            "pb": float(pb) if pb is not None and float(pb) > 0 else None,
+        }
+        _STOCK_PE_CACHE[code] = (now + 300, result)  # 缓存 5 分钟
+        return result
+    except Exception as e:
+        logger.debug(f"[ETF估值] 查 {code} PE/PB 失败: {e}")
+        return {"pe": None, "pb": None}
+
+
+def calculate_etf_valuation(holdings: List[Dict[str, str]]) -> str:
+    """
+    基于持仓成分股加权计算 ETF 的 PE/PB。
+    按需单只查询，不拉全市场数据。
+
+    Args:
+        holdings: fetch_etf_holdings 返回的持仓列表，每项含 code/name/ratio
+
+    Returns:
+        格式化的估值文本块，失败返回空串
+    """
+    if not holdings:
+        return ""
+
+    pe_vals = []   # (weight, pe)
+    pb_vals = []   # (weight, pb)
+    details = []
+
+    for h in holdings:
+        code = h.get("code", "").strip().upper()
+        ratio_str = h.get("ratio", "0").replace("%", "").strip()
+        name = h.get("name", "")
+        try:
+            weight = float(ratio_str)
+        except (ValueError, TypeError):
+            weight = 0.0
+        if weight <= 0 or not code:
+            continue
+
+        v = _fetch_single_pe_pb(code)
+        pe, pb = v["pe"], v["pb"]
+        source = "港股" if _is_hk_code(code) else "A股"
+
+        if pe is not None:
+            pe_vals.append((weight, pe))
+        if pb is not None:
+            pb_vals.append((weight, pb))
+
+        pe_str = _format_pe(pe)
+        pb_str = _format_pb(pb)
+        details.append(f"· {name}({code}) [{source}] 占比{ratio_str}%    PE={pe_str}    PB={pb_str}")
+
+    if not details:
+        return ""
+
+    # 加权 PE（调和平均）
+    wpe = "—"
+    if pe_vals:
+        w_pe_sum = sum(w for w, _ in pe_vals)
+        inv_sum = sum(w / p for w, p in pe_vals if p > 0)
+        wpe_val = w_pe_sum / inv_sum if inv_sum > 0 else 0
+        wpe = f"{wpe_val:.1f}" if wpe_val > 0 else "亏损"
+
+    # 加权 PB（算术平均）
+    wpb = "—"
+    if pb_vals:
+        pb_sum = sum(w * p for w, p in pb_vals)
+        w_pb_sum = sum(w for w, _ in pb_vals)
+        wpb_val = pb_sum / w_pb_sum if w_pb_sum > 0 else 0
+        wpb = f"{wpb_val:.2f}" if wpb_val > 0 else "—"
+
+    covered = sum(1 for d in details if "PE=" in d and "—" not in d.split("PE=")[1].split("    ")[0])
+    rate = f"{covered}/{len(details)}"
+
+    lines = [
+        f"【持仓加权估值（成分股实时行情）】",
+        f"覆盖: {rate} 只成分股有 PE 数据",
+        f"加权 PE: {wpe}（调和平均，亏损股权重不计入分子）",
+        f"加权 PB: {wpb}（算术平均）",
+        f"成分股估值明细:",
+    ] + details
+
+    return "\n".join(lines)
+
+
 # =========================== 报告格式化 ===========================
 
 
 def format_etf_report(spot: Optional[Dict[str, str]],
                       holdings: List[Dict[str, str]],
-                      industry: List[Dict[str, str]]) -> str:
+                      industry: List[Dict[str, str]],
+                      valuation_text: str = "") -> str:
     """将 ETF 数据格式化为报告文本块（数据缺失时友好降级）"""
+    today = date.today().strftime("%Y-%m-%d")
     blocks = []
 
     if spot:
@@ -320,12 +540,12 @@ def format_etf_report(spot: Optional[Dict[str, str]],
         volume = spot.get("成交量", "")
         shares = spot.get("最新份额", "")
         mcap = spot.get("流通市值", "")
-        lines = [f"【ETF 实时行情】{name}"]
+        lines = [f"【ETF 实时行情】{name}  采集日期: {today}"]
         if price:
             lines.append(f"最新价: {price}")
         if iopv:
             lines.append(f"IOPV: {iopv}")
-        if premium is not None:
+        if premium and premium not in ("", "None", "nan"):
             lines.append(f"折溢价: {premium}%")
         if change:
             lines.append(f"涨跌幅: {change}%")
@@ -339,20 +559,23 @@ def format_etf_report(spot: Optional[Dict[str, str]],
             lines.append(f"流通市值: {mcap}")
         blocks.append(" | ".join(lines))
     else:
-        blocks.append("【ETF 行情】暂无数据")
+        blocks.append(f"【ETF 行情】程序采集失败（{today}），需依赖网络研究信息补充")
 
     if industry:
-        ind_lines = ["【行业配置（前5）】"]
+        ind_lines = [f"【行业配置（前5）】采集日期: {today}"]
         for ind in industry[:5]:
             ind_lines.append(f"· {ind['industry']}: {ind['ratio']}")
         blocks.append("\n".join(ind_lines))
 
     if holdings:
-        hd_lines = ["【前十大重仓股】"]
+        hd_lines = [f"【前十大重仓股】采集日期: {today}"]
         for h in holdings:
             hd_lines.append(f"· {h['name']}({h['code']}): 占比{h['ratio']}")
         blocks.append("\n".join(hd_lines))
     else:
         blocks.append("【持仓穿透】暂无数据（分析将聚焦行情与行业配置）")
+
+    if valuation_text:
+        blocks.append(valuation_text)
 
     return "\n\n".join(blocks)

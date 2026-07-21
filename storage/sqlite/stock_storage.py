@@ -4,6 +4,7 @@
 """
 import os
 import io
+import json
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Mapping
@@ -763,6 +764,137 @@ class StockIncome(Base):
             'data_source': self.data_source,
         }
 
+# === 分红送股模型 ===
+class StockDividend(Base):
+    """
+    股票分红送股模型 - ORM映射类
+
+    数据库表: stock_dividend
+    功能：存储分红送股数据
+
+    字段说明：
+    • 标识字段：code（股票代码）、end_date（报告期）
+    • 分红数据：div_procf（每股分红）、stk_bo_rate（送股比例）、stk_co_rate（转增比例）
+    • 金额数据：cash_div（现金分红总额）
+    • 日期数据：ex_date（除权除息日）、pay_date（派息日）
+    • 元数据：updated_at（更新时间）
+    """
+    __tablename__ = 'stock_dividend'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    div_procf = Column(Float)  # 每股分红
+    stk_bo_rate = Column(Float)  # 送股比例
+    stk_co_rate = Column(Float)  # 转赠比例
+    cash_div = Column(Float)  # 现金分红总额
+    ex_date = Column(Date)  # 除权除息日
+    pay_date = Column(Date)  # 派息日
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'end_date', name='uix_dividend_code_date'),
+        Index('ix_dividend_code_date', 'code', 'end_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockDividend(code={self.code}, end_date={self.end_date}, div_procf={self.div_procf})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'code': self.code,
+            'end_date': self.end_date,
+            'div_procf': self.div_procf,
+            'stk_bo_rate': self.stk_bo_rate,
+            'stk_co_rate': self.stk_co_rate,
+            'cash_div': self.cash_div,
+            'ex_date': self.ex_date,
+            'pay_date': self.pay_date,
+        }
+
+# === 财务审计意见模型 ===
+class StockFinaAudit(Base):
+    """
+    股票财务审计意见模型 - ORM映射类
+
+    数据库表: stock_fina_audit
+    功能：存储财务审计意见数据
+
+    字段说明：
+    • 标识字段：code（股票代码）、end_date（报告期）
+    • 审计数据：audit_opinion（审计意见）、opinions（审计意见全文基数）、auditor（审计事务所）
+    • 金额数据：audit_fee（审计费用）
+    • 元数据：updated_at（更新时间）
+    """
+    __tablename__ = 'stock_fina_audit'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    audit_opinion = Column(String(100))  # 审计意见
+    opinions = Column(Text)  # 审计意见全文基数
+    auditor = Column(String(100))  # 审计事务所
+    audit_fee = Column(Float)  # 审计费用
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'end_date', name='uix_fina_audit_code_date'),
+        Index('ix_fina_audit_code_date', 'code', 'end_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockFinaAudit(code={self.code}, end_date={self.end_date}, audit_opinion={self.audit_opinion})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'code': self.code,
+            'end_date': self.end_date,
+            'audit_opinion': self.audit_opinion,
+            'opinions': self.opinions,
+            'auditor': self.auditor,
+            'audit_fee': self.audit_fee,
+        }
+
+# === 财报披露计划模型 ===
+class StockDisclosureDate(Base):
+    """
+    股票财报披露计划模型 - ORM映射类
+
+    数据库表: stock_disclosure_date
+    功能：存储财报披露计划数据
+
+    字段说明：
+    • 标识字段：code（股票代码）、end_date（报告期）
+    • 日期数据：stm_issue_date（首次披露日）、stm_comm_date（董事会公告日）、actual_diss_date（实际披露日）
+    • 元数据：updated_at（更新时间）
+    """
+    __tablename__ = 'stock_disclosure_date'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    stm_issue_date = Column(Date)  # 首次披露日
+    stm_comm_date = Column(Date)  # 董事会公告日
+    actual_diss_date = Column(Date)  # 实际披露日
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'end_date', name='uix_disclosure_date_code_date'),
+        Index('ix_disclosure_date_code_date', 'code', 'end_date'),
+    )
+
+    def __repr__(self):
+        return f"<StockDisclosureDate(code={self.code}, end_date={self.end_date}, stm_issue_date={self.stm_issue_date})>"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'code': self.code,
+            'end_date': self.end_date,
+            'stm_issue_date': self.stm_issue_date,
+            'stm_comm_date': self.stm_comm_date,
+            'actual_diss_date': self.actual_diss_date,
+        }
+
 # === 资产负债表模型 ===
 class StockBalanceSheet(Base):
     """
@@ -1435,6 +1567,317 @@ class StockBlockTrade(Base):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
 
 
+class StockPledgeDetail(Base):
+    """股权质押明细数据"""
+    __tablename__ = 'stock_pledge_detail'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    end_date = Column(Date, nullable=False, index=True)
+    pledger = Column(String(100))       # 出质人
+    pledge_amount = Column(Float)       # 质押数量（万股）
+    pledge_ratio = Column(Float)        # 占所持股份比例(%)
+    pledge_total_ratio = Column(Float)  # 占总股本比例(%)
+    pledge_start_date = Column(Date)    # 质押开始日期
+    pledge_end_date = Column(Date)      # 质押到期日期
+    pledge_status = Column(String(20))  # 质押状态
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'end_date', 'pledger', name='uix_pledge_detail_code_date'),
+        Index('ix_pledge_detail_code_date', 'code', 'end_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockHolderTrade(Base):
+    """股东增减持数据"""
+    __tablename__ = 'stock_holder_trade'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    ann_date = Column(Date, nullable=False, index=True)
+    holder_name = Column(String(100))   # 股东名称
+    trade_type = Column(String(10))     # 交易类型 IN增持 DE减持
+    trade_volume = Column(Float)        # 变动数量（万股）
+    trade_ratio = Column(Float)         # 变动比例(%)
+    after_ratio = Column(Float)         # 变动后持股比例(%)
+    avg_price = Column(Float)           # 均价（元）
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'ann_date', 'holder_name', name='uix_holder_trade_code_date'),
+        Index('ix_holder_trade_code_date', 'code', 'ann_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockReportRc(Base):
+    """卖方盈利预测数据"""
+    __tablename__ = 'stock_report_rc'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    report_date = Column(Date, nullable=False, index=True)        # 研报日期
+    forecast_type = Column(String(20))                           # 预测类型（营收/净利润/EPS等）
+    forecast_value = Column(Float)                               # 预测值（亿元/元）
+    forecast_org = Column(String(100))                           # 机构名称
+    analyst = Column(String(100))                                # 分析师
+    rating = Column(String(20))                                  # 评级（买入/增持/中性等）
+    rating_change = Column(String(20))                           # 评级变动
+    target_price = Column(Float)                                 # 目标价（元）
+    period = Column(String(20))                                  # 预测年份/期间
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'report_date', 'forecast_org', 'forecast_type', name='uix_report_rc_code_date'),
+        Index('ix_report_rc_code_date', 'code', 'report_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockMargin(Base):
+    """融资融券交易汇总"""
+    __tablename__ = 'stock_margin'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    margin_balance = Column(Float)           # 融资余额
+    margin_buy = Column(Float)               # 融资买入额
+    short_sell_balance = Column(Float)       # 融券余额
+    short_sell_volume = Column(Float)        # 融券卖出量
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'trade_date', name='uix_margin_code_date'),
+        Index('ix_margin_code_date', 'code', 'trade_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockMarginDetail(Base):
+    """融资融券交易明细"""
+    __tablename__ = 'stock_margin_detail'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    margin_buy = Column(Float)               # 融资买入额
+    rzye = Column(Float)                     # 融资余额
+    rqye = Column(Float)                     # 融券余额
+    rzmre = Column(Float)                    # 融资买入额
+    rqyl = Column(Float)                     # 融券余量
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'trade_date', name='uix_margin_detail_code_date'),
+        Index('ix_margin_detail_code_date', 'code', 'trade_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockMoneyflow(Base):
+    """个股资金流"""
+    __tablename__ = 'stock_moneyflow'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    buy_sm_vol = Column(Float)               # 小单买入量
+    buy_sm_amount = Column(Float)            # 小单买入金额
+    sell_sm_vol = Column(Float)              # 小单卖出量
+    sell_sm_amount = Column(Float)           # 小单卖出金额
+    buy_md_vol = Column(Float)               # 中单买入量
+    buy_md_amount = Column(Float)            # 中单买入金额
+    sell_md_vol = Column(Float)              # 中单卖出量
+    sell_md_amount = Column(Float)           # 中单卖出金额
+    buy_lg_vol = Column(Float)               # 大单买入量
+    buy_lg_amount = Column(Float)            # 大单买入金额
+    sell_lg_vol = Column(Float)              # 大单卖出量
+    sell_lg_amount = Column(Float)           # 大单卖出金额
+    buy_elg_vol = Column(Float)              # 特大单买入量
+    buy_elg_amount = Column(Float)           # 特大单买入金额
+    sell_elg_vol = Column(Float)             # 特大单卖出量
+    sell_elg_amount = Column(Float)          # 特大单卖出金额
+    net_mf_amount = Column(Float)            # 主力净流入
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('code', 'trade_date', name='uix_moneyflow_code_date'),
+        Index('ix_moneyflow_code_date', 'code', 'trade_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockHsgtMoneyflow(Base):
+    """沪深港通资金流"""
+    __tablename__ = 'stock_hsgt_moneyflow'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    ggt_ss = Column(Float)                   # 港股通（沪）
+    ggt_sz = Column(Float)                   # 港股通（深）
+    hgt = Column(Float)                      # 沪股通
+    sgt = Column(Float)                      # 深股通
+    north_money = Column(Float)              # 北向资金
+    south_money = Column(Float)              # 南向资金
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('trade_date', name='uix_hsgt_moneyflow_date'),
+        Index('ix_hsgt_moneyflow_date', 'trade_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockMktMoneyflowDC(Base):
+    """大盘资金流（日频）"""
+    __tablename__ = 'stock_mkt_moneyflow_dc'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    close_sh = Column(Float)                 # 上证收盘
+    change_pct = Column(Float)               # 涨跌幅
+    main_net = Column(Float)                 # 主力净流入
+    retail_net = Column(Float)               # 散户净流入
+    total_net = Column(Float)                # 总净流入
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('trade_date', name='uix_mkt_moneyflow_dc_date'),
+        Index('ix_mkt_moneyflow_dc_date', 'trade_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockMacroRate(Base):
+    """宏观利率数据（Shibor/Libor/Hibor等）"""
+    __tablename__ = 'stock_macro_rate'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rate_type = Column(String(20), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    rate_value = Column(Float)               # 利率值
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('rate_type', 'date', name='uix_macro_rate_type_date'),
+        Index('ix_macro_rate_type_date', 'rate_type', 'date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockWzIndex(Base):
+    """温州指数"""
+    __tablename__ = 'stock_wz_index'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(Date, nullable=False, index=True)
+    index_value = Column(Float)              # 指数值
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('date', name='uix_wz_index_date'),
+        Index('ix_wz_index_date', 'date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockGzIndex(Base):
+    """贵阳指数"""
+    __tablename__ = 'stock_gz_index'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    date = Column(Date, nullable=False, index=True)
+    index_value = Column(Float)              # 指数值
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('date', name='uix_gz_index_date'),
+        Index('ix_gz_index_date', 'date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockFundAdj(Base):
+    """复权因子"""
+    __tablename__ = 'stock_fund_adj'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts_code = Column(String(30), nullable=False, index=True)
+    trade_date = Column(Date, nullable=False, index=True)
+    adj_factor = Column(Float)               # 复权因子
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('ts_code', 'trade_date', name='uix_fund_adj_code_date'),
+        Index('ix_fund_adj_code_date', 'ts_code', 'trade_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockMarginSecs(Base):
+    """融资融券标的列表（含ETF）"""
+    __tablename__ = 'stock_margin_secs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts_code = Column(String(30), nullable=False, index=True)
+    name = Column(String(30))
+    trade_date = Column(Date, index=True)
+    is_etf = Column(String(1))
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('ts_code', 'trade_date', name='uix_margin_secs_code_date'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
+class StockMacroIndicator(Base):
+    """宏观指标数据缓存"""
+    __tablename__ = 'stock_macro_indicator'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    indicator_name = Column(String(30), nullable=False, index=True)
+    period = Column(String(20), nullable=False)
+    value_json = Column(Text, nullable=False)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('indicator_name', 'period', name='uq_macro_indicator_period'),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+
 class StockTopList(Base):
     """龙虎榜每日明细"""
     __tablename__ = 'stock_top_list'
@@ -1555,6 +1998,7 @@ class AnalysisReview(Base):
     days_elapsed = Column(Integer)  # 距分析的自然日数
     price_now = Column(Float)
     pct_change = Column(Float)  # 区间涨跌幅 %
+    error_pattern = Column(String(30))  # 误判主要类别：技术面权重失衡/基本面利空高估/资金面驱动低估/无明显误判/其他
     direction_verdict = Column(String(10))  # 方向对账：正确/错误/未验证
     review_content = Column(Text)  # LLM 生成的复盘卡片全文
     created_at = Column(DateTime, default=datetime.now, index=True)
@@ -1566,9 +2010,45 @@ class AnalysisReview(Base):
             'days_elapsed': self.days_elapsed,
             'price_now': self.price_now,
             'pct_change': self.pct_change,
+            'error_pattern': self.error_pattern,
             'direction_verdict': self.direction_verdict,
             'review_content': self.review_content,
             'created_at': self.created_at,
+        }
+
+
+class ImprovementRule(Base):
+    """
+    从复盘教训中提炼的可复用改进规则（跨标的共享）。
+    is_active 用于软删除，effectiveness 由后续复盘自动更新。
+    """
+    __tablename__ = 'improvement_rule'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_text = Column(Text, nullable=False)  # 具体的改进规则
+    error_pattern = Column(String(30))  # 对应误判类别
+    source_snapshot_id = Column(Integer)  # 产生该规则的复盘快照id
+    code = Column(String(10), index=True)  # 适用标的代码（NULL=通用规则）
+    source_stock_name = Column(String(50))  # 来源股票名称，便于追溯
+    is_active = Column(Integer, nullable=False, default=1)  # 1=有效 0=停用
+    hit_count = Column(Integer, nullable=False, default=0)  # 被引用次数
+    effectiveness = Column(Float)  # 0-1: 按此规则操作后方向正确的比例（None=尚未评估）
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'rule_text': self.rule_text,
+            'error_pattern': self.error_pattern,
+            'source_snapshot_id': self.source_snapshot_id,
+            'code': self.code,
+            'source_stock_name': self.source_stock_name,
+            'is_active': self.is_active,
+            'hit_count': self.hit_count,
+            'effectiveness': self.effectiveness,
+            'created_at': self.created_at,
+            'updated_at': self.updated_at,
         }
 
 
@@ -1908,6 +2388,23 @@ class CompanySocialAccount(Base):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
 
 
+class PeerConsCache(Base):
+    """
+    同业对标板块成分股缓存。
+    同一板块每24小时只拉一次成分股 list，减少对 akshare 的重复调用和网络故障。
+    """
+    __tablename__ = 'peer_cons_cache'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    industry = Column(String(50), nullable=False, index=True)
+    data_json = Column(Text)          # 成分股数据的 JSON 序列化（{code, name} list）
+    cached_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint('industry', name='uix_peer_cons_industry'),
+    )
+
+
 class DatabaseManager:
     """
     数据库管理器
@@ -2127,6 +2624,17 @@ class DatabaseManager:
                             conn.execute(text(f'ALTER TABLE stock_income ADD COLUMN {col_name} FLOAT'))
                             conn.commit()
                             logger.info(f"stock_income 表补充费用列 {col_name}（{col_desc}，单位：元）")
+
+                # analysis_review：旧表缺 error_pattern / direction_verdict 列时补齐
+                if 'analysis_review' in table_names:
+                    review_cols = [c['name'] for c in inspector.get_columns('analysis_review')]
+                    for col_name, col_type, col_desc in (
+                            ('error_pattern', 'VARCHAR(30)', '误判主要类别'),
+                            ('direction_verdict', 'VARCHAR(10)', '方向对账结果')):
+                        if col_name not in review_cols:
+                            conn.execute(text(f'ALTER TABLE analysis_review ADD COLUMN {col_name} {col_type}'))
+                            conn.commit()
+                            logger.info(f"analysis_review 表补充 {col_name} 列（{col_desc}）")
         except Exception as e:
             # 迁移失败不阻塞启动，但要暴露出来便于排查
             logger.error(f"历史表结构迁移失败: {e}")
@@ -3740,14 +4248,20 @@ class DatabaseManager:
             else:
                 file_path = pdf_path / filename
 
-            # 检查文件是否已存在（已存在也要提取文本，否则下游拿不到 file_content）
+            # 检查文件是否已存在
             if file_path.exists():
-                result['success'] = True
-                result['file_path'] = str(file_path)
-                result['file_size'] = file_path.stat().st_size
-                result['file_content'] = self.extract_text_from_pdf_content(file_path.read_bytes()) or ""
-                logger.info(f"PDF文件已存在: {file_path}")
-                return result
+                # 已有文件尝试提取文本
+                existing_content = self.extract_text_from_pdf_content(file_path.read_bytes()) or ""
+                if existing_content:
+                    result['success'] = True
+                    result['file_path'] = str(file_path)
+                    result['file_size'] = file_path.stat().st_size
+                    result['file_content'] = existing_content
+                    logger.info(f"PDF文件已存在: {file_path}")
+                    return result
+                # 文件损坏或扫描版PDF → 删掉重新下载
+                logger.warning(f"文件已存在但提取文本为空（可能损坏或非PDF无文本内容），重新下载: {file_path}")
+                file_path.unlink()
 
             # 下载PDF
             logger.info(f"开始下载PDF: {url}")
@@ -3791,19 +4305,53 @@ class DatabaseManager:
 
     def extract_text_from_pdf_content(self, file_content: bytes) -> Optional[str]:
         """
-        从 PDF 二进制内容中提取文本
+        从 PDF 二进制内容中提取文本（自动降级处理非PDF内容）
+
+        - 真实 PDF（%PDF 文件头）→ PyPDF2 提取
+        - HTML 页面 → BeautifulSoup 提取纯文本
+        - 纯文本 → 直接返回
 
         参数:
-            file_content: PDF 文件的二进制内容（bytes 或 bytearray）
+            file_content: 文件的二进制内容（bytes 或 bytearray）
 
         返回:
             str: 提取的文本内容
         """
+        content_bytes = bytes(file_content) if isinstance(file_content, bytearray) else file_content
+
+        # === 非 PDF 内容：直接解码为文本 ===
+        if not content_bytes.startswith(b'%PDF'):
+            try:
+                raw_text = content_bytes.decode('utf-8', errors='replace')
+            except Exception:
+                return None
+
+            # 尝试用 BeautifulSoup 剥离 HTML 标签
+            try:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(raw_text, 'html.parser')
+                # 如果有明显的 HTML 结构，提取纯文本
+                if soup.find(['html', 'body', 'div', 'p', 'span']):
+                    texts = soup.get_text(separator='\n', strip=True)
+                    if texts:
+                        logger.info(f"[非PDF提取] HTML 内容，提取 {len(texts)} 字符")
+                        return texts
+            except Exception:
+                pass
+
+            # 纯文本：去除空行后返回
+            stripped = '\n'.join(line for line in raw_text.splitlines() if line.strip())
+            if stripped.strip():
+                logger.info(f"[非PDF提取] 纯文本内容，共 {len(stripped)} 字符")
+                return stripped
+            return None
+
+        # === 真实 PDF：用 PyPDF2 提取 ===
         try:
             import PyPDF2
 
             # 将 bytes 转换为文件对象
-            pdf_file = io.BytesIO(bytes(file_content))
+            pdf_file = io.BytesIO(content_bytes)
 
             # 读取 PDF
             reader = PyPDF2.PdfReader(pdf_file)
@@ -5479,9 +6027,19 @@ class DatabaseManager:
         """保存限售解禁数据"""
         if df is None or df.empty: return 0
         saved_count = 0
+        # 同一批 dedup：去重 (float_date, holder_name)，防止事务内互不可见导致的 UNIQUE 冲突
+        seen = set()
+        rows = []
+        for _, row in df.iterrows():
+            fd = parse_row_date(row.get('float_date'))
+            hn = row.get('holder_name', '')
+            key = (fd, hn)
+            if key not in seen:
+                seen.add(key)
+                rows.append(row)
         with self.get_session() as session:
             try:
-                for _, row in df.iterrows():
+                for _, row in enumerate(rows):
                     float_date = parse_row_date(row.get('float_date'))
                     holder_name = row.get('holder_name', '')
                     existing = session.execute(
@@ -6121,6 +6679,56 @@ class DatabaseManager:
                 session.rollback()
                 raise
 
+    def save_improvement_rule(self, **kwargs) -> int:
+        """保存一条改进规则"""
+        with self.get_session() as session:
+            try:
+                record = ImprovementRule(**kwargs)
+                session.add(record)
+                session.commit()
+                return record.id
+            except Exception:
+                session.rollback()
+                raise
+
+    def get_active_rules(self, code: str = None, limit: int = 10) -> List[Dict[str, Any]]:
+        """获取有效的改进规则：如果传 code 则优先取该标的规则+通用规则，
+           不传 code 只取通用规则"""
+        with self.get_session() as session:
+            query = select(ImprovementRule).where(ImprovementRule.is_active == 1)
+            if code:
+                query = query.where(
+                    or_(ImprovementRule.code == code, ImprovementRule.code.is_(None))
+                )
+            else:
+                query = query.where(ImprovementRule.code.is_(None))
+            query = query.order_by(desc(ImprovementRule.created_at)).limit(limit)
+            results = session.execute(query).scalars().all()
+            return [r.to_dict() for r in results]
+
+    def get_rule_by_snapshot(self, snapshot_id: int) -> Optional[Dict[str, Any]]:
+        """根据复盘快照id查找是否已生成规则"""
+        with self.get_session() as session:
+            result = session.execute(
+                select(ImprovementRule).where(
+                    ImprovementRule.source_snapshot_id == snapshot_id
+                ).limit(1)
+            ).scalar_one_or_none()
+            return result.to_dict() if result else None
+
+    def increment_rule_hit(self, rule_id: int) -> None:
+        """增加规则引用计数"""
+        with self.get_session() as session:
+            try:
+                rule = session.execute(
+                    select(ImprovementRule).where(ImprovementRule.id == rule_id)
+                ).scalar_one_or_none()
+                if rule:
+                    rule.hit_count = (rule.hit_count or 0) + 1
+                    session.commit()
+            except Exception:
+                session.rollback()
+
     def get_last_review_for_code(self, code: str) -> Optional[Dict[str, Any]]:
         """获取某股票最近一次复盘记录（供下次分析注入）"""
         with self.get_session() as session:
@@ -6296,6 +6904,1282 @@ class DatabaseManager:
             except Exception:
                 session.rollback()
                 return False
+
+    # ===== 分红送股数据 ===================================================
+
+    def save_stock_dividend(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存分红送股数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含分红送股数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存分红送股数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                end_dates = [parse_row_date(d) for d in df['end_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockDividend).where(
+                        and_(
+                            StockDividend.code == code,
+                            StockDividend.end_date.in_(end_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {r.end_date: r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    end_date = parse_row_date(row.get('end_date'))
+                    existing = existing_map.get(end_date)
+
+                    if existing:
+                        existing.div_procf = row.get('div_procf')
+                        existing.stk_bo_rate = row.get('stk_bo_rate')
+                        existing.stk_co_rate = row.get('stk_co_rate')
+                        existing.cash_div = row.get('cash_div')
+                        existing.ex_date = parse_row_date(row.get('ex_date')) if row.get('ex_date') else None
+                        existing.pay_date = parse_row_date(row.get('pay_date')) if row.get('pay_date') else None
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockDividend(
+                            code=code,
+                            end_date=end_date,
+                            div_procf=row.get('div_procf'),
+                            stk_bo_rate=row.get('stk_bo_rate'),
+                            stk_co_rate=row.get('stk_co_rate'),
+                            cash_div=row.get('cash_div'),
+                            ex_date=parse_row_date(row.get('ex_date')) if row.get('ex_date') else None,
+                            pay_date=parse_row_date(row.get('pay_date')) if row.get('pay_date') else None,
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 分红送股数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 分红送股数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 分红送股数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_dividend(self, code: str, limit: int = 10) -> pd.DataFrame:
+        """
+        获取分红送股数据
+        Args:
+            code: 股票代码
+            limit: 返回记录数上限
+        Returns:
+            pd.DataFrame: 分红送股数据
+        """
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockDividend)
+                .where(StockDividend.code == code)
+                .order_by(desc(StockDividend.end_date))
+                .limit(limit)
+            ).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'end_date' in data_list.columns:
+                data_list['end_date'] = data_list['end_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    # ===== 财务审计意见数据 ===================================================
+
+    def save_stock_fina_audit(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存财务审计意见数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含财务审计意见数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存财务审计意见数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                end_dates = [parse_row_date(d) for d in df['end_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockFinaAudit).where(
+                        and_(
+                            StockFinaAudit.code == code,
+                            StockFinaAudit.end_date.in_(end_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {r.end_date: r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    end_date = parse_row_date(row.get('end_date'))
+                    existing = existing_map.get(end_date)
+
+                    if existing:
+                        existing.audit_opinion = row.get('audit_opinion')
+                        existing.opinions = row.get('opinions')
+                        existing.auditor = row.get('auditor')
+                        existing.audit_fee = row.get('audit_fee')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockFinaAudit(
+                            code=code,
+                            end_date=end_date,
+                            audit_opinion=row.get('audit_opinion'),
+                            opinions=row.get('opinions'),
+                            auditor=row.get('auditor'),
+                            audit_fee=row.get('audit_fee'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 财务审计意见数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 财务审计意见数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 财务审计意见数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_fina_audit(self, code: str, limit: int = 10) -> pd.DataFrame:
+        """
+        获取财务审计意见数据
+        Args:
+            code: 股票代码
+            limit: 返回记录数上限
+        Returns:
+            pd.DataFrame: 财务审计意见数据
+        """
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockFinaAudit)
+                .where(StockFinaAudit.code == code)
+                .order_by(desc(StockFinaAudit.end_date))
+                .limit(limit)
+            ).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'end_date' in data_list.columns:
+                data_list['end_date'] = data_list['end_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    # ===== 财报披露计划数据 ===================================================
+
+    def save_stock_disclosure_date(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存财报披露计划数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含财报披露计划数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存财报披露计划数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                end_dates = [parse_row_date(d) for d in df['end_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockDisclosureDate).where(
+                        and_(
+                            StockDisclosureDate.code == code,
+                            StockDisclosureDate.end_date.in_(end_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {r.end_date: r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    end_date = parse_row_date(row.get('end_date'))
+                    existing = existing_map.get(end_date)
+
+                    if existing:
+                        existing.stm_issue_date = parse_row_date(row.get('stm_issue_date')) if row.get('stm_issue_date') else None
+                        existing.stm_comm_date = parse_row_date(row.get('stm_comm_date')) if row.get('stm_comm_date') else None
+                        existing.actual_diss_date = parse_row_date(row.get('actual_diss_date')) if row.get('actual_diss_date') else None
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockDisclosureDate(
+                            code=code,
+                            end_date=end_date,
+                            stm_issue_date=parse_row_date(row.get('stm_issue_date')) if row.get('stm_issue_date') else None,
+                            stm_comm_date=parse_row_date(row.get('stm_comm_date')) if row.get('stm_comm_date') else None,
+                            actual_diss_date=parse_row_date(row.get('actual_diss_date')) if row.get('actual_diss_date') else None,
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 财报披露计划数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 财报披露计划数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 财报披露计划数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_disclosure_date(self, code: str, limit: int = 10) -> pd.DataFrame:
+        """
+        获取财报披露计划数据
+        Args:
+            code: 股票代码
+            limit: 返回记录数上限
+        Returns:
+            pd.DataFrame: 财报披露计划数据
+        """
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockDisclosureDate)
+                .where(StockDisclosureDate.code == code)
+                .order_by(desc(StockDisclosureDate.end_date))
+                .limit(limit)
+            ).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'end_date' in data_list.columns:
+                data_list['end_date'] = data_list['end_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    # ===== 股权质押明细数据 ===================================================
+
+    def save_stock_pledge_detail(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存股权质押明细数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含股权质押明细数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存股权质押明细数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                end_dates = [parse_row_date(d) for d in df['end_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockPledgeDetail).where(
+                        and_(
+                            StockPledgeDetail.code == code,
+                            StockPledgeDetail.end_date.in_(end_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {(r.end_date, r.pledger): r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    end_date = parse_row_date(row.get('end_date'))
+                    pledger = row.get('pledger')
+                    existing = existing_map.get((end_date, pledger))
+
+                    if existing:
+                        existing.pledge_amount = row.get('pledge_amount')
+                        existing.pledge_ratio = row.get('pledge_ratio')
+                        existing.pledge_total_ratio = row.get('pledge_total_ratio')
+                        existing.pledge_start_date = parse_row_date(row.get('pledge_start_date')) if row.get('pledge_start_date') else None
+                        existing.pledge_end_date = parse_row_date(row.get('pledge_end_date')) if row.get('pledge_end_date') else None
+                        existing.pledge_status = row.get('pledge_status')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockPledgeDetail(
+                            code=code,
+                            end_date=end_date,
+                            pledger=pledger,
+                            pledge_amount=row.get('pledge_amount'),
+                            pledge_ratio=row.get('pledge_ratio'),
+                            pledge_total_ratio=row.get('pledge_total_ratio'),
+                            pledge_start_date=parse_row_date(row.get('pledge_start_date')) if row.get('pledge_start_date') else None,
+                            pledge_end_date=parse_row_date(row.get('pledge_end_date')) if row.get('pledge_end_date') else None,
+                            pledge_status=row.get('pledge_status'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 股权质押明细数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 股权质押明细数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 股权质押明细数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_pledge_detail(self, code: str, limit: int = 20) -> pd.DataFrame:
+        """
+        获取股权质押明细数据
+        Args:
+            code: 股票代码
+            limit: 返回记录数上限
+        Returns:
+            pd.DataFrame: 股权质押明细数据
+        """
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockPledgeDetail)
+                .where(StockPledgeDetail.code == code)
+                .order_by(desc(StockPledgeDetail.end_date))
+                .limit(limit)
+            ).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'end_date' in data_list.columns:
+                data_list['end_date'] = data_list['end_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    # ===== 股东增减持数据 ===================================================
+
+    def save_stock_holder_trade(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存股东增减持数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含股东增减持数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存股东增减持数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                ann_dates = [parse_row_date(d) for d in df['ann_date'].tolist()]
+                existing_records = session.execute(
+                    select(StockHolderTrade).where(
+                        and_(
+                            StockHolderTrade.code == code,
+                            StockHolderTrade.ann_date.in_(ann_dates)
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {(r.ann_date, r.holder_name): r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    ann_date = parse_row_date(row.get('ann_date'))
+                    holder_name = row.get('holder_name')
+                    existing = existing_map.get((ann_date, holder_name))
+
+                    if existing:
+                        existing.trade_type = row.get('trade_type')
+                        existing.trade_volume = row.get('trade_volume')
+                        existing.trade_ratio = row.get('trade_ratio')
+                        existing.after_ratio = row.get('after_ratio')
+                        existing.avg_price = row.get('avg_price')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockHolderTrade(
+                            code=code,
+                            ann_date=ann_date,
+                            holder_name=holder_name,
+                            trade_type=row.get('trade_type'),
+                            trade_volume=row.get('trade_volume'),
+                            trade_ratio=row.get('trade_ratio'),
+                            after_ratio=row.get('after_ratio'),
+                            avg_price=row.get('avg_price'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 股东增减持数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 股东增减持数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 股东增减持数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_holder_trade(self, code: str, limit: int = 20) -> pd.DataFrame:
+        """
+        获取股东增减持数据
+        Args:
+            code: 股票代码
+            limit: 返回记录数上限
+        Returns:
+            pd.DataFrame: 股东增减持数据
+        """
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockHolderTrade)
+                .where(StockHolderTrade.code == code)
+                .order_by(desc(StockHolderTrade.ann_date))
+                .limit(limit)
+            ).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'ann_date' in data_list.columns:
+                data_list['ann_date'] = data_list['ann_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    def save_stock_report_rc(self, df: pd.DataFrame, code: str) -> int:
+        """
+        保存卖方盈利预测数据到数据库（支持UPSERT操作）
+        Args:
+            df: 包含卖方盈利预测数据的DataFrame
+            code: 股票代码
+        Returns:
+            int: 新增的记录数
+        """
+        if df is None or df.empty:
+            logger.warning(f"保存卖方盈利预测数据为空，跳过 {code}")
+            return 0
+
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                report_dates = [parse_row_date(d) for d in df['report_date'].tolist()]
+                forecast_orgs = df['forecast_org'].tolist() if 'forecast_org' in df.columns else df.get('org_name', ['']).tolist()
+                forecast_types = df['forecast_type'].tolist() if 'forecast_type' in df.columns else df.get('type', ['']).tolist()
+                existing_records = session.execute(
+                    select(StockReportRc).where(
+                        and_(
+                            StockReportRc.code == code,
+                            StockReportRc.report_date.in_(report_dates),
+                            StockReportRc.forecast_org.in_(forecast_orgs),
+                            StockReportRc.forecast_type.in_(forecast_types),
+                        )
+                    )
+                ).scalars().all()
+                existing_map = {(r.report_date, r.forecast_org, r.forecast_type): r for r in existing_records}
+
+                for _, row in df.iterrows():
+                    report_date = parse_row_date(row.get('report_date'))
+                    forecast_type = row.get('forecast_type') or row.get('type')
+                    forecast_value = row.get('forecast_value') or row.get('value')
+                    forecast_org = row.get('forecast_org') or row.get('org_name')
+                    target_price = row.get('target_price') or row.get('target')
+                    key = (report_date, forecast_org, forecast_type)
+                    existing = existing_map.get(key)
+
+                    if existing:
+                        existing.forecast_value = forecast_value
+                        existing.forecast_org = forecast_org
+                        existing.analyst = row.get('analyst')
+                        existing.rating = row.get('rating')
+                        existing.rating_change = row.get('rating_change')
+                        existing.target_price = target_price
+                        existing.period = row.get('period')
+                        existing.updated_at = datetime.now()
+                    else:
+                        record = StockReportRc(
+                            code=code,
+                            report_date=report_date,
+                            forecast_type=forecast_type,
+                            forecast_value=forecast_value,
+                            forecast_org=forecast_org,
+                            analyst=row.get('analyst'),
+                            rating=row.get('rating'),
+                            rating_change=row.get('rating_change'),
+                            target_price=target_price,
+                            period=row.get('period'),
+                        )
+                        session.add(record)
+                        saved_count += 1
+
+                session.commit()
+                if saved_count > 0:
+                    logger.info(f"保存 {code} 卖方盈利预测数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
+                else:
+                    logger.info(f"保存 {code} 卖方盈利预测数据成功，更新 {len(df)} 条记录")
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存 {code} 卖方盈利预测数据失败: {e}")
+                raise
+
+        return saved_count
+
+    def get_stock_report_rc(self, code: str, limit: int = 20) -> pd.DataFrame:
+        """
+        获取卖方盈利预测数据
+        Args:
+            code: 股票代码
+            limit: 返回记录数上限
+        Returns:
+            pd.DataFrame: 卖方盈利预测数据
+        """
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockReportRc)
+                .where(StockReportRc.code == code)
+                .order_by(desc(StockReportRc.report_date))
+                .limit(limit)
+            ).scalars().all()
+
+            if not results:
+                return pd.DataFrame()
+
+            data_list = pd.DataFrame([obj.to_dict() for obj in results])
+
+            if 'report_date' in data_list.columns:
+                data_list['report_date'] = data_list['report_date'].apply(lambda x: pd.Timestamp(x))
+                data_list['code'] = data_list['code'].astype(str)
+
+            return data_list
+
+    def save_stock_margin(self, df: pd.DataFrame, code: str) -> int:
+        """保存融资融券交易汇总"""
+        if df is None or df.empty:
+            return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    trade_date = parse_row_date(row.get('trade_date'))
+                    existing = session.execute(
+                        select(StockMargin).where(
+                            and_(StockMargin.code == code, StockMargin.trade_date == trade_date)
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.margin_balance = row.get('margin_balance')
+                        existing.margin_buy = row.get('margin_buy')
+                        existing.short_sell_balance = row.get('short_sell_balance')
+                        existing.short_sell_volume = row.get('short_sell_volume')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockMargin(
+                            code=code, trade_date=trade_date,
+                            margin_balance=row.get('margin_balance'),
+                            margin_buy=row.get('margin_buy'),
+                            short_sell_balance=row.get('short_sell_balance'),
+                            short_sell_volume=row.get('short_sell_volume'),
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存融资融券数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_margin(self, code: str, limit: int = 20) -> pd.DataFrame:
+        """获取融资融券交易汇总"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockMargin)
+                .where(StockMargin.code == code)
+                .order_by(desc(StockMargin.trade_date))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'trade_date' in df.columns:
+                df['trade_date'] = pd.to_datetime(df['trade_date'])
+            return df
+
+    def save_stock_margin_detail(self, df: pd.DataFrame, code: str) -> int:
+        """保存融资融券交易明细"""
+        if df is None or df.empty:
+            return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    trade_date = parse_row_date(row.get('trade_date'))
+                    existing = session.execute(
+                        select(StockMarginDetail).where(
+                            and_(StockMarginDetail.code == code, StockMarginDetail.trade_date == trade_date)
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.margin_buy = row.get('margin_buy')
+                        existing.rzye = row.get('rzye')
+                        existing.rqye = row.get('rqye')
+                        existing.rzmre = row.get('rzmre')
+                        existing.rqyl = row.get('rqyl')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockMarginDetail(
+                            code=code, trade_date=trade_date,
+                            margin_buy=row.get('margin_buy'),
+                            rzye=row.get('rzye'),
+                            rqye=row.get('rqye'),
+                            rzmre=row.get('rzmre'),
+                            rqyl=row.get('rqyl'),
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存融资融券明细数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_margin_detail(self, code: str, limit: int = 20) -> pd.DataFrame:
+        """获取融资融券交易明细"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockMarginDetail)
+                .where(StockMarginDetail.code == code)
+                .order_by(desc(StockMarginDetail.trade_date))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'trade_date' in df.columns:
+                df['trade_date'] = pd.to_datetime(df['trade_date'])
+            return df
+
+    def save_stock_moneyflow(self, df: pd.DataFrame, code: str) -> int:
+        """保存个股资金流"""
+        if df is None or df.empty:
+            return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    trade_date = parse_row_date(row.get('trade_date'))
+                    existing = session.execute(
+                        select(StockMoneyflow).where(
+                            and_(StockMoneyflow.code == code, StockMoneyflow.trade_date == trade_date)
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.buy_sm_vol = row.get('buy_sm_vol')
+                        existing.buy_sm_amount = row.get('buy_sm_amount')
+                        existing.sell_sm_vol = row.get('sell_sm_vol')
+                        existing.sell_sm_amount = row.get('sell_sm_amount')
+                        existing.buy_md_vol = row.get('buy_md_vol')
+                        existing.buy_md_amount = row.get('buy_md_amount')
+                        existing.sell_md_vol = row.get('sell_md_vol')
+                        existing.sell_md_amount = row.get('sell_md_amount')
+                        existing.buy_lg_vol = row.get('buy_lg_vol')
+                        existing.buy_lg_amount = row.get('buy_lg_amount')
+                        existing.sell_lg_vol = row.get('sell_lg_vol')
+                        existing.sell_lg_amount = row.get('sell_lg_amount')
+                        existing.buy_elg_vol = row.get('buy_elg_vol')
+                        existing.buy_elg_amount = row.get('buy_elg_amount')
+                        existing.sell_elg_vol = row.get('sell_elg_vol')
+                        existing.sell_elg_amount = row.get('sell_elg_amount')
+                        existing.net_mf_amount = row.get('net_mf_amount')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockMoneyflow(
+                            code=code, trade_date=trade_date,
+                            buy_sm_vol=row.get('buy_sm_vol'),
+                            buy_sm_amount=row.get('buy_sm_amount'),
+                            sell_sm_vol=row.get('sell_sm_vol'),
+                            sell_sm_amount=row.get('sell_sm_amount'),
+                            buy_md_vol=row.get('buy_md_vol'),
+                            buy_md_amount=row.get('buy_md_amount'),
+                            sell_md_vol=row.get('sell_md_vol'),
+                            sell_md_amount=row.get('sell_md_amount'),
+                            buy_lg_vol=row.get('buy_lg_vol'),
+                            buy_lg_amount=row.get('buy_lg_amount'),
+                            sell_lg_vol=row.get('sell_lg_vol'),
+                            sell_lg_amount=row.get('sell_lg_amount'),
+                            buy_elg_vol=row.get('buy_elg_vol'),
+                            buy_elg_amount=row.get('buy_elg_amount'),
+                            sell_elg_vol=row.get('sell_elg_vol'),
+                            sell_elg_amount=row.get('sell_elg_amount'),
+                            net_mf_amount=row.get('net_mf_amount'),
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存个股资金流数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_moneyflow(self, code: str, limit: int = 20) -> pd.DataFrame:
+        """获取个股资金流"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockMoneyflow)
+                .where(StockMoneyflow.code == code)
+                .order_by(desc(StockMoneyflow.trade_date))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'trade_date' in df.columns:
+                df['trade_date'] = pd.to_datetime(df['trade_date'])
+            return df
+
+    def save_stock_hsgt_moneyflow(self, df: pd.DataFrame) -> int:
+        """保存沪深港通资金流"""
+        if df is None or df.empty:
+            return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    trade_date = parse_row_date(row.get('trade_date'))
+                    existing = session.execute(
+                        select(StockHsgtMoneyflow).where(
+                            StockHsgtMoneyflow.trade_date == trade_date
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.ggt_ss = row.get('ggt_ss')
+                        existing.ggt_sz = row.get('ggt_sz')
+                        existing.hgt = row.get('hgt')
+                        existing.sgt = row.get('sgt')
+                        existing.north_money = row.get('north_money')
+                        existing.south_money = row.get('south_money')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockHsgtMoneyflow(
+                            trade_date=trade_date,
+                            ggt_ss=row.get('ggt_ss'),
+                            ggt_sz=row.get('ggt_sz'),
+                            hgt=row.get('hgt'),
+                            sgt=row.get('sgt'),
+                            north_money=row.get('north_money'),
+                            south_money=row.get('south_money'),
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存沪深港通资金流数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_hsgt_moneyflow(self, limit: int = 20) -> pd.DataFrame:
+        """获取沪深港通资金流"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockHsgtMoneyflow)
+                .order_by(desc(StockHsgtMoneyflow.trade_date))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'trade_date' in df.columns:
+                df['trade_date'] = pd.to_datetime(df['trade_date'])
+            return df
+
+    def save_stock_mkt_moneyflow_dc(self, df: pd.DataFrame) -> int:
+        """保存大盘资金流（日频）"""
+        if df is None or df.empty:
+            return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    trade_date = parse_row_date(row.get('trade_date'))
+                    existing = session.execute(
+                        select(StockMktMoneyflowDC).where(
+                            StockMktMoneyflowDC.trade_date == trade_date
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.close_sh = row.get('close_sh')
+                        existing.change_pct = row.get('change_pct')
+                        existing.main_net = row.get('main_net')
+                        existing.retail_net = row.get('retail_net')
+                        existing.total_net = row.get('total_net')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockMktMoneyflowDC(
+                            trade_date=trade_date,
+                            close_sh=row.get('close_sh'),
+                            change_pct=row.get('change_pct'),
+                            main_net=row.get('main_net'),
+                            retail_net=row.get('retail_net'),
+                            total_net=row.get('total_net'),
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存大盘资金流数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_mkt_moneyflow_dc(self, limit: int = 20) -> pd.DataFrame:
+        """获取大盘资金流（日频）"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockMktMoneyflowDC)
+                .order_by(desc(StockMktMoneyflowDC.trade_date))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'trade_date' in df.columns:
+                df['trade_date'] = pd.to_datetime(df['trade_date'])
+            return df
+
+    def save_stock_macro_rate(self, df: pd.DataFrame, rate_type: str) -> int:
+        """保存宏观利率数据"""
+        if df is None or df.empty:
+            return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    date_val = parse_row_date(row.get('date'))
+                    existing = session.execute(
+                        select(StockMacroRate).where(
+                            and_(StockMacroRate.rate_type == rate_type, StockMacroRate.date == date_val)
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.rate_value = row.get('rate_value') or row.get(row.get('rate_type'))
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockMacroRate(
+                            rate_type=rate_type, date=date_val,
+                            rate_value=row.get('rate_value') or row.get(rate_type),
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存宏观利率数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_macro_rate(self, rate_type: str, limit: int = 30) -> pd.DataFrame:
+        """获取宏观利率数据"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockMacroRate)
+                .where(StockMacroRate.rate_type == rate_type)
+                .order_by(desc(StockMacroRate.date))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+            return df
+
+    def save_stock_wz_index(self, df: pd.DataFrame) -> int:
+        """保存温州指数"""
+        if df is None or df.empty:
+            return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    date_val = parse_row_date(row.get('date'))
+                    existing = session.execute(
+                        select(StockWzIndex).where(
+                            StockWzIndex.date == date_val
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.index_value = row.get('index_value') or row.get('close')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockWzIndex(
+                            date=date_val,
+                            index_value=row.get('index_value') or row.get('close'),
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存温州指数数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_wz_index(self, limit: int = 20) -> pd.DataFrame:
+        """获取温州指数"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockWzIndex)
+                .order_by(desc(StockWzIndex.date))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+            return df
+
+    def save_stock_gz_index(self, df: pd.DataFrame) -> int:
+        """保存贵阳指数"""
+        if df is None or df.empty:
+            return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    date_val = parse_row_date(row.get('date'))
+                    existing = session.execute(
+                        select(StockGzIndex).where(
+                            StockGzIndex.date == date_val
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.index_value = row.get('index_value') or row.get('close')
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockGzIndex(
+                            date=date_val,
+                            index_value=row.get('index_value') or row.get('close'),
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存贵阳指数数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_gz_index(self, limit: int = 20) -> pd.DataFrame:
+        """获取贵阳指数"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockGzIndex)
+                .order_by(desc(StockGzIndex.date))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            df = pd.DataFrame([r.to_dict() for r in results])
+            if 'date' in df.columns:
+                df['date'] = pd.to_datetime(df['date'])
+            return df
+
+    def save_stock_macro_indicator(self, indicator_name: str, df: pd.DataFrame) -> int:
+        """保存宏观指标数据（UPSERT）"""
+        if df is None or df.empty:
+            return 0
+        saved_count = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    # 找到第一个看起来像日期/周期的列
+                    period_col = None
+                    for col in df.columns:
+                        col_lower = col.lower()
+                        if col_lower in ('month', 'year', 'quarter', 'date', 'period', 'trade_date', 'ann_date', 'end_date'):
+                            period_col = col
+                            break
+                    if period_col is None:
+                        period_col = df.columns[0]
+                    period_val = str(row.get(period_col, ''))
+                    if not period_val:
+                        continue
+                    # 将所有列值转为JSON
+                    row_dict = {}
+                    for col in df.columns:
+                        val = row.get(col)
+                        if val is not None and not (isinstance(val, float) and pd.isna(val)):
+                            if isinstance(val, (date, datetime)):
+                                row_dict[col] = str(val)
+                            else:
+                                row_dict[col] = val
+                    value_json_str = json.dumps(row_dict, ensure_ascii=False, default=str)
+                    existing = session.execute(
+                        select(StockMacroIndicator).where(
+                            and_(
+                                StockMacroIndicator.indicator_name == indicator_name,
+                                StockMacroIndicator.period == period_val,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        existing.value_json = value_json_str
+                        existing.updated_at = datetime.now()
+                    else:
+                        session.add(StockMacroIndicator(
+                            indicator_name=indicator_name,
+                            period=period_val,
+                            value_json=value_json_str,
+                        ))
+                        saved_count += 1
+                session.commit()
+            except Exception as e:
+                session.rollback()
+                logger.error(f"保存宏观指标[{indicator_name}]数据失败: {e}")
+                raise
+        return saved_count
+
+    def get_stock_macro_indicator(self, indicator_name: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """获取宏观指标数据"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockMacroIndicator)
+                .where(StockMacroIndicator.indicator_name == indicator_name)
+                .order_by(desc(StockMacroIndicator.period))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return []
+            return [r.to_dict() for r in results]
+
+    def get_latest_macro_period(self, indicator_name: str) -> Optional[str]:
+        """获取宏观指标最新周期"""
+        with self.get_session() as session:
+            result = session.execute(
+                select(StockMacroIndicator.period)
+                .where(StockMacroIndicator.indicator_name == indicator_name)
+                .order_by(desc(StockMacroIndicator.period))
+                .limit(1)
+            ).scalar_one_or_none()
+            return result
+
+    def has_stock_macro_indicator(self, indicator_name: str) -> bool:
+        """检查宏观指标是否有缓存数据"""
+        with self.get_session() as session:
+            result = session.execute(
+                select(StockMacroIndicator.id)
+                .where(StockMacroIndicator.indicator_name == indicator_name)
+                .limit(1)
+            ).scalar_one_or_none()
+            return result is not None
+
+    def get_latest_stock_macro_end_date(self, indicator_name: str) -> Optional[date]:
+        """获取宏观指标缓存中最新的 period 作为日期返回"""
+        try:
+            with self.get_session() as session:
+                result = session.execute(
+                    select(StockMacroIndicator.period)
+                    .where(StockMacroIndicator.indicator_name == indicator_name)
+                    .order_by(StockMacroIndicator.period.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+                if result is None:
+                    return None
+                p = str(result).strip()
+                # 尝试多种格式解析
+                if len(p) == 8 and p.isdigit():  # YYYYMMDD
+                    return datetime.strptime(p, "%Y%m%d").date()
+                if len(p) == 6 and p.isdigit():  # YYYYMM
+                    return datetime.strptime(p + "01", "%Y%m%d").date()
+                return datetime.strptime(p[:10], "%Y-%m-%d").date()
+        except Exception as e:
+            logger.debug(f"解析宏观指标[{indicator_name}]最新日期失败: {e}")
+            return None
+
+    # ----- 同业对标板块成分股缓存 -----
+
+    def get_cached_peer_cons(self, industry: str) -> Optional[pd.DataFrame]:
+        """
+        读取板块成分股缓存（JSON → DataFrame）。
+        过期由调用方（_try_board_cons_cached）判断，本函数只做反序列化。
+        """
+        try:
+            from sqlalchemy import select
+            session = self.Session()
+            stmt = select(PeerConsCache).where(PeerConsCache.industry == industry)
+            row = session.execute(stmt).scalar_one_or_none()
+            if row and row.data_json:
+                import json
+                data = json.loads(row.data_json)
+                if data:
+                    df = pd.DataFrame(data)
+                    logger.debug(f"[DB缓存] 读取板块成分股成功: {industry}, {len(df)}只")
+                    return df
+            return None
+        except Exception as e:
+            logger.debug(f"[DB缓存] 读取板块成分股失败: {e}")
+            return None
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def set_cached_peer_cons(self, industry: str, cons_df: pd.DataFrame) -> None:
+        """保存板块成分股到缓存（upsert）。"""
+        try:
+            import json
+            data_json = json.dumps(
+                cons_df[["代码", "名称"]].to_dict(orient="records"),
+                ensure_ascii=False,
+            )
+            session = self.Session()
+            from sqlalchemy import select
+            stmt = select(PeerConsCache).where(PeerConsCache.industry == industry)
+            existing = session.execute(stmt).scalar_one_or_none()
+            if existing:
+                existing.data_json = data_json
+                existing.cached_at = datetime.now()
+            else:
+                session.add(PeerConsCache(industry=industry, data_json=data_json))
+            session.commit()
+            logger.info(f"[DB缓存] 板块成分股缓存写入成功: {industry}, {len(cons_df)}只")
+        except Exception as e:
+            logger.debug(f"[DB缓存] 写入板块成分股缓存失败: {e}")
+            session.rollback()
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def get_peer_cons_cache_time(self, industry: str) -> Optional[datetime]:
+        """获取板块成分股缓存的时间戳。"""
+        try:
+            from sqlalchemy import select
+            session = self.Session()
+            stmt = select(PeerConsCache.cached_at).where(PeerConsCache.industry == industry)
+            result = session.execute(stmt).scalar_one_or_none()
+            return result
+        except Exception as e:
+            logger.debug(f"[DB缓存] 获取缓存时间失败: {e}")
+            return None
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+# ----- fund_adj 复权因子 -----
+
+    def save_stock_fund_adj(self, df: pd.DataFrame) -> int:
+        """保存基金复权因子"""
+        saved = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    ts_code = str(row.get("ts_code", "")).strip()
+                    trade_date = parse_row_date(row)
+                    if not ts_code or trade_date is None:
+                        continue
+                    stmt = select(StockFundAdj).where(
+                        StockFundAdj.ts_code == ts_code,
+                        StockFundAdj.trade_date == trade_date,
+                    )
+                    exist = session.execute(stmt).scalar_one_or_none()
+                    if exist:
+                        exist.adj_factor = _safe_float(row.get("adj_factor"))
+                    else:
+                        session.add(StockFundAdj(
+                            ts_code=ts_code, trade_date=trade_date,
+                            adj_factor=_safe_float(row.get("adj_factor")),
+                        ))
+                    saved += 1
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+        return saved
+
+    def get_stock_fund_adj(self, ts_code: str, limit: int = 10) -> pd.DataFrame:
+        """获取基金复权因子"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockFundAdj)
+                .where(StockFundAdj.ts_code == ts_code)
+                .order_by(desc(StockFundAdj.trade_date))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            return pd.DataFrame([r.to_dict() for r in results])
+
+    # ----- margin_secs 融资融券标的 -----
+
+    def save_stock_margin_secs(self, df: pd.DataFrame) -> int:
+        """保存融资融券标的列表"""
+        saved = 0
+        with self.get_session() as session:
+            try:
+                for _, row in df.iterrows():
+                    ts_code = str(row.get("ts_code", "")).strip()
+                    trade_date = parse_row_date(row)
+                    if not ts_code or trade_date is None:
+                        continue
+                    stmt = select(StockMarginSecs).where(
+                        StockMarginSecs.ts_code == ts_code,
+                        StockMarginSecs.trade_date == trade_date,
+                    )
+                    exist = session.execute(stmt).scalar_one_or_none()
+                    if exist:
+                        exist.name = str(row.get("name", "")).strip()
+                        exist.is_etf = str(row.get("is_etf", "")).strip()
+                    else:
+                        session.add(StockMarginSecs(
+                            ts_code=ts_code, trade_date=trade_date,
+                            name=str(row.get("name", "")).strip(),
+                            is_etf=str(row.get("is_etf", "")).strip(),
+                        ))
+                    saved += 1
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+        return saved
+
+    def get_stock_margin_secs(self, limit: int = 100) -> pd.DataFrame:
+        """获取融资融券标的列表"""
+        with self.get_session() as session:
+            results = session.execute(
+                select(StockMarginSecs)
+                .order_by(desc(StockMarginSecs.trade_date))
+                .limit(limit)
+            ).scalars().all()
+            if not results:
+                return pd.DataFrame()
+            return pd.DataFrame([r.to_dict() for r in results])
+
 
 # ===== 便捷函数 (Convenience Function) ====================================
 

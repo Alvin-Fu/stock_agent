@@ -10,6 +10,7 @@ import re
 import traceback
 from typing import Dict, Any, List, Optional
 from datetime import date, datetime, timedelta
+from concurrent.futures import as_completed
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from agents.base import AgentState
@@ -17,17 +18,21 @@ from agents.prompts_common import INTERMEDIATE_PRODUCT_NOTE
 from core.llm import get_agent_llm
 from .web_search_tool import web_search
 from tools.company_code_validator import find_stock_code, find_company_name
+from tools.weight_adjuster import get_stage_weights
 from utils.logger import logger
 
 
 # 阶段化评分框架：机会=边际变化，护城河是存量质量——不同行业生命周期两者的权重完全不同。
 # 用成熟行业的护城河框架去筛导入期行业（如商业航天），结论永远是"不参与"，等于对成长机会失明。
 # momentum（边际变化）分项：只认近2个季度/近3个月的增量事实（增速拐点/新订单/产能爬坡/毛利率环比回升）。
-STAGE_WEIGHTS = {
+# 权重值优先读取 config 中 weights.stage_weights 段（复盘自动调权后写入，热更新即时生效），
+# 缺失时回退到以下硬编码默认值。
+_STAGE_WEIGHTS_DEFAULT = {
     "成熟期": {"business": 0.2, "fundamental": 0.3, "moat": 0.4, "momentum": 0.1},
     "成长期": {"business": 0.2, "fundamental": 0.25, "moat": 0.25, "momentum": 0.3},
     "导入期": {"business": 0.15, "fundamental": 0.2, "moat": 0.25, "momentum": 0.4},
 }
+
 # 阶段判定失败/缺失时的兜底：取中间档，避免把早期行业误按成熟框架全部拒之门外
 DEFAULT_STAGE = "成长期"
 
@@ -42,7 +47,7 @@ STAGE_GATES = {
 
 def normalize_stage(stage) -> str:
     stage = str(stage or "").strip()
-    return stage if stage in STAGE_WEIGHTS else DEFAULT_STAGE
+    return stage if stage in get_stage_weights() else DEFAULT_STAGE
 
 
 def apply_stage_gate(ranked: List[Dict[str, Any]], stage: str):
@@ -90,7 +95,7 @@ def compute_composite_ranking(candidates: List[Dict[str, Any]], stage: str = DEF
     返回按综合分降序的列表：[{code, business, fundamental, moat, momentum, composite, rank, note}]
     """
     stage = normalize_stage(stage)
-    weights = STAGE_WEIGHTS[stage]
+    weights = get_stage_weights()[stage]
     ranked = []
     for c in candidates or []:
         code = str(c.get("code", "")).strip()
@@ -162,7 +167,7 @@ def format_ranking_table(ranked: List[Dict[str, Any]], name_of=None) -> str:
     if not ranked:
         return ""
     stage = ranked[0].get("stage", DEFAULT_STAGE)
-    w = STAGE_WEIGHTS[normalize_stage(stage)]
+    w = get_stage_weights()[normalize_stage(stage)]
     lines = [f"【综合排名（行业阶段：{stage}；程序按 业务{w['business']:.0%}+基本面{w['fundamental']:.0%}"
              f"+护城河{w['moat']:.0%}+边际变化{w['momentum']:.0%} 加权，再按PE历史分位做预期差调整）】"]
     for item in ranked:
@@ -319,12 +324,24 @@ class ResearcherAgent:
                 lines.append(f"  {it.get('metric','')}: {it.get('value','')} {it.get('unit','')}{note}")
         return "\n".join(lines)
 
-    def _search_with_fallback(self, query: str, max_retries: int = 2) -> str:
-        """搜索+降级重试：首搜结果空或含失败关键词时，换一种更直接的表述重试"""
+    def _search_with_fallback(self, query: str, max_retries: int = 2,
+                               per_query_timeout: int = 60) -> str:
+        """搜索+降级重试 + 超时保护。
+
+        单条query超过 per_query_timeout 秒自动放弃，不让慢引擎（如DuckDuckGo）
+        拖垮整批并行搜索。超时后直接返回失败，不再重试。
+        """
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
         for attempt in range(max_retries):
             try:
                 logger.info(f"搜索: {query[:60]}...")
-                result = web_search.invoke({"query": query})
+                with ThreadPoolExecutor(max_workers=1) as _pool:
+                    _ft = _pool.submit(lambda: web_search.invoke({"query": query}))
+                    try:
+                        result = _ft.result(timeout=per_query_timeout)
+                    except _TimeoutError:
+                        logger.warning(f"搜索超时({per_query_timeout}s, attempt {attempt+1}): {query[:40]}")
+                        return f"搜索失败: 超时{per_query_timeout}s"
                 if isinstance(result, str):
                     # 工具兜底失败返回"搜索失败:"前缀
                     if result.startswith("搜索失败"):
@@ -367,26 +384,25 @@ class ResearcherAgent:
         last_month_end = today.replace(day=1) - timedelta(days=1)
         last_month = f"{last_month_end.year}年{last_month_end.month}月"
 
+        # 从15条缩减到10条：合并主题相近的query（技术+护城河、竞争+产业链），
+        # 减少搜索引擎降级链压力（每条query都要跑一轮引擎链）
         return [
-            # 基础面
-            f"{tag} 公司公告 重大事项 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
-            f"{tag} 经营状况 营收 利润 最新业绩 {recent_period}",
-            f"{tag} 业务构成 收入占比 毛利占比 各板块营收拆分",
+            # 基础面（4条）
+            f"{tag} 重大事项 公司公告 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
+            f"{tag} 最新经营业绩 营收 利润 {recent_period}",
+            f"{tag} 业务构成 收入占比 毛利拆分 各板块营收",
             f"{tag} 所属行业 产业政策 发展趋势 {three_month_range}",
 
-            # 行业特有运营指标（通用搜索，适用于汽车/半导体/光伏/消费电子等）
-            f"{tag} {last_month} 月度 销量 出货量 交付量 同比 环比",
-            f"{tag} 月度产销快报 经营数据 最新 公告 {recent_period}",
-            f"{tag} 出货量 产能 产能利用率 新增订单 订单来源 资本开支 {recent_period}",
+            # 运营数据（2条）
+            f"{tag} {last_month} 月度产销数据 销量 出货量 交付量 同比",
+            f"{tag} 产能 产能利用率 新增订单 资本开支 {recent_period}",
 
-            # 技术与竞争
-            f"{tag} 技术实力 研发投入 核心技术突破 专利 新产品",
-            f"{tag} 竞争对手 销量对比 市场份额 {today.year}",
-            f"{tag} 护城河 技术壁垒 不可替代性 切换成本 市占率 竞争格局",
-            f"{tag} 产业链 上下游 市场地位 竞争格局 {recent_period}",
+            # 技术与竞争（2条）
+            f"{tag} 技术实力 研发投入 核心竞争力 护城河 专利壁垒",
+            f"{tag} 竞争对手 市场份额 产业链地位 竞争格局 {recent_period}",
 
-            # 增长与资金
-            f"{tag} 第二增长曲线 新业务 布局 进展 放量 {recent_period}",
+            # 增长与预期（2条）
+            f"{tag} 第二增长曲线 新业务 进展 放量 {recent_period}",
             f"{tag} 利好 利空 机构评级 目标价 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
         ]
 
@@ -402,58 +418,143 @@ class ResearcherAgent:
 请基于下方搜索结果，对该公司的以下维度进行客观分析并给出核心结论：
 
 1. **公司公告与重大事项**：近期是否有重大公告及影响
-2. **产业信息**：行业景气度、政策、趋势
+
+2. **产业信息**：行业景气度、政策、趋势；结合【同业横向对标】数据块中的行业整体估值和财务数据
+
 3. **业务拆解**：各板块收入/毛利占比、TOP3业务、出货量、产能利用率、资本开支、新增订单及来源；
    销量/出货量必须给近几个月的同比或环比序列并注明是单月还是累计，
    只有单月数据时不得外推为趋势
    **海外业务（如有）必须拆分毛利率差异来源**：车型结构差异、关税/运费影响、
    定价策略差异、渠道费用差异等，分析海外毛利率高于/低于国内的原因及可持续性
+   **高端品牌/高毛利业务（如有）必须披露其单车均价、单独毛利率、营收占比**，
+   量化高端化对公司综合毛利率的拉动空间
+
 4. **财报空窗期前瞻**：最新财报报告期之后已公布的月度经营数据（销量/出货量/订单/中标）
    是下一期财报的领先指标，必须单独汇总为「报告期后经营数据」小节
    （如一季报后已出的4/5/6月销量），并给出方向性前瞻：延续加速/延续放缓/出现拐点。
    前瞻只能是方向判断且必须标注"基于月度数据推断"，禁止推算具体营收利润数字
+
 5. **技术实力**：研发投入、核心技术突破、在研项目、专利壁垒
+
 6. **产业链地位与护城河评级**：位置、议价力、竞争格局；
-   必须给出护城河评级「高/中/低」+ 依据（独有技术/专利/牌照/切换成本/市占率等具体证据），
+   必须给出护城河评级「高/中/低」+ **双向依据**：
+   - 正面支撑：独有技术/专利/牌照/切换成本/市占率等具体证据
+   - 负面制约：削弱壁垒的因素（如净利率下行、价格战侵蚀、高端品牌占比低等）
    证据不足时评「低」并写明"未找到壁垒证据"——护城河低的公司，
    后续所有多头结论都要显著降温（没有壁垒的景气随时会被竞争摊薄）
+   **护城河论证必须包含长期盈利验证指标**：连续3年以上ROE是否高于行业平均、
+   净利率是否行业领先、超额利润的来源是什么——用这些财务壁垒佐证产业壁垒，
+   数据不足时标注"缺少ROE/净利率的长期对标数据"
+
 7. **利好与利空分析**：分别列出利好和利空条目，每条标注影响力(高/中/低)及依据出处；
    综合判断只用「偏多/中性/偏空」三档，禁止编造精确百分比
-8. **利润驱动与飞轮（三段论）**：
-   - 当前驱动：现在利润主要靠什么业务赚？必须引用主营构成数据的收入/利润占比与毛利率原数
-   - 第二曲线：哪些业务正在放量接棒？需有占比同比提升、销量/订单/出货量数据或公告佐证，
-     不能只凭新闻标题定性（按地区维度的海外占比提升=出海驱动）
-   - 远期期权：公司公开布局但尚未贡献利润的方向，逐项标注证据强度
-     （已投产/在建/公告立项/仅高管表态），没有公开证据的方向禁止列入
-   - 飞轮效应：判断各业务之间是否共享技术/产能/渠道/品牌而相互强化，
-     成立则写出具体传导链条（如"A业务的规模摊薄B业务的核心部件成本"）；
-     不成立或证据不足要明说"未见明显飞轮"，禁止强行升华
-9. **情景推演与重估触发**：
-   - 给出 乐观/基准/悲观 三情景，每个情景必须包含：
-     触发条件（具体可验证：指标+阈值或事件，如"单月销量同比转正""毛利率环比回升超1pct"
-     "海外反补贴关税落地"）、传导路径（条件→业务→财务指标的方向变化）、
-     可能性档位（只用 高/中/低，禁止编造百分比）。情景是推演不是预测，禁止写目标价
-   - 在输出最末尾附一段纯JSON（不要markdown包裹）：
-     {{"company_triggers": [{{"trigger": "重估触发条件（可被公开新闻验证的具体事件）",
-       "keywords": "盯梢关键词 空格分隔"}}, ...]}}
-     取三情景中最关键的1-4条可验证触发条件（利多利空都要有）；没有就给 []
-   - 触发条件硬规则（违反的条目会被程序丢弃）：
-     ①必须是**尚未发生**的前瞻事件：已披露报告期的数据不得作为触发条件
-     （一季报已公布就写"中报/三季报净利润同比转正"，不能写"一季报转正"）；
-     ②必须可判定：含明确方向+数字阈值（"毛利率回升至25%以上""同比转正"）
-     或明确事件（"公告""正式落地""公布"），禁止"毛利率波动/环比变化"这类
-     没有方向阈值、任何时候都成立的写法
 
-【风险对称要求】
-- 每条高影响力利好必须检查并列出对应风险（如：出口高增→关税/反补贴调查风险；大客户订单→客户集中度风险）
-- 机构评级降权处理：A股卖方几乎不出卖出评级，"N家机构全部买入"不构成有效利好，最多作为关注度参考
-- 目标价：搜索结果里有具体数字才引用，没有就不写"上涨空间较大"这类无依据表述
+8. **大盘环境与同业对标**：
+   - 基于【同业横向对标】数据块，分析公司相对同业的估值位置（PE/PB是偏高还是偏低）、
+     毛利率对比、增速对比
+   - 判断当前新能源车/所在板块指数近60日涨跌方向，公司走势相对板块的强弱
+   - 综合判断：公司是行业beta驱动还是自身alpha驱动
+
+9. **利润驱动与飞轮（三段论）**：
+   - **当前驱动**：现在利润主要靠什么业务赚？必须引用主营构成数据的收入/利润占比与毛利率原数
+   - **第二曲线**：哪些业务正在放量接棒？需有占比同比提升、销量/订单/出货量数据或公告佐证，
+     不能只凭新闻标题定性（按地区维度的海外占比提升=出海驱动）。
+     **第二曲线必须给出量化弹性测算**：未来2-3年该业务的营收空间、利润增量估算、
+     对公司整体利润的贡献占比预期（如"预计2027年储能利润占比从5%升至20%"）
+   - **远期期权**：公司公开布局但尚未贡献利润的方向，**用表格格式列出**：
+     方向 | 证据强度（已投产/在建/公告立项/仅高管表态）| 预计兑现时间，
+     每行一个方向，禁止展开大段文字；无公开证据的方向不列入
+   - **飞轮效应**：判断各业务之间是否共享技术/产能/渠道/品牌而相互强化，
+    必须做**双向判断**：
+    - 正向协同：成立则写出具体传导链条（如"A业务的规模摊薄B业务的核心部件成本"）
+    - 反向约束：是否存在内部冲突（如低端车型降价损伤高端品牌形象、各业务协同有限）
+    不成立或证据不足要明说"未见明显飞轮"，禁止强行升华
+
+10. **业绩持续性判断（增长质量分析）**：
+    对每项增长驱动力（当前驱动/第二曲线/远期期权），明确区分是**一次性脉冲**还是**持续性增长**：
+    - **一次性脉冲信号**（不可持续）：大客户一次性集采/压货、补贴退坡前抢装、
+      原材料价格短期暴涨/暴跌、特殊事件驱动（疫情/战争/缺货恐慌）、
+      会计准则变更、低基数效应、汇率短期波动、资产处置收益
+    - **持续性增长信号**（可持续）：行业渗透率持续提升、客户覆盖面扩大、
+      复购/续约率高、产能有节奏释放、海外渠道持续拓展、技术代差领先、
+      规模效应持续摊薄成本
+    - 对每项增长驱动标注「持续性/一次性/不确定」并说明判断依据
+    - 综合判断：当前利润增长中**可持续部分占比多少**？若一次性因素占比过高，
+      则在估值和展望中必须保守处理
+    - 举例：AI服务器业务中——"GB200出货量爆发"可能是一次性大客户集中部署，
+      "液冷解决方案收入占比持续提升"才是持续性增长信号
+
+11. **资金筹码分析**（基于【资金筹码数据】程序数据块）：
+    - **北向资金**：持股量变化趋势（增配/减配/新进）
+    - **两融余额**：融资净买入方向，杠杆资金在加仓还是撤退
+    - **股东户数**：户数变化趋势，筹码集中度在提升还是发散（户数↓=筹码集中，户数↑=筹码发散）
+    - **机构持仓**：基金/机构家数及持仓占比变化
+    - **限售解禁**：未来3个月大规模解禁预警（占流通股比>5%时单独警示）
+    - **综合判断**：整体资金面偏多/中性/偏空
+
+12. **SOTP分部估值**（如果程序计算模块提供了各业务净利润数据）：
+    - 对公司主要业务板块进行分部估值
+    - 汇总SOTP估值区间结论，**压缩为一句**（含每股内在价值区间），不展开PE倍数假设讨论
+
+13. **业绩敏感性测算**：
+    - 识别影响公司利润的核心变量（原材料价格/关税税率/销量/毛利率等）
+    - 估算各变量每变动一个单位对净利润的影响量级
+    - 给出"若XX变量变动±10%/±20%，净利润将在XX-XX亿元区间"的量化判断
+
+14. **情景推演与重估触发**：
+    - 给出 乐观/基准/悲观 三情景，每个情景必须包含：
+      触发条件（具体可验证：指标+阈值或事件，如"单月销量同比转正""毛利率环比回升超1pct"
+      "海外反补贴关税落地"）、传导路径（条件→业务→财务指标的方向变化）、
+      可能性档位（只用 高/中/低，禁止编造百分比）。情景是推演不是预测，禁止写目标价
+    - **催化事件分级**：在重估触发条件中标注一级/二级：
+      - **一级强催化**（🟢）：直接影响业绩兑现的事件（招标结果/量产里程碑/合同签署/财报超预期）
+      - **二级弱催化**（🔵）：间接影响情绪的事件（政策征求意见/技术试验/行业会议）
+    - 在输出最末尾附一段纯JSON（不要markdown包裹）：
+      {{"company_triggers": [{{"trigger": "重估触发条件（可被公开新闻验证的具体事件）",
+        "keywords": "盯梢关键词 空格分隔", "level": "primary/secondary"}}, ...]}}
+      取三情景中最关键的1-4条可验证触发条件（一级优先，利多利空都要有）；没有就给 []
+    - 触发条件硬规则（违反的条目会被程序丢弃）：
+      ①必须是**尚未发生**的前瞻事件：已披露报告期的数据不得作为触发条件
+      （一季报已公布就写"中报/三季报净利润同比转正"，不能写"一季报转正"）；
+      ②必须可判定：含明确方向+数字阈值（"毛利率回升至25%以上""同比转正"）
+      或明确事件（"公告""正式落地""公布"），禁止"毛利率波动/环比变化"这类
+      没有方向阈值、任何时候都成立的写法
+
+【资本开支细分要求】
+- 如果搜索结果中包含资本开支数据，必须拆分为细分投向：
+  海外建厂、产能扩张、研发投入、充换电网络/销售渠道建设等
+- 估算各方向的资本分配比例，判断投入的产能释放节奏与预期回报周期
+- 没有细分数据则标注"仅有资本开支总额，无细分投向数据"
+
+【现金流分析要求】
+- 必须给出近 4 个季度的经营现金流/投资现金流/筹资现金流时序对比
+- 标注经营现金流是否足以覆盖资本开支（自由现金流正负）
+- 判断现金流趋势是季节性波动还是长期恶化
+- 数据不足时标注"数据不足以判断现金流趋势"
 
 【机构预期修正要求】
 - 如果搜索信息显示当前季度/月度经营数据明显弱于去年同期或上季度（如销量同比下滑、毛利率走低），
   必须在报告中给出基于经营数据的**保守修正后全年净利润估算**（用当前月销量年化×单车净利等简易算法），
   并和Wind/Bloomberg 34家机构一致预期做差值对比，量化"预期差"——机构预期可能下行修正的空间
 - 如果经营数据优于预期，同样需计算修正方向
+
+【估值多窗口分析要求】
+- PE分位必须同时给出3年/5年/10年三个窗口的分位数，禁止只写单一窗口
+- 如果材料中只提供了一个窗口的分位数，标注"仅X年数据可用"
+- 必须交叉验证PE/PB/PS三个指标：PE看贵贱、PB看资产底、PS看营收估值
+- PE和PB分位背离时必须解读矛盾根源（如"盈利下滑被动抬高PE、但资产端已处历史底部"）
+- PS(TTM)分位作为补充维度，与PE/PB形成三维估值画像
+
+【海外口径说明要求】
+- 海外收入/出口占比数据必须标注统计口径：
+  - 出口量/总产量口径（含渠道库存与在途）= 非终端交付
+  - 终端交付口径 = 实际销售给终端客户
+  - 如果搜索结果中未明确口径，标注"统计口径待确认"
+
+【风险对称要求】
+- 每条高影响力利好必须检查并列出对应风险（如：出口高增→关税/反补贴调查风险；大客户订单→客户集中度风险）
+- 机构评级降权处理：A股卖方几乎不出卖出评级，"N家机构全部买入"不构成有效利好，最多作为关注度参考
+- 目标价：搜索结果里有具体数字才引用，没有就不写"上涨空间较大"这类无依据表述
 
 【价格反弹与基本面反转区分原则】
 - 报告中必须区分两组独立判断：
@@ -712,7 +813,7 @@ class ResearcherAgent:
 
     def _build_chain_system_prompt(self, stage: str = DEFAULT_STAGE, stage_reason: str = "") -> str:
         stage = normalize_stage(stage)
-        w = STAGE_WEIGHTS[stage]
+        w = get_stage_weights()[stage]
         gate_desc = "；".join(f"{label}≥{gate:g}分" for _, gate, label in STAGE_GATES[stage])
         return f"""你是一个顶级的产业链研究专家，擅长挖掘投资机会。你的任务是从产业链中筛选出所有关键公司（含特精专新企业），分析其基本面、边际变化、护城河、资金偏好，并输出清晰的候选公司清单（含股票代码），供下游技术分析 Agent 使用。
 
@@ -818,18 +919,30 @@ class ResearcherAgent:
 - 当前瓶颈环节在哪（瓶颈=定价权）：供需缺口、涨价/降价的传导方向、谁在挤压谁的毛利
 - 行业放量的兑现顺序：早周期（设备/材料）→ 中周期（制造）→ 晚周期（运营/服务），当前处于哪一段
 - 明确给出结论：**未来2-4个季度最受益的环节是哪个、为什么**，对应环节的候选公司要点名
+- **业绩持续性判断**：对各环节的增长驱动力，区分是**一次性脉冲**（大厂集中招标/补贴退坡前抢装/涨价囤货等）还是**持续性增长**（渗透率提升/国产替代加速/产能有序释放/复购需求稳定等）。综合判断各环节利润增量中可持续部分占比
 - 全部判断必须基于搜索证据（涨价新闻/排产数据/招标节奏），没有证据就写「证据不足，无法判断迁移方向」
 
-## 七、催化剂时间轴（未来3-6个月）
+## 七、资金筹码分析（北向/两融/股东户数/机构持仓/解禁）
+基于下方【候选公司资金筹码数据】程序数据块，对各家公司进行资金面分析：
+- **北向资金**：持股量变化趋势（增配/减配/新进），谁是北向重点配置标的
+- **两融余额**：融资净买入方向，杠杆资金在加仓还是撤退
+- **股东户数**：户数变化趋势，筹码集中度在提升还是发散（户数↓=筹码集中，户数↑=筹码发散）
+- **机构持仓**：基金/机构家数及持仓占比变化，机构是否在加仓
+- **限售解禁**：未来3个月大规模解禁预警（占流通股比>5%时单独列出）
+- **综合判断**：整体资金面偏多/中性/偏空，主力资金、游资、散户各自在增持哪类标的
+
+## 八、催化剂时间轴（未来3-6个月，含分级）
 机会有时间属性。用列表按时间先后列出可能的催化事件：
 - 每条格式：预计时间 | 事件（招标/发射/投产/量产/政策落地/财报窗口）| 影响的环节或公司 | 落地概率 | 弹性强度 | 出处
 - **落地概率**：每条催化标注概率（高/中/低），说明判断依据，禁止默认全部"高概率"
-- **弹性强度**：标注该事件对行业/个股业绩弹性大小（强催化/弱催化），区分股价驱动级别
+- **弹性强度**：标注该事件对行业/个股业绩弹性大小，按以下分级标准标注：
+  - **一级强催化**（🟢）：直接影响业绩兑现/订单落地的事件，如招标结果公示、量产里程碑、产品获批上市、重大合同签署、财报业绩超预期——此类事件值得推送主动告警
+  - **二级弱催化**（🔵）：间接影响市场情绪的事件，如政策征求意见稿、技术试验成功、行业会议、机构调研——此类事件仅做日常跟踪，不触发主动推送
 - 出处必须写具体来源（媒体名/公司公告/政府文件，尽量带日期），禁止笼统写
   「搜索数据」「搜索结果」——无法说出具体来源的事件视为依据不足，不列
 - 只列搜索结果里有明确依据的事件，禁止编造时间；没有就明写「未发现明确催化剂」
 
-## 八、行业近况与重大事件（近1-3个月已发生）
+## 九、行业近况与重大事件（近1-3个月已发生）
 催化剂时间轴看未来，本节看已经发生的行情驱动：
 - 技术里程碑（如"国产火箭回收试验成功"）、重要政策落地、大额融资/订单、事故与挫折，
   每条带日期与出处，并说明它是哪个环节的确认信号或风险信号
@@ -853,25 +966,29 @@ class ResearcherAgent:
     # ========== 通用工具 ==========
 
     def _do_search(self, queries: List[str]) -> Dict[str, str]:
-        # 健康按"条"上报而非按"批"：整批只报一次时，5条查询全成功显示成裸"✓"，
-        # 读起来像只搜了1条（实际误导过排查）；按条上报后显示"✓5/5"
+        """并行搜索：所有查询同时发出，大幅缩短等待时间"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         results = {}
-        for q in queries:
-            ok = True
-            try:
-                result = self._search_with_fallback(q)
-                results[q] = result
-                if isinstance(result, str) and result.startswith("搜索失败"):
+        max_workers = min(len(queries), 8)  # 最多8个并发
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(self._search_with_fallback, q): q for q in queries}
+            for future in as_completed(future_map):
+                q = future_map[future]
+                ok = True
+                try:
+                    result = future.result()
+                    results[q] = result
+                    if isinstance(result, str) and result.startswith("搜索失败"):
+                        ok = False
+                except Exception as e:
+                    logger.error(f"搜索失败 [{q}]: {e}")
+                    results[q] = f"搜索失败: {e}"
                     ok = False
-            except Exception as e:
-                logger.error(f"搜索失败 [{q}]: {e}")
-                results[q] = f"搜索失败: {e}"
-                ok = False
-            try:
-                from tools.source_health import report_source
-                report_source("网页搜索", ok, "" if ok else "部分查询失败")
-            except Exception:
-                pass
+                try:
+                    from tools.source_health import report_source
+                    report_source("网页搜索", ok, "" if ok else "部分查询失败")
+                except Exception:
+                    pass
         return results
 
     def _search_text(self, results: Dict[str, str]) -> str:
@@ -919,9 +1036,37 @@ class ResearcherAgent:
 
 {holdings_rule}
 
-【信源优先级】
-🟢 T1 权威（经认证的官方社交账号/公告）> 🔵 T2 结构化（财经媒体）> ⚪ T4 网络搜索
-数据冲突时以高等级为准。"""
+【信源优先级——必须遵守】
+**程序采集数据（标记 🟢 T1）级别最高，代表今日 {today} 的实时数据**。
+网络研究信息（⚪ T4）有明确回源日期标注时必须保留该日期，若无日期则标注"根据网络研究信息"。
+**当程序采集数据存在时，禁止用网络研究信息覆盖或替代它**。
+多个来源对同一指标有矛盾时，以更新日期为准，日期同以 🟢 T1 为准。
+**业绩快报/定期报告等公告原文的数字用「根据公司公告」，禁止搞错来源等级。**"""
+
+
+
+    def _build_etf_queries(self, etf_name: str, stock_code: str) -> List[str]:
+        """ETF 模式的搜索 query，聚焦 ETF 自身指标而非个股经营数据。"""
+        today = date.today()
+        one_month = f"{today.year}年{today.month}月"
+        three_months = f"{(today - timedelta(days=90)).strftime('%Y-%m')} {today.strftime('%Y-%m')}"
+        tag = etf_name if etf_name and etf_name != stock_code else f"ETF {stock_code}"
+
+        return [
+            # ETF 自身净值与份额
+            f"{tag} 基金规模 净值 IOPV 折溢价 成交额 {one_month}",
+            f"{tag} 份额变化 资金流向 净申购 净赎回 {one_month}",
+            # 跟踪标的指数
+            f"{tag} 跟踪指数 标的指数 走势 行情 {three_months}",
+            f"{tag} 估值 PE PB 历史分位 指数估值 {one_month}",
+            # 重仓股与板块
+            f"{tag} 前十大重仓股 权重 调仓 {today.year}",
+            f"{tag} 重仓股 业绩 财报 利好 利空 {one_month}",
+            # 行业/主题
+            f"{tag} 所属行业 景气度 政策 板块轮动 {three_months}",
+            # 资金面
+            f"{tag} 主力资金 净流入 北向资金 机构持仓 {one_month}",
+        ]
 
     def _analyze_etf(self, state: AgentState) -> Dict[str, Any]:
         """ETF 分析：行情数据 + 前 5 大重仓股穿透分析"""
@@ -931,14 +1076,16 @@ class ResearcherAgent:
 
         # ---- 1. ETF 行情与基本信息 ----
         from tools.etf_tools import (
-            fetch_etf_spot, fetch_etf_holdings, fetch_etf_industry_allocation, format_etf_report)
+            fetch_etf_spot, fetch_etf_holdings, fetch_etf_industry_allocation,
+            format_etf_report, calculate_etf_valuation)
 
         spot = fetch_etf_spot(stock_code)
         etf_name = spot.get("名称", stock_code) if spot else stock_code
 
         holdings = fetch_etf_holdings(stock_code, year=str(date.today().year))
         industry = fetch_etf_industry_allocation(stock_code, year=str(date.today().year))
-        etf_data_block = format_etf_report(spot, holdings, industry)
+        valuation_text = calculate_etf_valuation(holdings)  # 成分股加权 PE/PB
+        etf_data_block = format_etf_report(spot, holdings, industry, valuation_text)
         logger.info(f"[ETF] 数据获取完成: spot={'Y' if spot else 'N'}, "
                     f"holdings={len(holdings)}, industry={len(industry)}")
 
@@ -977,8 +1124,8 @@ class ResearcherAgent:
 
         holdings_block = "\n\n".join(holding_reports) if holding_reports else "（无持仓数据）"
 
-        # ---- 3. 额外搜索补充 ----
-        extra_queries = self._build_stock_queries(stock_code)
+        # ---- 3. 额外搜索补充（ETF 专用 query，不搜个股经营指标） ----
+        extra_queries = self._build_etf_queries(etf_name, stock_code)
         extra_results = self._do_search(extra_queries)
         extra_text = self._search_text(extra_results)
 
@@ -1001,7 +1148,12 @@ ETF 名称：{etf_name}
 
 ========== 全网搜索结果（⚪ T4 补充） ==========
 {extra_text[:8000]}
-请基于以上数据对该 ETF 进行全面多维度的分析报告。"""),
+
+【指令】
+1. 🟢 T1 程序采集数据代表今日实时数据，必须作为报告核心依据
+2. ⚪ T4 网络信息仅作补充，有日期标注的保留日期，无日期的标"根据网络研究信息"
+3. T1 数据不足的维度（如份额趋势），再引用 T4 补充并标注"根据网络研究信息"
+4. **当 T1 和 T4 对同一指标有数据时，以 T1 为准，禁止用 T4 替换 T1**"""),
         ]
 
         logger.info("ETF LLM 综合分析中...")
@@ -1077,14 +1229,185 @@ ETF 名称：{etf_name}
                 structured_blocks.append(social_text)
         except Exception as e:
             logger.debug(f"社交媒体信息获取跳过（不影响主流程）: {e}")
+        # 增量财经信息源（雪球/新浪财经/华尔街见闻/证券时报），补充专业财经视角
+        try:
+            from tools.financial_sources import fetch_financial_sources_text
+            fin_text = fetch_financial_sources_text(stock_code, company_name)
+            if fin_text:
+                structured_blocks.append(fin_text)
+        except Exception as e:
+            logger.debug(f"财经信息源获取跳过（不影响主流程）: {e}")
         structured_text = "\n\n".join(structured_blocks) if structured_blocks else "（结构化信源暂无数据）"
 
-        # ---- 网页搜索（补充） ----
-        queries = self._build_stock_queries(stock_code)
-        all_results = self._do_search(queries)
-        search_text = self._search_text(all_results)
+        # ---- 并行采集：网页搜索 + 程序数据拉取（互不依赖，同时进行） ----
+        from concurrent.futures import ThreadPoolExecutor
+        collected = {}
+        def _run_search():
+            queries = self._build_stock_queries(stock_code)
+            return self._search_text(self._do_search(queries))
+        def _run_industry():
+            try:
+                from tools.data_router import fetch_industry_data
+                r = fetch_industry_data(stock_code, company_name)
+                if r.get("has_data"):
+                    return (f"========== 行业专用数据源（{r.get('std_industry','')}）"
+                            f" ==========\n{r.get('data_text','')}")
+            except Exception as e:
+                logger.debug(f"行业数据路由未命中: {e}")
+            return ""
+        def _run_capital():
+            try:
+                from tools.stock_capital_fetcher import fetch_all_capital_data
+                raw = fetch_all_capital_data([stock_code])
+                if raw:
+                    return ("========== 资金筹码数据（程序拉取，含北向/两融/股东户数/机构持仓/解禁）"
+                            f" ==========\n{raw[:6000]}")
+            except Exception as e:
+                logger.warning(f"资金筹码拉取失败: {e}")
+            return ""
+        def _run_peer():
+            try:
+                from tools.peer_comparison import fetch_peer_comparison
+                raw = fetch_peer_comparison(stock_code)
+                if raw:
+                    return ("========== 同业横向对标（程序根据东财板块成分股计算）"
+                            f" ==========\n{raw[:5000]}")
+            except Exception as e:
+                logger.warning(f"同业对标拉取失败: {e}")
+            return ""
+        def _run_sensitivity_sotp():
+            try:
+                from tools.stock_tools import call_fetch_fina_indicator
+                raw_fina = call_fetch_fina_indicator(stock_code)
+                import re
+                np_match = re.search(r'(?:归母净利润|净利润)[：:]\s*([\d.]+)\s*亿', str(raw_fina))
+                base_profit = float(np_match.group(1)) if np_match else None
+                from tools.main_business import fetch_main_business_text
+                mb_text = fetch_main_business_text(stock_code)
+                segments = []
+                if mb_text and base_profit:
+                    lines = [l.strip() for l in mb_text.split('\n') if l.strip()]
+                    seg_lines = [l for l in lines if any(k in l for k in ('收入', '占比', '%', '业务', '产品'))][:5]
+                    if seg_lines:
+                        n = len(seg_lines)
+                        for sl in seg_lines:
+                            segments.append({"name": sl[:20], "profit": round(base_profit / n, 2),
+                                             "pe_assumed": 15, "weight": round(1.0 / n, 2)})
+                    else:
+                        segments.append({"name": "主营业务", "profit": base_profit, "pe_assumed": 15, "weight": 1.0})
+                blocks = []
+                if base_profit and base_profit > 0:
+                    from tools.sensitivity_analysis import build_sensitivity_table
+                    # 百分比变动敏感性
+                    sens_vars = [
+                        {"name": "营收增速变动", "impact": round(base_profit * 0.3, 2),
+                         "unit": "亿元/±1%增速", "range": [-20, -10, 0, 10, 20]},
+                        {"name": "毛利率变动", "impact": round(base_profit * 0.15, 2),
+                         "unit": "亿元/±1%毛利率", "range": [-5, -2, 0, 2, 5]},
+                    ]
+                    sens = build_sensitivity_table(base_profit, sens_vars)
+                    if sens:
+                        blocks.append(f"========== 敏感性分析（百分比弹性） ==========\n{sens}")
+                    # 核心情景敏感性：针对整车/新能源标的的专项变量
+                    # 各变量的 impact（每单位变动对净利润影响）和 range（变动幅度%）根据行业典型值设定
+                    car_sens_vars = [
+                        {"name": "欧盟反补贴关税", "impact": round(base_profit * 0.1, 2),
+                         "unit": "亿元/±10%关税强度", "range": [-40, -20, 0, 20, 40]},
+                        {"name": "锂/原材料价格", "impact": round(base_profit * 0.05, 2),
+                         "unit": "亿元/±10%原材料价格", "range": [-30, -15, 0, 15, 30]},
+                        {"name": "整车毛利率(1pct)", "impact": round(base_profit * 0.12, 2),
+                         "unit": "亿元/±1pct毛利率", "range": [-3, -1, 0, 1, 3]},
+                        {"name": "海外月销(万辆)", "impact": round(base_profit * 0.15, 2),
+                         "unit": "亿元/±1万辆月销", "range": [-10, -5, 0, 5, 10]},
+                    ]
+                    car_sens = build_sensitivity_table(base_profit, car_sens_vars)
+                    if car_sens:
+                        blocks.append(f"========== 核心情景敏感性（关税/原材料/毛利率/海外月销）==========\n"
+                                      f"{car_sens}\n"
+                                      f"**说明**：关税每±10%强度±{round(base_profit*0.1,2)}亿；"
+                                      f"毛利率±1pct±{round(base_profit*0.12,2)}亿；"
+                                      f"海外月销±1万辆±{round(base_profit*0.15,2)}亿")
+                if segments:
+                    from tools.sotp_valuation import build_sotp_valuation
+                    import akshare as ak
+                    try:
+                        spot = ak.stock_zh_a_spot_em()
+                        sr = spot[spot["代码"].astype(str).str.strip() == stock_code]
+                        total_mv = float(sr.iloc[-1].get("总市值", 0)) / 1e8 if not sr.empty else 500.0
+                    except Exception:
+                        total_mv = 500.0
+                    sotp = build_sotp_valuation(segments, total_mv)
+                    if sotp:
+                        blocks.append(f"========== SOTP 分部估值（程序按主营构成+财报数据推算） ==========\n{sotp}")
+                return "\n\n".join(blocks) if blocks else ""
+            except Exception as e:
+                logger.warning(f"敏感性/SOTP推算失败: {e}")
+                return ""
+        def _run_nine_turn():
+            try:
+                from tools.magic_nine_turn import fetch_magic_nine_turn
+                raw = fetch_magic_nine_turn(stock_code, months=6)
+                if raw:
+                    return ("========== 神奇九转（TD Sequential，程序根据K线自动计算）"
+                            f" ==========\n{raw[:4000]}")
+            except Exception as e:
+                logger.warning(f"神奇九转获取失败: {e}")
+            return ""
+        def _run_extra_stock():
+            try:
+                from tools.stock_tools import (
+                    call_fetch_forecast, call_fetch_express,
+                    call_fetch_dividend, call_fetch_report_rc,
+                    call_fetch_holder_trade, call_fetch_moneyflow,
+                    call_fetch_pledge, call_fetch_block_trade,
+                    call_fetch_repurchase,
+                )
+                parts = []
+                for name, func in [
+                    ("业绩预告", call_fetch_forecast), ("业绩快报", call_fetch_express),
+                    ("分红送股", call_fetch_dividend), ("卖方盈利预测", call_fetch_report_rc),
+                    ("股东增减持", call_fetch_holder_trade), ("个股资金流向", call_fetch_moneyflow),
+                    ("股权质押", call_fetch_pledge), ("大宗交易", call_fetch_block_trade),
+                    ("股票回购", call_fetch_repurchase),
+                ]:
+                    try:
+                        t = func(stock_code)
+                        if t and t.strip(): parts.append(f"【{name}】\n{t.strip()[:2000]}")
+                    except Exception:
+                        pass
+                if parts:
+                    return "========== 补充个股基本面数据（程序拉取） ==========\n" + "\n\n".join(parts)
+            except Exception as e:
+                logger.warning(f"补充个股数据拉取失败: {e}")
+            return ""
 
-        # ---- 结构化数据提取（从搜索结果中提取销量/出货量等时序数字） ----
+        with ThreadPoolExecutor(max_workers=8) as _exe:
+            _futs = {
+                _exe.submit(_run_search): 'search',
+                _exe.submit(_run_industry): 'industry',
+                _exe.submit(_run_capital): 'capital',
+                _exe.submit(_run_peer): 'peer',
+                _exe.submit(_run_sensitivity_sotp): 'sens_sotp',
+                _exe.submit(_run_nine_turn): 'nine_turn',
+                _exe.submit(_run_extra_stock): 'extra_stock',
+            }
+            for _future in as_completed(_futs):
+                _key = _futs[_future]
+                try:
+                    collected[_key] = _future.result()
+                except Exception as e:
+                    logger.warning(f"并行采集[{_key}]异常: {e}")
+                    collected[_key] = ""
+
+        search_text = collected.get('search', '')
+        industry_section = collected.get('industry', '')
+        capital_block = collected.get('capital', '')
+        peer_block = collected.get('peer', '')
+        sensitivity_sotp_block = collected.get('sens_sotp', '')
+        nine_turn_block = collected.get('nine_turn', '')
+        extra_stock_block = collected.get('extra_stock', '')
+
+        # ---- 结构化数据提取（依赖搜索结果，顺序执行） ----
         structured_data = self._extract_structured_data_from_search(search_text, company_name=company_name)
         structured_data_block = self._format_structured_data_block(structured_data)
         has_structured = bool(structured_data.get("time_series") or structured_data.get("key_figures"))
@@ -1093,19 +1416,6 @@ ETF 名称：{etf_name}
             logger.info(f"结构化数据提取成功，共 {len(structured_data.get('time_series',[]))} 条时序")
             structured_section = ("========== 程序提取的结构化数据（时序数据+关键数字）"
                                   " ==========\n" + structured_data_block)
-
-        # ---- 行业数据路由：有专用API则优先调用（如汽车→懂车帝销量） ----
-        industry_section = ""
-        try:
-            from tools.data_router import fetch_industry_data
-            router_result = fetch_industry_data(stock_code, company_name)
-            if router_result.get("has_data"):
-                industry_section = (f"========== 行业专用数据源（{router_result.get('std_industry','')}）"
-                                    f" ==========\n{router_result.get('data_text','')}")
-                logger.info(f"✅ 行业数据路由命中: [{stock_code}] → "
-                            f"{router_result.get('std_industry')} → {router_result.get('source')}")
-        except Exception as e:
-            logger.debug(f"行业数据路由未命中（不影响主流程）: {e}")
 
         messages = [
             SystemMessage(content=self._build_stock_system_prompt()),
@@ -1124,6 +1434,16 @@ ETF 名称：{etf_name}
 {structured_section}
 
 {industry_section}
+
+{capital_block}
+
+{peer_block}
+
+{sensitivity_sotp_block}
+
+{nine_turn_block}
+
+{extra_stock_block}
 
 ========== 全网搜索结果（补充信息，T4） ==========
 {search_text[:10000]}
@@ -1336,6 +1656,18 @@ ETF 名称：{etf_name}
         except Exception as e:
             logger.warning(f"候选标的关键数据拉取失败（不影响分析）: {e}")
 
+        # 资金筹码数据（程序拉取北向/两融/股东户数/机构持仓/解禁）
+        capital_block = ""
+        try:
+            from tools.stock_capital_fetcher import fetch_all_capital_data
+            codes_str = sorted(all_leader_codes)[:10]
+            if codes_str:
+                capital_block_raw = fetch_all_capital_data(codes_str)
+                if capital_block_raw:
+                    capital_block = f"========== 候选公司资金筹码数据（程序拉取，含北向/两融/股东户数/机构持仓/解禁） ==========\n{capital_block_raw[:8000]}"
+        except Exception as e:
+            logger.warning(f"资金筹码数据拉取失败（不影响分析）: {e}")
+
         # 全景搜索（含不可替代性/溢价能力维度）
         all_queries = self._build_chain_queries(industry_name, chain)
         all_results = self._do_search(all_queries)
@@ -1365,6 +1697,8 @@ ETF 名称：{etf_name}
 
 ========== 候选公司关键财务数据快照（程序拉取，含利润表/财务指标/资产负债表/现金流/资本开支/健康度/股东户数/北向资金/筹码成本+同业估值对比） ==========
 {stock_snapshot_text[:10000] if stock_snapshot_text else '（未获取到个股级关键数据）'}
+
+{capital_block if capital_block else ''}
 
 ========== 全网搜索结果（含经营/竞争力/业务拆解/收入毛利占比/出货量/资本开支/新增订单/技术突破/护城河） ==========
 {search_text[:15000]}

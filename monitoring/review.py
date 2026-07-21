@@ -479,10 +479,44 @@ class ReviewRunner:
 【输出模板】
 判断结果：一句话（引用程序判定）
 理由核验：当时的核心理由逐条标注 兑现✅/未兑现❌/无新信息⏸
-教训：一两句（没有就写"无明显误判"；区分误判与新信息）{feedback_template_line}"""
+教训：一两句（没有就写"无明显误判"；区分误判与新信息）{feedback_template_line}
+
+【结构化误判分析（只输出JSON，不要markdown包裹）】
+{{"error_pattern": "误判主要类别", "improvement_rule": "具体的改进规则"}}
+
+误判类别选项（选最匹配的1项）：
+- 技术面权重失衡：多周期信号权重分配失当（如日线死叉权重过高/周月线金叉被低估）
+- 基本面利空高估：过度押注基本面利空但股价未跌（利空已被定价/资金面对冲）
+- 基本面利好高估：过度押注基本面利好但股价未涨（利好已被定价/技术面压制）
+- 资金面驱动低估：低估了短期资金/情绪/题材驱动的力量
+- 技术面信号误读：误读技术指标含义（如将底部磨盘空头当作下跌中段空头）
+- 信息时效性误判：使用了已过时信息/低估了新信息的影响
+- 无明显误判：事后新信息导致走势偏离，当时推理合理
+- 其他：上述都不匹配则选此项
+
+improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉在周月线金叉+基本面强劲时权重降一档"
+如果 error_pattern 为"无明显误判"，improvement_rule 给空字符串""。"""
 
             response = self._get_llm().invoke(prompt)
             content = response.content if hasattr(response, "content") else str(response)
+
+            # 解析结构化误判分析
+            error_pattern = "其他"
+            improvement_rule = ""
+            import json as _json
+            import re as _re
+            try:
+                json_match = _re.search(r'\{.*"error_pattern".*\}', content, _re.DOTALL)
+                if json_match:
+                    error_data = _json.loads(json_match.group(0))
+                    ep = error_data.get("error_pattern", "").strip()
+                    if ep in ("技术面权重失衡", "基本面利空高估", "基本面利好高估",
+                              "资金面驱动低估", "技术面信号误读", "信息时效性误判",
+                              "无明显误判", "其他"):
+                        error_pattern = ep
+                    improvement_rule = str(error_data.get("improvement_rule", "")).strip()[:200]
+            except (ValueError, TypeError, _json.JSONDecodeError):
+                pass
 
             header = (f"📋 复盘 | {snap.get('name') or code}({code})\n"
                       f"{snap_date} 分析（当时 {price_then}）→ {days_elapsed} 天后 {price_now}"
@@ -493,11 +527,42 @@ class ReviewRunner:
                 snapshot_id=snap["id"], code=code, days_elapsed=days_elapsed,
                 price_now=price_now, pct_change=pct_change,
                 direction_verdict=verdict, review_content=card,
+                error_pattern=error_pattern,
             )
+
+            # 如果误判非"无明显误判"且有改进规则，保存为可复用规则
+            if error_pattern not in ("无明显误判", "") and improvement_rule:
+                try:
+                    existing = self.db.get_rule_by_snapshot(snap["id"])
+                    if not existing:
+                        self.db.save_improvement_rule(
+                            rule_text=improvement_rule,
+                            error_pattern=error_pattern,
+                            source_snapshot_id=snap["id"],
+                            code=code,
+                            source_stock_name=snap.get("name") or code,
+                            is_active=1,
+                            hit_count=0,
+                        )
+                        logger.info(f"[复盘] {code} 提炼改进规则：「{improvement_rule}」")
+                except Exception as e:
+                    logger.warning(f"[复盘] {code} 改进规则保存失败: {e}")
+
             self.db.mark_snapshot_reviewed(snap["id"])
+
+            # 自动调权：如果误判类别对应可调整的权重，自动写入 config
+            if error_pattern not in ("无明显误判", "", "其他"):
+                try:
+                    from tools.weight_adjuster import apply_review_adjustment
+                    source = f"{snap.get('name') or code}({code})"
+                    adjust_ok = apply_review_adjustment(error_pattern, source_info=source)
+                    if adjust_ok:
+                        logger.info(f"[复盘] {code} 自动调权完成（{error_pattern}）")
+                except Exception as e:
+                    logger.warning(f"[复盘] {code} 自动调权失败: {e}")
             if push and self.notifier:
                 self.notifier.send(card)
-            logger.info(f"[复盘] {code} 完成：{verdict}（{pct_change}%）")
+            logger.info(f"[复盘] {code} 完成：{verdict}（{pct_change}%），误判类别：{error_pattern}")
             return card
         except Exception as e:
             logger.error(f"[复盘] {code} 复盘失败: {e}\n{traceback.format_exc()}")
@@ -579,6 +644,14 @@ class ReviewRunner:
 
         if not due and not due_ind:
             logger.info("[复盘] 无到期快照")
+            # 即使无复盘，也推送宏观数据快照
+            if self.notifier:
+                try:
+                    from .macro_watcher import fetch_macro_snapshot
+                    macro_text = fetch_macro_snapshot(session="post")
+                    self.notifier.send(f"🏛 **大盘宏观数据快照**\n\n{macro_text[:6000]}")
+                except Exception as e:
+                    logger.debug(f"[复盘] 宏观数据快照跳过: {e}")
             return 0
 
         # 附上系统成绩单
@@ -598,6 +671,15 @@ class ReviewRunner:
                 self.notifier.send(
                     f"📈 产业链选股成绩单：近 {track['total']} 次复盘，组合跑赢基准 {track['outperform']} 次，"
                     f"排名区分度有效 {track['rank_effective']} 次")
+        # 附加当日宏观数据快照（复盘后紧跟大盘环境）
+        if self.notifier:
+            try:
+                from .macro_watcher import fetch_macro_snapshot
+                macro_text = fetch_macro_snapshot(session="post")
+                self.notifier.send(f"🏛 **大盘宏观数据快照**\n\n{macro_text[:6000]}")
+                logger.info("[复盘] 宏观数据快照推送完成")
+            except Exception as e:
+                logger.debug(f"[复盘] 宏观数据快照跳过: {e}")
         return done
 
     # ================== 产业链复盘 ==================

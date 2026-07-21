@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional, Tuple, Union
 from datetime import datetime, date, timezone, timedelta
 import numpy as np
-
+import json
 
 
 class StockTools:
@@ -484,6 +484,392 @@ class StockTools:
             return normalized_df
         except Exception as e:
             logger.error(f"获取股票[{stock_code}]利润表数据失败: {e} {traceback.format_exc()}")
+            return None
+
+    def fetch_and_save_stock_dividend(self, stock_code: str) -> Union[pd.DataFrame, None]:
+        """获取并保存分红送股数据（DB缓存：按code+end_date去重）"""
+        if stock_code is None:
+            logger.error("股票代码为空")
+            return None
+        try:
+            old = self.db.get_stock_dividend(stock_code, 1)
+            if old is not None and not old.empty:
+                logger.info(f"分红送股[{stock_code}]缓存已存在，直接返回")
+                return old
+            df = self.tushare.dividend(stock_code)
+            if df is None or df.empty:
+                logger.error(f"获取股票[{stock_code}]分红送股数据为空")
+                return None
+            save_count = self.db.save_stock_dividend(df, stock_code)
+            logger.info(f"保存股票[{stock_code}]分红送股数据成功，新增[{save_count}]条记录")
+            return self.db.get_stock_dividend(stock_code)
+        except Exception as e:
+            logger.error(f"获取股票[{stock_code}]分红送股数据失败: {e} {traceback.format_exc()}")
+            return None
+
+    def fetch_and_save_stock_pledge_detail(self, stock_code: str) -> Union[pd.DataFrame, None]:
+        """获取并保存股权质押明细数据（DB缓存）"""
+        if stock_code is None:
+            logger.error("股票代码为空")
+            return None
+        try:
+            old = self.db.get_stock_pledge_detail(stock_code, 1)
+            if old is not None and not old.empty:
+                logger.info(f"股权质押明细[{stock_code}]缓存已存在，直接返回")
+                return old
+            df = self.tushare.pledge_detail(stock_code)
+            if df is None or df.empty:
+                logger.error(f"获取股票[{stock_code}]股权质押明细数据为空")
+                return None
+            save_count = self.db.save_stock_pledge_detail(df, stock_code)
+            logger.info(f"保存股票[{stock_code}]股权质押明细成功，新增[{save_count}]条记录")
+            return self.db.get_stock_pledge_detail(stock_code)
+        except Exception as e:
+            logger.error(f"获取股票[{stock_code}]股权质押明细失败: {e} {traceback.format_exc()}")
+            return None
+
+    def fetch_and_save_stock_holder_trade(self, stock_code: str) -> Union[pd.DataFrame, None]:
+        """获取并保存股东增减持数据（DB缓存）"""
+        if stock_code is None:
+            logger.error("股票代码为空")
+            return None
+        try:
+            old = self.db.get_stock_holder_trade(stock_code, 1)
+            if old is not None and not old.empty:
+                logger.info(f"股东增减持[{stock_code}]缓存已存在，直接返回")
+                return old
+            today = date.today()
+            start_date = f"{today.year - 2}-01-01"
+            end_date_str = today.strftime("%Y-%m-%d")
+            df = self.tushare.stk_holdertrade(stock_code, ann_date=end_date_str, start_date=start_date, end_date=end_date_str)
+            if df is None or df.empty:
+                logger.error(f"获取股票[{stock_code}]股东增减持数据为空")
+                return None
+            save_count = self.db.save_stock_holder_trade(df, stock_code)
+            logger.info(f"保存股票[{stock_code}]股东增减持成功，新增[{save_count}]条记录")
+            return self.db.get_stock_holder_trade(stock_code)
+        except Exception as e:
+            logger.error(f"获取股票[{stock_code}]股东增减持数据失败: {e} {traceback.format_exc()}")
+            return None
+
+    def fetch_and_save_stock_margin(self, stock_code: str) -> Union[pd.DataFrame, None]:
+        """获取并保存融资融券汇总数据（DB缓存）"""
+        if stock_code is None:
+            logger.error("股票代码为空")
+            return None
+        try:
+            old = self.db.get_stock_margin(stock_code, 1)
+            if old is not None and not old.empty:
+                logger.info(f"融资融券汇总[{stock_code}]缓存已存在，直接返回")
+                return old
+            today = date.today()
+            start = f"{today.year - 1}-01-01"
+            end = today.strftime("%Y-%m-%d")
+            df = self.tushare.margin(stock_code, trade_date='', start_date=start, end_date=end, exchange_id='')
+            if df is None or df.empty:
+                logger.error(f"获取股票[{stock_code}]融资融券汇总数据为空")
+                return None
+            save_count = self.db.save_stock_margin(df, stock_code)
+            logger.info(f"保存股票[{stock_code}]融资融券汇总成功，新增[{save_count}]条记录")
+            return self.db.get_stock_margin(stock_code)
+        except Exception as e:
+            logger.error(f"获取股票[{stock_code}]融资融券汇总数据失败: {e} {traceback.format_exc()}")
+            return None
+
+    def fetch_and_save_stock_margin_detail(self, stock_code: str) -> Union[pd.DataFrame, None]:
+        """获取并保存融资融券明细数据（DB缓存）"""
+        if stock_code is None:
+            logger.error("股票代码为空")
+            return None
+        try:
+            old = self.db.get_stock_margin_detail(stock_code, 1)
+            if old is not None and not old.empty:
+                logger.info(f"融资融券明细[{stock_code}]缓存已存在，直接返回")
+                return old
+            today = date.today()
+            start = f"{today.year - 1}-01-01"
+            end = today.strftime("%Y-%m-%d")
+            df = self.tushare.margin_detail(stock_code, trade_date='', start_date=start, end_date=end)
+            if df is None or df.empty:
+                logger.error(f"获取股票[{stock_code}]融资融券明细数据为空")
+                return None
+            save_count = self.db.save_stock_margin_detail(df, stock_code)
+            logger.info(f"保存股票[{stock_code}]融资融券明细成功，新增[{save_count}]条记录")
+            return self.db.get_stock_margin_detail(stock_code)
+        except Exception as e:
+            logger.error(f"获取股票[{stock_code}]融资融券明细数据失败: {e} {traceback.format_exc()}")
+            return None
+
+    def fetch_and_save_stock_moneyflow(self, stock_code: str) -> Union[pd.DataFrame, None]:
+        """获取并保存个股资金流向数据（DB缓存）"""
+        if stock_code is None:
+            logger.error("股票代码为空")
+            return None
+        try:
+            old = self.db.get_stock_moneyflow(stock_code, 1)
+            if old is not None and not old.empty:
+                logger.info(f"个股资金流向[{stock_code}]缓存已存在，直接返回")
+                return old
+            today = date.today()
+            start = f"{today.year - 1}-01-01"
+            end = today.strftime("%Y-%m-%d")
+            df = self.tushare.moneyflow(stock_code, trade_date='', start_date=start, end_date=end)
+            if df is None or df.empty:
+                logger.error(f"获取股票[{stock_code}]个股资金流向数据为空")
+                return None
+            save_count = self.db.save_stock_moneyflow(df, stock_code)
+            logger.info(f"保存股票[{stock_code}]个股资金流向成功，新增[{save_count}]条记录")
+            return self.db.get_stock_moneyflow(stock_code)
+        except Exception as e:
+            logger.error(f"获取股票[{stock_code}]个股资金流向数据失败: {e} {traceback.format_exc()}")
+            return None
+
+    def fetch_and_save_stock_hsgt_moneyflow(self) -> Union[pd.DataFrame, None]:
+        """获取并保存沪深港通资金流向数据（DB缓存）"""
+        try:
+            old = self.db.get_stock_hsgt_moneyflow(1)
+            if old is not None and not old.empty:
+                logger.info(f"沪深港通资金流向缓存已存在，直接返回")
+                return old
+            today = date.today()
+            start = f"{today.year - 1}-01-01"
+            end = today.strftime("%Y-%m-%d")
+            df = self.tushare.moneyflow_hsgt(trade_date='', start_date=start, end_date=end)
+            if df is None or df.empty:
+                logger.error(f"获取沪深港通资金流向数据为空")
+                return None
+            save_count = self.db.save_stock_hsgt_moneyflow(df)
+            logger.info(f"保存沪深港通资金流向成功，新增[{save_count}]条记录")
+            return self.db.get_stock_hsgt_moneyflow()
+        except Exception as e:
+            logger.error(f"获取沪深港通资金流向数据失败: {e} {traceback.format_exc()}")
+            return None
+
+    def fetch_and_save_stock_macro(self, indicator_name: str) -> Union[pd.DataFrame, None]:
+        """
+        拉取宏观数据并缓存到DB。
+        支持: cn_gdp, cn_cpi, cn_ppi, cn_m, sf_month, us_tycr, us_trycr, us_tbr, us_tltr, us_trltr
+        缓存策略按指标频率判定是否刷新：
+          - 日频（资金流向/利率/美债）：最新数据日期 < 今天 → 尝试 API 刷新
+          - 月频（CPI/PPI/M2/社融）：最新数据月份滞后 ≥ 2 个月 → 尝试 API 刷新
+          - 季频（GDP）：最新数据季度滞后 ≥ 2 个季度 → 尝试 API 刷新
+        API 刷新失败时回退使用缓存数据。
+        """
+        macro_apis = {
+            'cn_gdp': self.tushare.cn_gdp,
+            'cn_cpi': self.tushare.cn_cpi,
+            'cn_ppi': self.tushare.cn_ppi,
+            'cn_m': self.tushare.cn_m,
+            'sf_month': self.tushare.sf_month,
+            'us_tycr': self.tushare.us_tycr,
+            'us_trycr': self.tushare.us_trycr,
+            'us_tbr': self.tushare.us_tbr,
+            'us_tltr': self.tushare.us_tltr,
+            'us_trltr': self.tushare.us_trltr,
+        }
+        # 按指标频率设定最大可接受滞后
+        freq = self._macro_freshness.get(indicator_name, "daily")
+
+        # 检查缓存是否够新鲜
+        latest = self.db.get_latest_stock_macro_end_date(indicator_name)
+        stale = False
+        if latest is not None:
+            try:
+                if freq == "daily":
+                    # 日频数据：最新日期必须 ≥ 昨天
+                    from datetime import timedelta
+                    cutoff = date.today() - timedelta(days=2)
+                    # 容差 2 天（周末/节假日无数据）
+                    if latest < cutoff:
+                        stale = True
+                        logger.info(f"宏观数据[{indicator_name}]最新为{latest}，已过期，尝试刷新")
+                elif freq == "monthly":
+                    # 月频：最新月份距今 ≤ 2 个月（考虑发布滞后 ~10天）
+                    from dateutil.relativedelta import relativedelta
+                    if latest < date.today() - relativedelta(months=2):
+                        stale = True
+                        logger.info(f"宏观数据[{indicator_name}]最新为{latest}，已过期，尝试刷新")
+                elif freq == "quarterly":
+                    from dateutil.relativedelta import relativedelta
+                    if latest < date.today() - relativedelta(months=8):
+                        # 季度数据滞后约 1 个月，8 个月 = 2 季度 + 安全边界
+                        stale = True
+                        logger.info(f"宏观数据[{indicator_name}]最新为{latest}，已过期，尝试刷新")
+            except Exception:
+                stale = False  # 解析失败当不陈旧处理
+
+        if not stale:
+            has = self.db.has_stock_macro_indicator(indicator_name)
+            if has:
+                logger.info(f"宏观数据[{indicator_name}]缓存有效，直接返回")
+                return self._read_macro_from_db(indicator_name)
+
+        # 尝试 API 刷新
+        api_fn = macro_apis.get(indicator_name)
+        if api_fn is None:
+            logger.warning(f"未知宏观指标: {indicator_name}")
+            return None
+        try:
+            df = api_fn()
+            if df is not None and not df.empty:
+                self.db.save_stock_macro_indicator(indicator_name, df)
+                logger.info(f"宏观数据[{indicator_name}] API 拉取成功并缓存")
+                return df
+        except Exception as e:
+            logger.warning(f"宏观数据[{indicator_name}] API 刷新失败: {e}")
+
+        # API 失败 → 回退缓存
+        logger.info(f"宏观数据[{indicator_name}] 回退使用缓存")
+        return self._read_macro_from_db(indicator_name)
+
+    _macro_freshness = {
+        # 日频
+        "moneyflow_mkt_dc": "daily",
+        "moneyflow_hsgt": "daily",
+        "margin": "daily",
+        "shibor": "daily",
+        "shibor_lpr": "daily",
+        "us_tycr": "daily",
+        "us_trycr": "daily",
+        "us_tbr": "daily",
+        "us_tltr": "daily",
+        "us_trltr": "daily",
+        # 月频
+        "cn_cpi": "monthly",
+        "cn_ppi": "monthly",
+        "cn_m": "monthly",
+        "sf_month": "monthly",
+        # 季频
+        "cn_gdp": "quarterly",
+    }
+
+    def _read_macro_from_db(self, indicator_name: str) -> Union[pd.DataFrame, None]:
+        """从 DB 读取宏观缓存数据"""
+        try:
+            data = self.db.get_stock_macro_indicator(indicator_name, limit=40)
+            if data:
+                import pandas as _pd
+                rows = [{**d, **json.loads(d.get('value_json','{}'))} for d in data]
+                return _pd.DataFrame(rows)
+            return None
+        except Exception as e:
+            logger.debug(f"宏观数据[{indicator_name}] 读缓存失败: {e}")
+            return None
+
+    def fetch_fund_adj(self, ts_code: str) -> Union[pd.DataFrame, None]:
+        """基金复权因子（缓存1天）"""
+        try:
+            df = self.db.get_stock_fund_adj(ts_code, limit=10)
+            if df is not None and not df.empty:
+                return df
+            import tushare as ts
+            pro = ts.pro_api()
+            df = pro.fund_adj(ts_code=ts_code)
+            if df is None or df.empty:
+                return None
+            self.db.save_stock_fund_adj(df)
+            return self.db.get_stock_fund_adj(ts_code, limit=10)
+        except Exception as e:
+            logger.debug(f"基金复权因子[{ts_code}]获取失败: {e}")
+            return None
+
+    def fetch_margin_secs(self) -> Union[pd.DataFrame, None]:
+        """融资融券标的列表（含ETF，缓存1天）"""
+        try:
+            df = self.db.get_stock_margin_secs(limit=100)
+            if df is not None and not df.empty:
+                return df
+            import tushare as ts
+            pro = ts.pro_api()
+            df = pro.margin_secs()
+            if df is None or df.empty:
+                return None
+            self.db.save_stock_margin_secs(df)
+            return self.db.get_stock_margin_secs(limit=100)
+        except Exception as e:
+            logger.debug(f"融资融券标的获取失败: {e}")
+            return None
+
+    def fetch_and_save_stock_report_rc(self, stock_code: str) -> Union[pd.DataFrame, None]:
+        """获取并保存卖方盈利预测数据（缓存：同日不重复请求，隔日交易日尝试刷新）"""
+        if stock_code is None:
+            logger.error("股票代码为空")
+            return None
+        try:
+            old = self.db.get_stock_report_rc(stock_code, limit=5)
+            today = date.today()
+            if old is not None and not old.empty:
+                latest_date = old['report_date'].max()
+                if isinstance(latest_date, str):
+                    from datetime import datetime as _dt
+                    latest_date = _dt.strptime(str(latest_date)[:10], "%Y-%m-%d").date()
+                if latest_date == today:
+                    logger.info(f"卖方盈利预测[{stock_code}]今日数据已缓存，直接返回")
+                    return old
+                # 非交易日（周末）也跳过API，节省配额
+                if today.weekday() >= 5:
+                    logger.info(f"卖方盈利预测[{stock_code}]非交易日，使用缓存")
+                    return old
+                logger.info(f"卖方盈利预测[{stock_code}]缓存日期{latest_date}<今日，尝试刷新")
+            today = date.today()
+            start_date = f"{today.year - 1}-01-01"
+            end_date_str = today.strftime("%Y-%m-%d")
+            df = self.tushare.report_rc(stock_code, start_date=start_date, end_date=end_date_str)
+            if df is None or df.empty:
+                if old is not None and not old.empty:
+                    logger.warning(f"卖方盈利预测[{stock_code}]API获取为空（可能非交易日），使用本地缓存")
+                    return old
+                logger.error(f"获取股票[{stock_code}]卖方盈利预测数据为空")
+                return None
+            save_count = self.db.save_stock_report_rc(df, stock_code)
+            logger.info(f"保存股票[{stock_code}]卖方盈利预测成功，新增[{save_count}]条记录")
+            return self.db.get_stock_report_rc(stock_code)
+        except Exception as e:
+            logger.warning(f"卖方盈利预测[{stock_code}]获取失败，使用本地缓存: {e}")
+            if old is not None and not old.empty:
+                return old
+            return None
+
+    def fetch_and_save_stock_fina_audit(self, stock_code: str) -> Union[pd.DataFrame, None]:
+        """获取并保存财务审计意见数据（DB缓存：按code+end_date去重）"""
+        if stock_code is None:
+            logger.error("股票代码为空")
+            return None
+        try:
+            old = self.db.get_stock_fina_audit(stock_code, 1)
+            if old is not None and not old.empty:
+                logger.info(f"财务审计意见[{stock_code}]缓存已存在，直接返回")
+                return old
+            df = self.tushare.fina_audit(stock_code)
+            if df is None or df.empty:
+                logger.error(f"获取股票[{stock_code}]财务审计意见数据为空")
+                return None
+            save_count = self.db.save_stock_fina_audit(df, stock_code)
+            logger.info(f"保存股票[{stock_code}]财务审计意见数据成功，新增[{save_count}]条记录")
+            return self.db.get_stock_fina_audit(stock_code)
+        except Exception as e:
+            logger.error(f"获取股票[{stock_code}]财务审计意见数据失败: {e} {traceback.format_exc()}")
+            return None
+
+    def fetch_and_save_stock_disclosure_date(self, stock_code: str) -> Union[pd.DataFrame, None]:
+        """获取并保存财报披露计划日期数据（DB缓存：按code+end_date去重）"""
+        if stock_code is None:
+            logger.error("股票代码为空")
+            return None
+        try:
+            old = self.db.get_stock_disclosure_date(stock_code, 1)
+            if old is not None and not old.empty:
+                logger.info(f"财报披露计划日期[{stock_code}]缓存已存在，直接返回")
+                return old
+            df = self.tushare.disclosure_date(stock_code)
+            if df is None or df.empty:
+                logger.error(f"获取股票[{stock_code}]财报披露计划日期数据为空")
+                return None
+            save_count = self.db.save_stock_disclosure_date(df, stock_code)
+            logger.info(f"保存股票[{stock_code}]财报披露计划日期数据成功，新增[{save_count}]条记录")
+            return self.db.get_stock_disclosure_date(stock_code)
+        except Exception as e:
+            logger.error(f"获取股票[{stock_code}]财报披露计划日期数据失败: {e} {traceback.format_exc()}")
             return None
 
     def fetch_and_save_stock_balance_sheet(self, stock_code: str) -> Union[pd.DataFrame, None]:
@@ -1794,20 +2180,55 @@ def _get_hs300_close() -> Optional[pd.Series]:
     today_d = date.today()
     if _HS300_CACHE["date"] == today_d and _HS300_CACHE["series"] is not None:
         return _HS300_CACHE["series"]
+
+    # 先试 Tushare（速度更快、稳定性更高），失败再试 akshare
+    for attempt, (source, label) in enumerate([
+        (lambda: _fetch_hs300_tushare(today_d), "Tushare"),
+        (lambda: _fetch_hs300_akshare(today_d), "akshare"),
+    ]):
+        try:
+            s = source()
+            if s is not None and len(s) > 10:
+                _HS300_CACHE.update(date=today_d, series=s)
+                return s
+        except Exception as e:
+            logger.warning(f"获取沪深300指数({label})失败: {e}")
+    logger.warning("获取沪深300指数失败，跳过相对强弱计算")
+    return None
+
+
+def _fetch_hs300_akshare(today_d: date) -> Optional[pd.Series]:
+    """通过 akshare 获取沪深300日线"""
+    import akshare as ak
+    start = (today_d - timedelta(days=180)).strftime("%Y%m%d")
+    idx = ak.index_zh_a_hist(symbol="000300", period="daily",
+                             start_date=start, end_date=today_d.strftime("%Y%m%d"))
+    s = pd.Series(
+        [float(v) for v in idx["收盘"].values],
+        index=[parse_row_date(v) for v in idx["日期"].values],
+    ).sort_index()
+    return s
+
+
+def _fetch_hs300_tushare(today_d: date) -> Optional[pd.Series]:
+    """通过 Tushare 获取沪深300日线（作为 akshare 的兜底）"""
+    import tushare as ts
     try:
-        import akshare as ak
-        start = (today_d - timedelta(days=180)).strftime("%Y%m%d")
-        idx = ak.index_zh_a_hist(symbol="000300", period="daily",
-                                 start_date=start, end_date=today_d.strftime("%Y%m%d"))
-        s = pd.Series(
-            [float(v) for v in idx["收盘"].values],
-            index=[parse_row_date(v) for v in idx["日期"].values],
-        ).sort_index()
-        _HS300_CACHE.update(date=today_d, series=s)
-        return s
-    except Exception as e:
-        logger.warning(f"获取沪深300指数失败，跳过相对强弱计算: {e}")
+        pro = ts.pro_api()
+    except Exception:
         return None
+    start = (today_d - timedelta(days=180)).strftime("%Y%m%d")
+    df = pro.index_daily(ts_code="000300.SH",
+                         start_date=start,
+                         end_date=today_d.strftime("%Y%m%d"),
+                         fields="trade_date,close")
+    if df is None or df.empty:
+        return None
+    s = pd.Series(
+        [float(v) for v in df["close"].values],
+        index=df["trade_date"].apply(parse_row_date),
+    ).sort_index()
+    return s
 
 
 def _calc_rs_text(df: pd.DataFrame) -> str:
@@ -1904,6 +2325,12 @@ def _build_kline_summary(df: pd.DataFrame, stock_code: str, freq_label: str,
             v = row.get(col)
             if v and isinstance(v, str) and v.strip():
                 sig_parts.extend(v.strip().split())
+        # 背离信号（每列只有一个非空值：顶背离/底背离）
+        for diver_col in ("macd_divergence", "macd_bar_divergence", "obv_divergence"):
+            dv = row.get(diver_col)
+            if dv and isinstance(dv, str) and dv.strip():
+                label = {"macd_divergence": "MACD", "macd_bar_divergence": "柱状线", "obv_divergence": "OBV"}
+                sig_parts.append(f"{label[diver_col]}{dv}")
         if sig_parts:
             recent_signal_names.update(sig_parts)
             signal_lines.append(f"  {parse_row_date(row.get('date'))}: {'、'.join(sig_parts)}")
@@ -3061,6 +3488,198 @@ def _format_block_trade(df: pd.DataFrame, stock_code: str) -> str:
     return "\n".join(lines)
 
 
+def _format_pledge_detail(df: pd.DataFrame, stock_code: str) -> str:
+    """格式化股权质押明细数据"""
+    if df is None or df.empty:
+        return ""
+    lines = [f"【股权质押明细（来源：Tushare）】"]
+    for _, row in df.head(10).iterrows():
+        end_date = str(row.get('end_date', ''))[:10]
+        pledger = row.get('pledger', '')
+        amount = row.get('pledge_amount', '')
+        ratio = row.get('pledge_ratio', '')
+        total_ratio = row.get('pledge_total_ratio', '')
+        start = str(row.get('pledge_start_date', ''))[:10]
+        status = row.get('pledge_status', '')
+        items = [f"日期:{end_date}", f"出质人:{pledger}"]
+        if amount: items.append(f"质押数量:{amount}万股")
+        if ratio: items.append(f"占持股:{ratio}%")
+        if total_ratio: items.append(f"占总股本:{total_ratio}%")
+        if start: items.append(f"开始:{start}")
+        if status: items.append(f"状态:{status}")
+        lines.append("  " + " | ".join(items))
+    return "\n".join(lines)
+
+
+def _format_holder_trade(df: pd.DataFrame, stock_code: str) -> str:
+    """格式化股东增减持数据"""
+    if df is None or df.empty:
+        return ""
+    lines = [f"【股东增减持（来源：Tushare）】"]
+    for _, row in df.head(15).iterrows():
+        ann_date = str(row.get('ann_date', ''))[:10]
+        holder = row.get('holder_name', '')
+        trade_type = row.get('trade_type', '')
+        vol = row.get('trade_volume', '')
+        ratio = row.get('trade_ratio', '')
+        after = row.get('after_ratio', '')
+        price = row.get('avg_price', '')
+        type_label = "增持" if trade_type == "IN" else "减持" if trade_type == "DE" else str(trade_type)
+        items = [f"公告日:{ann_date}", f"股东:{holder}", f"方向:{type_label}"]
+        if vol: items.append(f"数量:{vol}万股")
+        if ratio: items.append(f"比例:{ratio}%")
+        if after: items.append(f"变动后:{after}%")
+        if price: items.append(f"均价:{price}元")
+        lines.append("  " + " | ".join(items))
+    return "\n".join(lines)
+
+
+def _format_report_rc(df: pd.DataFrame, stock_code: str) -> str:
+    """格式化卖方盈利预测数据"""
+    if df is None or df.empty:
+        return ""
+    lines = [f"【卖方盈利预测（来源：Tushare）】"]
+    # 按预测类型分组展示
+    from collections import defaultdict
+    by_type = defaultdict(list)
+    for _, row in df.iterrows():
+        ftype = str(row.get('forecast_type', '') or row.get('type', '') or '其他')
+        by_type[ftype].append(row)
+    for ftype, rows in sorted(by_type.items()):
+        lines.append(f"\n## {ftype}")
+        for row in rows[:8]:
+            report_date = str(row.get('report_date', ''))[:10]
+            value = row.get('forecast_value', '') or row.get('value', '')
+            org = row.get('forecast_org', '') or row.get('org_name', '')
+            analyst = row.get('analyst', '')
+            rating = row.get('rating', '')
+            target = row.get('target_price', '') or row.get('target', '')
+            items = [f"日期:{report_date}"]
+            if value: items.append(f"预测值:{value}")
+            if org: items.append(f"机构:{org}")
+            if analyst: items.append(f"分析师:{analyst}")
+            if rating: items.append(f"评级:{rating}")
+            if target: items.append(f"目标价:{target}")
+            lines.append("  " + " | ".join(items))
+    return "\n".join(lines)
+
+
+def _format_macro_data(df: pd.DataFrame, indicator_name: str) -> str:
+    """格式化宏观指标数据为文本"""
+    if df is None or df.empty:
+        return ""
+    lines = [f"【{indicator_name} 宏观数据】"]
+    for _, row in df.head(10).iterrows():
+        items = [f"{col}: {val}" for col, val in row.items() if val is not None and val != '']
+        if items:
+            lines.append("  " + " | ".join(items))
+    return "\n".join(lines)
+
+
+def _format_margin(df: pd.DataFrame, stock_code: str) -> str:
+    """格式化融资融券汇总数据"""
+    if df is None or df.empty:
+        return ""
+    lines = [f"【融资融券汇总（来源：Tushare）】"]
+    for _, row in df.head(10).iterrows():
+        trade_date = str(row.get('trade_date', ''))[:10]
+        exchange_id = row.get('exchange_id', '')
+        rzmre = row.get('rzmre', '')
+        rzye = row.get('rzye', '')
+        rqmcl = row.get('rqmcl', '')
+        rqye = row.get('rqye', '')
+        rzrqye = row.get('rzrqye', '')
+        items = [f"日期:{trade_date}"]
+        if exchange_id: items.append(f"交易所:{exchange_id}")
+        if rzmre: items.append(f"融资买入额:{rzmre}")
+        if rzye: items.append(f"融资余额:{rzye}")
+        if rqmcl: items.append(f"融券卖出量:{rqmcl}")
+        if rqye: items.append(f"融券余额:{rqye}")
+        if rzrqye: items.append(f"融券融券余额:{rzrqye}")
+        lines.append("  " + " | ".join(items))
+    return "\n".join(lines)
+
+
+def _format_margin_detail(df: pd.DataFrame, stock_code: str) -> str:
+    """格式化融资融券明细数据"""
+    if df is None or df.empty:
+        return ""
+    lines = [f"【融资融券明细（来源：Tushare）】"]
+    for _, row in df.head(10).iterrows():
+        trade_date = str(row.get('trade_date', ''))[:10]
+        name = row.get('name', '')
+        rzmre = row.get('rzmre', '')
+        rzye = row.get('rzye', '')
+        rqmcl = row.get('rqmcl', '')
+        rqye = row.get('rqye', '')
+        rzrqye = row.get('rzrqye', '')
+        items = [f"日期:{trade_date}"]
+        if name: items.append(f"名称:{name}")
+        if rzmre: items.append(f"融资买入额:{rzmre}")
+        if rzye: items.append(f"融资余额:{rzye}")
+        if rqmcl: items.append(f"融券卖出量:{rqmcl}")
+        if rqye: items.append(f"融券余额:{rqye}")
+        if rzrqye: items.append(f"融券融券余额:{rzrqye}")
+        lines.append("  " + " | ".join(items))
+    return "\n".join(lines)
+
+
+def _format_moneyflow(df: pd.DataFrame, stock_code: str) -> str:
+    """格式化个股资金流向数据"""
+    if df is None or df.empty:
+        return ""
+    lines = [f"【个股资金流向（来源：Tushare）】"]
+    for _, row in df.head(10).iterrows():
+        trade_date = str(row.get('trade_date', ''))[:10]
+        buy_sm = row.get('buy_sm_vol', '')
+        sell_sm = row.get('sell_sm_vol', '')
+        buy_md = row.get('buy_md_vol', '')
+        sell_md = row.get('sell_md_vol', '')
+        buy_lg = row.get('buy_lg_vol', '')
+        sell_lg = row.get('sell_lg_vol', '')
+        buy_elg = row.get('buy_elg_vol', '')
+        sell_elg = row.get('sell_elg_vol', '')
+        net_mf_vol = row.get('net_mf_vol', '')
+        net_mf_amount = row.get('net_mf_amount', '')
+        items = [f"日期:{trade_date}"]
+        if buy_sm: items.append(f"小单买入:{buy_sm}")
+        if sell_sm: items.append(f"小单卖出:{sell_sm}")
+        if buy_md: items.append(f"中单买入:{buy_md}")
+        if sell_md: items.append(f"中单卖出:{sell_md}")
+        if buy_lg: items.append(f"大单买入:{buy_lg}")
+        if sell_lg: items.append(f"大单卖出:{sell_lg}")
+        if buy_elg: items.append(f"特大单买入:{buy_elg}")
+        if sell_elg: items.append(f"特大单卖出:{sell_elg}")
+        if net_mf_vol: items.append(f"净流入量:{net_mf_vol}")
+        if net_mf_amount: items.append(f"净流入额:{net_mf_amount}")
+        lines.append("  " + " | ".join(items))
+    return "\n".join(lines)
+
+
+def _format_hsgt_moneyflow(df: pd.DataFrame) -> str:
+    """格式化沪深港通资金流向数据"""
+    if df is None or df.empty:
+        return ""
+    lines = [f"【沪深港通资金流向（来源：Tushare）】"]
+    for _, row in df.head(10).iterrows():
+        trade_date = str(row.get('trade_date', ''))[:10]
+        ggt_ss = row.get('ggt_ss', '')
+        ggt_sz = row.get('ggt_sz', '')
+        hgt = row.get('hgt', '')
+        sgt = row.get('sgt', '')
+        north_money = row.get('north_money', '')
+        south_money = row.get('south_money', '')
+        items = [f"日期:{trade_date}"]
+        if ggt_ss: items.append(f"沪股通:{ggt_ss}")
+        if ggt_sz: items.append(f"深股通:{ggt_sz}")
+        if hgt: items.append(f"港股通(沪):{hgt}")
+        if sgt: items.append(f"港股通(深):{sgt}")
+        if north_money: items.append(f"北向资金:{north_money}")
+        if south_money: items.append(f"南向资金:{south_money}")
+        lines.append("  " + " | ".join(items))
+    return "\n".join(lines)
+
+
 def _format_top_list(df: pd.DataFrame, stock_code: str) -> str:
     """格式化龙虎榜数据"""
     if df is None or df.empty:
@@ -3144,6 +3763,77 @@ def call_fetch_income_data(stock_code: str) -> str:
     except Exception as e:
         logger.error(f"调用利润表工具失败: {e} {traceback.format_exc()}")
         return "❌ 获取利润表数据失败"
+
+
+def call_fetch_dividend_data(stock_code: str) -> str:
+    """获取分红送股数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_dividend(stock_code=stock_code)
+        if df is None or df.empty:
+            return ""
+        lines = [f"【分红送股历史（来源：Tushare）】"]
+        for _, row in df.head(10).iterrows():
+            date_str = str(row.get('end_date', ''))[:10]
+            div = row.get('div_procf', '')
+            stk_bo = row.get('stk_bo_rate', '')
+            stk_co = row.get('stk_co_rate', '')
+            cash = row.get('cash_div', '')
+            items = [f"报告期:{date_str}"]
+            if div: items.append(f"每股分红:{div}")
+            if stk_bo: items.append(f"送股:{stk_bo}")
+            if stk_co: items.append(f"转增:{stk_co}")
+            if cash: items.append(f"现金分红总额:{cash}")
+            lines.append("  " + " | ".join(items))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"分红送股数据获取失败（不影响分析）: {e}")
+        return ""
+
+
+def call_fetch_fina_audit_data(stock_code: str) -> str:
+    """获取财务审计意见数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_fina_audit(stock_code=stock_code)
+        if df is None or df.empty:
+            return ""
+        lines = [f"【财务审计意见（来源：Tushare）】"]
+        for _, row in df.head(10).iterrows():
+            date_str = str(row.get('end_date', ''))[:10]
+            opinion = row.get('audit_opinion', '')
+            auditor = row.get('auditor', '')
+            fee = row.get('audit_fee', '')
+            items = [f"报告期:{date_str}"]
+            if opinion: items.append(f"审计意见:{opinion}")
+            if auditor: items.append(f"审计机构:{auditor}")
+            if fee: items.append(f"审计费用:{fee}")
+            lines.append("  " + " | ".join(items))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"财务审计意见数据获取失败（不影响分析）: {e}")
+        return ""
+
+
+def call_fetch_disclosure_date_data(stock_code: str) -> str:
+    """获取财报披露计划日期数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_disclosure_date(stock_code=stock_code)
+        if df is None or df.empty:
+            return ""
+        lines = [f"【财报披露计划日期（来源：Tushare）】"]
+        for _, row in df.head(10).iterrows():
+            date_str = str(row.get('end_date', ''))[:10]
+            issue_date = str(row.get('stm_issue_date', ''))[:10]
+            comm_date = str(row.get('stm_comm_date', ''))[:10]
+            diss_date = str(row.get('actual_diss_date', ''))[:10]
+            items = [f"报告期:{date_str}"]
+            if issue_date: items.append(f"首次披露日:{issue_date}")
+            if comm_date: items.append(f"董事会公告日:{comm_date}")
+            if diss_date: items.append(f"实际披露日:{diss_date}")
+            lines.append("  " + " | ".join(items))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"财报披露计划日期数据获取失败（不影响分析）: {e}")
+        return ""
 
 
 def call_fetch_balance_sheet_data(stock_code: str) -> str:
@@ -3414,6 +4104,86 @@ def call_fetch_vehicle_sales(stock_code: str) -> str:
     except Exception as e:
         logger.error(f"调用车型销量工具失败: {e}")
         return "❌ 获取车型销量数据失败"
+
+
+def call_fetch_pledge_detail(stock_code: str) -> str:
+    """获取股权质押明细数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_pledge_detail(stock_code=stock_code)
+        return _format_pledge_detail(df, stock_code)
+    except Exception as e:
+        logger.warning(f"股权质押明细数据获取失败（不影响分析）: {e}")
+        return ""
+
+
+def call_fetch_holder_trade(stock_code: str) -> str:
+    """获取股东增减持数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_holder_trade(stock_code=stock_code)
+        return _format_holder_trade(df, stock_code)
+    except Exception as e:
+        logger.warning(f"股东增减持数据获取失败（不影响分析）: {e}")
+        return ""
+
+
+def call_fetch_report_rc(stock_code: str) -> str:
+    """获取卖方盈利预测数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_report_rc(stock_code=stock_code)
+        return _format_report_rc(df, stock_code)
+    except Exception as e:
+        logger.warning(f"卖方盈利预测数据获取失败（不影响分析）: {e}")
+        return ""
+
+
+def call_fetch_macro(indicator_name: str) -> str:
+    """获取宏观指标数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_macro(indicator_name=indicator_name)
+        return _format_macro_data(df, indicator_name)
+    except Exception as e:
+        logger.warning(f"宏观数据[{indicator_name}]获取失败（不影响分析）: {e}")
+        return ""
+
+
+def call_fetch_margin(stock_code: str) -> str:
+    """获取融资融券汇总数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_margin(stock_code=stock_code)
+        return _format_margin(df, stock_code)
+    except Exception as e:
+        logger.warning(f"融资融券汇总数据获取失败（不影响分析）: {e}")
+        return ""
+
+
+def call_fetch_margin_detail(stock_code: str) -> str:
+    """获取融资融券明细数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_margin_detail(stock_code=stock_code)
+        return _format_margin_detail(df, stock_code)
+    except Exception as e:
+        logger.warning(f"融资融券明细数据获取失败（不影响分析）: {e}")
+        return ""
+
+
+def call_fetch_moneyflow(stock_code: str) -> str:
+    """获取个股资金流向数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_moneyflow(stock_code=stock_code)
+        return _format_moneyflow(df, stock_code)
+    except Exception as e:
+        logger.warning(f"个股资金流向数据获取失败（不影响分析）: {e}")
+        return ""
+
+
+def call_fetch_hsgt_moneyflow(use_cache: bool = True) -> str:
+    """获取沪深港通资金流向数据并格式化为文本"""
+    try:
+        df = stock_tool_instance.fetch_and_save_stock_hsgt_moneyflow()
+        return _format_hsgt_moneyflow(df)
+    except Exception as e:
+        logger.warning(f"沪深港通资金流向数据获取失败（不影响分析）: {e}")
+        return ""
 
 
 def call_fetch_repurchase(stock_code: str) -> str:

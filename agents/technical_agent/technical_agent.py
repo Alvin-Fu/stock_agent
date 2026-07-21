@@ -12,6 +12,7 @@ from langchain_core.tools import StructuredTool
 
 from agents.base import AgentState
 from core.llm import get_technical_llm
+from tools.weight_adjuster import get_tech_weights
 from tools import all_stock_tools
 from utils.logger import logger
 
@@ -42,6 +43,8 @@ class TechnicalAgent:
 
     def _build_single_prompt(self) -> str:
         today_str = date.today().strftime('%Y-%m-%d')
+        w = get_tech_weights()
+        w_line = f"- 综合判断 = 日线×{w['daily']:.1f} + 周线×{w['weekly']:.1f} + 月线×{w['monthly']:.1f}"
         return f"""你是一个专业的股票技术分析师。今天的日期是 {today_str}。
 请基于下方提供的日线、周线、月线数据，进行分析。
 
@@ -63,8 +66,13 @@ class TechnicalAgent:
 - 动量与位置（RSI/KDJ超买超卖/年内位置/BOLL位置）：0-2 分
 - 量价配合（放量涨/缩量跌/异常放量、OBV趋势）：0-2 分
 - 支撑位与压力位清晰度：0-1 分
-- 综合判断 = 日线×0.5 + 周线×0.3 + 月线×0.2
+{w_line}
   （日线主导短期动能、周线定中期方向、月线约束长期空间）
+
+【技术入场阈值（透明公开）】
+- 综合分 ≥ 7.5：强势入场区间，技术面支持积极操作
+- 综合分 6.0~7.5：中性区间，需结合基本面判断
+- 综合分 < 6.0：谨慎区间，建议观望或减仓
 
 【多周期空头判定规则（禁止一刀切）】
 - 日线金叉出现在周线空头排列阶段：结合月线超卖状态判断，
@@ -254,9 +262,21 @@ class TechnicalAgent:
         # 支撑压力位（独立于交易计划，供 LLM 引用具体价位）
         sr_text = self._compute_sr_text(code)
 
+        # 信号历史胜率权重调整建议（需在 kline 数据完成后拉取）
+        weight_text = ""
+        try:
+            from tools.signal_weight_adjuster import get_weight_adjustment_for_code
+            weight_text = get_weight_adjustment_for_code(code)
+            if weight_text:
+                logger.info(f"  {code} 信号权重调整: {weight_text[:80]}")
+        except Exception as e:
+            logger.debug(f"  {code} 信号权重计算失败: {e}")
+
         trade_block = plan_text if plan_text else ""
         if sr_text:
             trade_block = f"{sr_text}\n\n{trade_block}" if trade_block else sr_text
+        if weight_text:
+            trade_block = f"{weight_text}\n\n{trade_block}" if trade_block else weight_text
 
         messages = [
             SystemMessage(content=self._build_single_prompt()),
@@ -300,6 +320,7 @@ class TechnicalAgent:
         all_kline = ""
         plans, plans_text = {}, {}
         sr_texts = {}  # code → sr_levels_text
+        weight_texts = {}  # code → weight_adjustment_text
         for code in codes:
             name = self._resolve_name(code)
             label = f"{name}({code})" if name else code
@@ -318,6 +339,15 @@ class TechnicalAgent:
                     sr_texts[code] = sr_t
             except Exception:
                 pass
+            # 信号历史胜率权重调整建议
+            try:
+                from tools.signal_weight_adjuster import get_weight_adjustment_for_code
+                wt = get_weight_adjustment_for_code(code)
+                if wt:
+                    weight_texts[code] = wt
+                    logger.info(f"  {code} 信号权重调整: {wt[:80]}")
+            except Exception as e:
+                logger.debug(f"  {code} 信号权重计算失败: {e}")
 
         # 拼交易计划块
         trade_block = ""
@@ -331,6 +361,12 @@ class TechnicalAgent:
             sr_block = "\n\n".join(
                 f"=== 关键位({code}) ===\n{t}" for code, t in sr_texts.items())
             sr_block = f"\n{sr_block}\n"
+        # 拼权重调整建议块
+        weight_block = ""
+        if weight_texts:
+            weight_block = "\n\n".join(
+                f"=== 权重调整({code}) ===\n{t}" for code, t in weight_texts.items())
+            weight_block = f"\n{weight_block}\n"
 
         messages = [
             SystemMessage(content=self._build_chain_prompt()),
@@ -338,7 +374,7 @@ class TechnicalAgent:
 
 【用户问题】{question}
 
-{trade_block}{sr_block}
+{trade_block}{sr_block}{weight_block}
 
 {all_kline[:25000]}
 

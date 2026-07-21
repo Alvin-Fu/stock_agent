@@ -17,7 +17,7 @@ TushareFetcher - 备用数据源 (Priority 1)
 import logging
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Optional, Tuple
 import requests
 import tushare as ts
@@ -1151,6 +1151,447 @@ class TushareFetcher(BaseFetcher):
             if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
                 raise RateLimitError(f"Tushare 配额超限: {e}") from e
             raise DataFetchError(f"Tushare top_inst err: {e}") from e
+
+    def pledge_detail(self, stock_code: str) -> pd.DataFrame:
+        """获取股权质押明细数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        ts_code, _, _ = self.fetch_common(stock_code, "", "")
+        logger.info(f"pledge_detail({ts_code})")
+        try:
+            df = ts.pro_api().pledge_detail(ts_code=ts_code)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare pledge_detail err: {e}") from e
+
+    def report_rc(self, stock_code: str, start_date: str = "", end_date: str = "") -> pd.DataFrame:
+        """获取券商卖方盈利预测数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
+        logger.info(f"report_rc({ts_code}, {ts_start}, {ts_end})")
+        try:
+            df = ts.pro_api().report_rc(ts_code=ts_code, start_date=ts_start, end_date=ts_end)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare report_rc err: {e}") from e
+
+    # ------------------------------------------------------------------
+    # 以下为新增 Tushare 接口（分红送股/财务审计意见/财报披露计划）
+    # ------------------------------------------------------------------
+
+    def dividend(self, stock_code: str) -> pd.DataFrame:
+        """分红送股数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        ts_code, _, _ = self.fetch_common(stock_code, "", "")
+        logger.info(f"dividend({ts_code})")
+        try:
+            df = ts.pro_api().dividend(ts_code=ts_code)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare dividend err: {e}") from e
+
+    def fina_audit(self, stock_code: str) -> pd.DataFrame:
+        """财务审计意见数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        ts_code, _, _ = self.fetch_common(stock_code, "", "")
+        logger.info(f"fina_audit({ts_code})")
+        try:
+            df = ts.pro_api().fina_audit(ts_code=ts_code)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare fina_audit err: {e}") from e
+
+    def disclosure_date(self, stock_code: str) -> pd.DataFrame:
+        """财报披露计划日期"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        ts_code, _, _ = self.fetch_common(stock_code, "", "")
+        logger.info(f"disclosure_date({ts_code})")
+        try:
+            df = ts.pro_api().disclosure_date(ts_code=ts_code)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare disclosure_date err: {e}") from e
+
+    # ====== 融资融券系列 ======
+
+    def margin_secs(self) -> pd.DataFrame:
+        """融资融券标的（盘前更新）"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("margin_secs()")
+        try:
+            df = ts.pro_api().margin_secs()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare margin_secs err: {e}") from e
+
+    def slb_sec(self) -> pd.DataFrame:
+        """转融券交易汇总"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("slb_sec()")
+        try:
+            df = ts.pro_api().slb_sec()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare slb_sec err: {e}") from e
+
+    def slb_len(self) -> pd.DataFrame:
+        """转融资交易汇总"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("slb_len()")
+        try:
+            df = ts.pro_api().slb_len()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare slb_len err: {e}") from e
+
+    def moneyflow_mkt_dc(self, trade_date: str = "") -> pd.DataFrame:
+        """大盘资金流向（东方财富DC）"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info(f"moneyflow_mkt_dc({trade_date})")
+        try:
+            df = ts.pro_api().moneyflow_mkt_dc(trade_date=trade_date)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare moneyflow_mkt_dc err: {e}") from e
+
+    def fund_adj(self, ts_code: str) -> pd.DataFrame:
+        """基金复权因子"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info(f"fund_adj({ts_code})")
+        try:
+            df = ts.pro_api().fund_adj(ts_code=ts_code)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare fund_adj err: {e}") from e
+
+    # ====== 经济日历 & 利率 ======
+
+    def cn_schedule(self, date: str = "") -> pd.DataFrame:
+        """中国经济数据发布日程"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info(f"cn_schedule({date})")
+        try:
+            df = ts.pro_api().cn_schedule(date=date)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            raise DataFetchError(f"Tushare cn_schedule err: {e}") from e
+
+    def shibor(self) -> pd.DataFrame:
+        """Shibor 利率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("shibor()")
+        try:
+            import time as _t
+            start = (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+            end = date.today().strftime("%Y%m%d")
+            df = ts.pro_api().shibor(start_date=start, end_date=end)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            raise DataFetchError(f"Tushare shibor err: {e}") from e
+
+    def shibor_quote(self) -> pd.DataFrame:
+        """Shibor 报价数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("shibor_quote()")
+        try:
+            df = ts.pro_api().shibor_quote()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            raise DataFetchError(f"Tushare shibor_quote err: {e}") from e
+
+    def shibor_lpr(self) -> pd.DataFrame:
+        """LPR 贷款基础利率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("shibor_lpr()")
+        try:
+            import time as _t
+            start = (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+            end = date.today().strftime("%Y%m%d")
+            df = ts.pro_api().shibor_lpr(start_date=start, end_date=end)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            raise DataFetchError(f"Tushare shibor_lpr err: {e}") from e
+
+    def libor(self) -> pd.DataFrame:
+        """Libor 拆借利率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("libor()")
+        try:
+            import time as _t
+            start = (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+            end = date.today().strftime("%Y%m%d")
+            df = ts.pro_api().libor(start_date=start, end_date=end)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            raise DataFetchError(f"Tushare libor err: {e}") from e
+
+    def hibor(self) -> pd.DataFrame:
+        """Hibor 拆借利率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("hibor()")
+        try:
+            import time as _t
+            start = (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+            end = date.today().strftime("%Y%m%d")
+            df = ts.pro_api().hibor(start_date=start, end_date=end)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            raise DataFetchError(f"Tushare hibor err: {e}") from e
+
+    def wz_index(self) -> pd.DataFrame:
+        """温州民间借贷利率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("wz_index()")
+        try:
+            df = ts.pro_api().wz_index()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            raise DataFetchError(f"Tushare wz_index err: {e}") from e
+
+    def gz_index(self) -> pd.DataFrame:
+        """广州民间借贷利率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("gz_index()")
+        try:
+            df = ts.pro_api().gz_index()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            raise DataFetchError(f"Tushare gz_index err: {e}") from e
+
+    def cn_gdp(self) -> pd.DataFrame:
+        """国民经济之GDP数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("cn_gdp()")
+        try:
+            df = ts.pro_api().cn_gdp()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare cn_gdp err: {e}") from e
+
+    def cn_cpi(self) -> pd.DataFrame:
+        """国民经济之CPI数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("cn_cpi()")
+        try:
+            df = ts.pro_api().cn_cpi()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare cn_cpi err: {e}") from e
+
+    def cn_ppi(self) -> pd.DataFrame:
+        """国民经济之PPI数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("cn_ppi()")
+        try:
+            df = ts.pro_api().cn_ppi()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare cn_ppi err: {e}") from e
+
+    def cn_m(self) -> pd.DataFrame:
+        """货币供应量数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("cn_m()")
+        try:
+            df = ts.pro_api().cn_m()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare cn_m err: {e}") from e
+
+    def sf_month(self) -> pd.DataFrame:
+        """社会融资规模增量月度数据"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("sf_month()")
+        try:
+            df = ts.pro_api().sf_month()
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare sf_month err: {e}") from e
+
+    def us_tycr(self, start_date: str = "", end_date: str = "") -> pd.DataFrame:
+        """美国每日国债收益率曲线利率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("us_tycr()")
+        try:
+            if not start_date:
+                start_date = (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+            if not end_date:
+                end_date = date.today().strftime("%Y%m%d")
+            df = ts.pro_api().us_tycr(start_date=start_date, end_date=end_date)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare us_tycr err: {e}") from e
+
+    def us_trycr(self, start_date: str = "", end_date: str = "") -> pd.DataFrame:
+        """美国国债实际收益率曲线利率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("us_trycr()")
+        try:
+            if not start_date:
+                start_date = (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+            if not end_date:
+                end_date = date.today().strftime("%Y%m%d")
+            df = ts.pro_api().us_trycr(start_date=start_date, end_date=end_date)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare us_trycr err: {e}") from e
+
+    def us_tbr(self, start_date: str = "", end_date: str = "") -> pd.DataFrame:
+        """美国短期国债收益率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("us_tbr()")
+        try:
+            if not start_date:
+                start_date = (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+            if not end_date:
+                end_date = date.today().strftime("%Y%m%d")
+            df = ts.pro_api().us_tbr(start_date=start_date, end_date=end_date)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare us_tbr err: {e}") from e
+
+    def us_tltr(self, start_date: str = "", end_date: str = "") -> pd.DataFrame:
+        """美国长期国债收益率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("us_tltr()")
+        try:
+            if not start_date:
+                start_date = (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+            if not end_date:
+                end_date = date.today().strftime("%Y%m%d")
+            df = ts.pro_api().us_tltr(start_date=start_date, end_date=end_date)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare us_tltr err: {e}") from e
+
+    def us_trltr(self, start_date: str = "", end_date: str = "") -> pd.DataFrame:
+        """美国实际长期国债平均收益率"""
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化")
+        logger.info("us_trltr()")
+        try:
+            if not start_date:
+                start_date = (date.today() - timedelta(days=365)).strftime("%Y%m%d")
+            if not end_date:
+                end_date = date.today().strftime("%Y%m%d")
+            df = ts.pro_api().us_trltr(start_date=start_date, end_date=end_date)
+            if df.empty: return pd.DataFrame()
+            return df
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(kw in error_msg for kw in ['quota', '配额', 'limit', '权限']):
+                raise RateLimitError(f"Tushare 配额超限: {e}") from e
+            raise DataFetchError(f"Tushare us_trltr err: {e}") from e
 
 
 if __name__ == "__main__":

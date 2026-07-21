@@ -2,7 +2,7 @@
 """
 社交媒体信息抓取工具：
 - 微博：通过 web search 精确搜索公司官方认证微博内容（site:weibo.com + 关键词过滤）
-- 微信公众号：先通过 wechatsogou 定位官方认证公众号，再只保留该号的文章
+- 微信公众号：通过 web search 搜索 site:mp.weixin.qq.com 定位官方公众号及文章
 - 两级缓存：数据库 → 实时搜索，24 小时刷新一次
 
 使用方式（被 researcher agent 调用）：
@@ -12,8 +12,6 @@
 
 import json
 import re
-import threading
-import time
 from datetime import datetime
 from typing import Optional
 
@@ -21,26 +19,10 @@ from storage.sqlite.stock_storage import get_db
 from utils.logger import logger
 from tools.source_tiers import TIER, tier_tag
 
-# ===== 全局限速（wechatsogou 并发保护） =====
-# 搜狗微信搜索没有公开 API 配额，短时间高频请求会被封 IP。
-# 全局锁 + 3 秒最小间隔，确保串行调用。
-_WECHAT_LOCK = threading.Lock()
-_LAST_WECHAT_TS = 0.0
-_WECHAT_MIN_INTERVAL = 3.0  # 秒
-
-
-def _wechat_throttled_call(func, *args, **kwargs):
-    """全局限速包装器：确保 wechatsogou 串行调用，间隔不低于 _WECHAT_MIN_INTERVAL 秒"""
-    global _LAST_WECHAT_TS
-    with _WECHAT_LOCK:
-        elapsed = time.time() - _LAST_WECHAT_TS
-        if elapsed < _WECHAT_MIN_INTERVAL:
-            time.sleep(_WECHAT_MIN_INTERVAL - elapsed)
-        try:
-            result = func(*args, **kwargs)
-            return result
-        finally:
-            _LAST_WECHAT_TS = time.time()
+# ===== 微信公众号搜索：用 web search 替代 wechatsogou =====
+# wechatsogou（搜狗微信搜索）因依赖旧版 werkzeug 已不可用，
+# 改为通过 web_search 搜索 site:mp.weixin.qq.com 来找公众号文章，
+# 与微博的处理方式一致。
 
 
 # ========== 微博：用 web search 精确搜索认证账号 ==========
@@ -107,51 +89,98 @@ def _format_weibo_text(posts: list) -> str:
 # ========== 微信公众号：官方号定位 + 文章过滤 ==========
 
 def _search_wechat_account(company_name: str) -> Optional[dict]:
-    """通过搜狗微信搜索查找公司官方公众号（搜狗返回的是经过微信认证的账号）"""
+    """
+    通过 web search 查找公司官方认证公众号信息
+    （搜索 site:mp.weixin.qq.com + 公众号认证关键词）
+    """
     try:
-        import wechatsogou
-        ws_api = wechatsogou.WechatSogouAPI(timeout=10)
-        info = _wechat_throttled_call(ws_api.get_gzh_info, company_name)
-        if info:
-            wechat_name = info.get("wechat_name") or info.get("name") or ""
-            wechat_id = info.get("wechat_id") or info.get("id") or ""
-            logger.info(f"[社交媒体] 搜索到 {company_name} 认证公众号: {wechat_name}({wechat_id})")
-            return {"name": wechat_name, "id": wechat_id}
-    except ImportError:
-        logger.debug("[社交媒体] wechatsogou 未安装，跳过公众号搜索")
+        from agents.researcher.web_search_tool import web_search
+
+        raw = web_search.invoke({"query": f"{company_name} site:mp.weixin.qq.com 公众号 认证 2026"})
+        text = raw or ""
+
+        if not text.strip():
+            return None
+
+        # 尝试从搜索结果中提取公众号名称
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        name, wechat_id = None, None
+        for line in lines:
+            if len(line) < 8:
+                continue
+            # 常见公众号标识模式
+            if not name:
+                m = re.search(r'微信号[：:]\s*(\S+)', line)
+                if m:
+                    wechat_id = m.group(1).strip()
+                    continue
+            if not name:
+                m = re.search(r'公众号[：:]\s*(\S+)', line)
+                if m:
+                    name = m.group(1).strip()
+                    continue
+            # 行中包含公司名 + "公众号" → 尝试提取公众号名
+            if company_name in line and "公众号" in line:
+                # 格式通常是 "公司名 公众号名" 或 "公司名 - 公众号名"
+                m = re.search(r'[：:]\s*(\S{2,20})', line)
+                if m:
+                    name = m.group(1).strip()
+
+        if name:
+            logger.info(f"[社交媒体] 搜索到 {company_name} 认证公众号: {name}（{'微信号: ' + wechat_id if wechat_id else '微信号未知'}）")
+            return {"name": name, "id": wechat_id or ""}
+        return None
     except Exception as e:
         logger.debug(f"[社交媒体] 搜索公众号失败: {e}")
-    return None
+        return None
 
 
 def _search_wechat_articles(company_name: str, official_name: str = None, limit: int = 5) -> list:
-    """通过搜狗微信搜索公众号文章。若已知官方公众号名，只保留该号的文章。"""
+    """
+    通过 web search 搜索公司公众号文章。
+    若已知官方公众号名，只保留该号的文章。
+    """
     try:
-        import wechatsogou
-        ws_api = wechatsogou.WechatSogouAPI(timeout=10)
-        results = _wechat_throttled_call(ws_api.search_article, company_name, page=1)
+        from agents.researcher.web_search_tool import web_search
+
+        raw = web_search.invoke({"query": f"{company_name} site:mp.weixin.qq.com 2026"})
+        text = raw or ""
+
+        if not text.strip():
+            return []
+
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
         articles = []
-        for art in (results or [])[:limit * 3]:  # 多取一些以便过滤
-            source = (art.get("source") or "").strip()
-            # 已知官方号名时，只保留来源匹配的文章
-            if official_name and official_name.lower() not in source.lower():
+        for line in lines:
+            if len(line) < 20:
                 continue
+            if line.startswith("搜索失败") or line.startswith("!"):
+                continue
+            # 尝试识别文章的公众号来源
+            source = ""
+            # 行末或行中的「来源：xxx」或「- xxx」模式
+            m = re.search(r'[-–—]+\s*(\S{2,20})\s*$', line)
+            if m:
+                source = m.group(1).strip()
+            # 如果已知官方号名，过滤非官方来源
+            if official_name and source and official_name.lower() not in source.lower():
+                continue
+
             articles.append({
-                "title": (art.get("title") or "")[:100],
-                "abstract": (art.get("abstract") or "")[:200],
+                "title": line[:100],
+                "abstract": line[:200],
                 "source": source,
-                "time": art.get("time") or "",
+                "time": "",
             })
             if len(articles) >= limit:
                 break
+
         if official_name and not articles:
-            logger.info(f"[社交媒体] 未找到 {official_name} 的公众号文章（搜狗微信搜索结果中无该号文章）")
+            logger.info(f"[社交媒体] 未找到 {official_name} 的公众号文章（搜索结果中无该号文章）")
         return articles
-    except ImportError:
-        pass
     except Exception as e:
         logger.debug(f"[社交媒体] 搜索公众号文章失败: {e}")
-    return []
+        return []
 
 
 def _format_wechat_text(articles: list, account: Optional[dict] = None) -> str:

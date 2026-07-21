@@ -16,6 +16,11 @@ from datetime import date, timedelta
 
 from utils.logger import logger
 
+# ---- 进程级内存缓存（同一次运行 + 6小时有效期） ----
+# 懂车帝月销量数据每月才变一次，每次分析重复拉完全浪费
+_INDUSTRY_CACHE: Dict[str, tuple] = {}  # stock_code → (result_dict, expiry_ts)
+_CACHE_TTL_HOURS = 6
+
 
 # ===== 行业与专用数据源映射表（扩展点） =====
 # 格式: {行业名: (工具模块名, 工具函数名, 说明)}
@@ -96,6 +101,16 @@ def fetch_industry_data(stock_code: str, stock_name: str = "") -> Dict[str, Any]
     if not stock_code:
         return {"has_data": False, "industry": None, "data_text": "", "source": ""}
 
+    # ---- 内存缓存：6小时内同股票不再重复拉取 ----
+    import time
+    now = time.time()
+    cache_key = f"industry:{stock_code}"
+    if cache_key in _INDUSTRY_CACHE:
+        data, expiry = _INDUSTRY_CACHE[cache_key]
+        if now < expiry:
+            logger.info(f"行业数据路由: [{stock_code}] 命中内存缓存（6h内），跳过API调用")
+            return data
+
     # 1. 查行业
     industry = get_stock_industry(stock_code)
     if not industry:
@@ -122,13 +137,16 @@ def fetch_industry_data(stock_code: str, stock_name: str = "") -> Dict[str, Any]
                 from tools.stock_tools import _format_vehicle_sales
                 text = _format_vehicle_sales(df, stock_code)
                 logger.info(f"✅ 行业数据路由: [{stock_code}] 匹配到[{std_industry}]，调用 {func_name} 成功")
-                return {
+                result = {
                     "has_data": True,
                     "industry": industry,
                     "std_industry": std_industry,
                     "data_text": text,
                     "source": f"行业专用数据源({description})",
                 }
+                # 写入内存缓存
+                _INDUSTRY_CACHE[cache_key] = (result, now + _CACHE_TTL_HOURS * 3600)
+                return result
             else:
                 logger.info(f"行业数据路由: [{stock_code}] {func_name} 返回空")
                 return {"has_data": False, "industry": industry, "data_text": "",

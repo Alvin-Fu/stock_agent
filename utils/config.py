@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Dict, Any
 
 import yaml
@@ -12,30 +13,69 @@ CONFIG_PATH = _LOCAL_CONFIG if os.path.exists(_LOCAL_CONFIG) else _DEFAULT_CONFI
 
 # 单例缓存（配置只加载一次，提升性能）
 _CONFIG_CACHE: Dict[str, Any] = None
+_CONFIG_MTIME: float = 0.0  # 最后加载时的文件修改时间戳
+_CONFIG_AUTO_RELOAD: bool = True  # 是否启用自动热加载
 
-def load_config() -> Dict[str, Any]:
+def load_config(force_reload: bool = False) -> Dict[str, Any]:
     """
-    加载并返回全局配置（单例模式，重复调用只加载一次）
-    :return: 完整配置字典
+    加载并返回全局配置（带文件变更检测，自动热加载）。
+
+    单例缓存策略（兼顾性能与热加载）：
+    - 首次调用 → 从磁盘加载，缓存到 _CONFIG_CACHE
+    - 后续调用 → 如果 _CONFIG_AUTO_RELOAD 开启，检查文件 mtime，
+      有变更则重新加载；否则返回缓存
+    - force_reload=True → 强制从磁盘重新加载
     """
-    global _CONFIG_CACHE
-    if _CONFIG_CACHE is not None:
+    global _CONFIG_CACHE, _CONFIG_MTIME
+
+    # 强制重新加载
+    if force_reload:
+        _CONFIG_CACHE = _do_load()
+        _CONFIG_MTIME = _get_mtime()
         return _CONFIG_CACHE
 
-    # 异常处理：配置文件不存在
+    # 自动热加载检测：文件变更时重新读取
+    if _CONFIG_AUTO_RELOAD and _CONFIG_CACHE is not None:
+        current_mtime = _get_mtime()
+        if current_mtime != _CONFIG_MTIME:
+            _CONFIG_CACHE = _do_load()
+            _CONFIG_MTIME = current_mtime
+        return _CONFIG_CACHE
+
+    # 首次加载
+    if _CONFIG_CACHE is None:
+        _CONFIG_CACHE = _do_load()
+        _CONFIG_MTIME = _get_mtime()
+
+    return _CONFIG_CACHE
+
+
+def _get_mtime() -> float:
+    """获取配置文件最后修改时间"""
+    try:
+        return os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        return 0.0
+
+
+def _do_load() -> Dict[str, Any]:
+    """实际从文件加载配置（无缓存）"""
     if not os.path.exists(CONFIG_PATH):
         raise FileNotFoundError(f"配置文件不存在！请检查路径：{CONFIG_PATH}")
-
-    # 读取并解析YAML
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            _CONFIG_CACHE = yaml.safe_load(f)
+            return yaml.safe_load(f)
     except yaml.YAMLError as e:
         raise ValueError(f"配置文件YAML格式错误：{str(e)}")
     except Exception as e:
         raise RuntimeError(f"加载配置失败：{str(e)}")
 
-    return _CONFIG_CACHE
+
+def set_config_auto_reload(enabled: bool) -> None:
+    """启用/禁用配置自动热加载"""
+    global _CONFIG_AUTO_RELOAD
+    _CONFIG_AUTO_RELOAD = enabled
+
 
 def get_model_config() -> Dict[str, Any]:
     """获取全局模型配置（嵌入模型+LLM）"""

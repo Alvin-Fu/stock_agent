@@ -426,6 +426,8 @@ class BaseFetcher(ABC):
 
     # 52周（一年）位置窗口：日线约244个交易日，周线52根，月线12根
     _POS_52W_WINDOW = {"daily": 244, "week": 52, "weekly": 52, "month": 12, "monthly": 12}
+    # 背离检测窗口：日线15根（~3周），周线8根（~2月），月线6根（~半年）
+    _DIVERGENCE_LOOKBACK = {"daily": 15, "week": 8, "weekly": 8, "month": 6, "monthly": 6}
 
     def _calculate_indicators(self, df: pd.DataFrame, freq: str = "daily") -> pd.DataFrame:
         """
@@ -455,6 +457,7 @@ class BaseFetcher(ABC):
         df = self._calculate_obv(df)
         df = self._calculate_pos_52w(df, self._POS_52W_WINDOW.get(freq, 244))
         df = self._calculate_signals(df)
+        df = self._detect_divergence(df, lookback=self._DIVERGENCE_LOOKBACK.get(freq, 15))
 
         # 全部指标计算完成后再按日期降序排列（仅用于展示，最新数据在前）
         if 'date' in df.columns:
@@ -523,6 +526,81 @@ class BaseFetcher(ABC):
         low_w = df['low'].rolling(window=window, min_periods=1).min()
         span = (high_w - low_w).replace(0, np.nan)
         df['pos_52w'] = ((df['close'] - low_w) / span * 100).fillna(50.0).round(1)
+        return df
+
+    @staticmethod
+    def _detect_divergence(df: pd.DataFrame, lookback: int = 15) -> pd.DataFrame:
+        """
+        检测 MACD/OBV 顶底背离（程序计算，LLM 直接引用）。
+        原理：将数据分成前后两段比较，后段价格创新高但 DIF/OBV 未同步 → 顶背离；
+              后段价格创新低但 DIF/OBV 未同步 → 底背离。
+        lookback 参数建议：日线 15（~3 周）、周线 8（~2 月）、月线 6（~半年）。
+        返回新增列：macd_divergence / macd_bar_divergence / obv_divergence。
+        """
+        diver_macd = pd.Series([''] * len(df), index=df.index)
+        diver_bar = pd.Series([''] * len(df), index=df.index)
+        diver_obv = pd.Series([''] * len(df), index=df.index)
+
+        # 需要足够的 DIF/OBV 历史
+        has_dif = 'DIF' in df.columns
+        has_macd = 'MACD' in df.columns
+        has_obv = 'obv' in df.columns
+        if not has_dif and not has_obv:
+            df['macd_divergence'] = diver_macd
+            df['macd_bar_divergence'] = diver_bar
+            df['obv_divergence'] = diver_obv
+            return df
+
+        for i in range(lookback * 2, len(df)):
+            left = df.iloc[i - lookback * 2 : i - lookback]
+            right = df.iloc[i - lookback : i]
+
+            # 跳过 NA 过多的窗口（数据缺口导致指标断裂时的崩溃保护）
+            _skip_na = lambda s: s is not None and s.notna().any()
+
+            # ── MACD DIF 背离 ──
+            if has_dif and _skip_na(left.get('DIF')) and _skip_na(right.get('DIF')):
+                l_hi = left['close'].max()
+                r_hi = right['close'].max()
+                l_hi_dif = left.loc[left['close'].idxmax(), 'DIF']
+                r_hi_dif = right.loc[right['close'].idxmax(), 'DIF']
+                if r_hi > l_hi * 1.005 and r_hi_dif < l_hi_dif * 0.985:
+                    diver_macd.iloc[i - 1] = '顶背离'
+
+                l_lo = left['close'].min()
+                r_lo = right['close'].min()
+                l_lo_dif = left.loc[left['close'].idxmin(), 'DIF']
+                r_lo_dif = right.loc[right['close'].idxmin(), 'DIF']
+                if r_lo < l_lo * 0.995 and r_lo_dif > l_lo_dif * 1.015:
+                    diver_macd.iloc[i - 1] = '底背离'
+
+            # ── MACD 柱状线背离（价格高低点 vs MACD柱值） ──
+            if has_macd and _skip_na(left.get('MACD')) and _skip_na(right.get('MACD')):
+                r_hi_bar = right.loc[right['close'].idxmax(), 'MACD']
+                l_hi_bar = left.loc[left['close'].idxmax(), 'MACD']
+                if r_hi > l_hi * 1.005 and r_hi_bar < l_hi_bar * 0.985:
+                    diver_bar.iloc[i - 1] = '顶背离'
+
+                r_lo_bar = right.loc[right['close'].idxmin(), 'MACD']
+                l_lo_bar = left.loc[left['close'].idxmin(), 'MACD']
+                if r_lo < l_lo * 0.995 and r_lo_bar > l_lo_bar * 1.015:
+                    diver_bar.iloc[i - 1] = '底背离'
+
+            # ── OBV 价量背离 ──
+            if has_obv and _skip_na(left.get('obv')) and _skip_na(right.get('obv')):
+                l_hi_obv = left.loc[left['close'].idxmax(), 'obv']
+                r_hi_obv = right.loc[right['close'].idxmax(), 'obv']
+                if r_hi > l_hi * 1.005 and r_hi_obv < l_hi_obv * 0.99:
+                    diver_obv.iloc[i - 1] = '顶背离'
+
+                l_lo_obv = left.loc[left['close'].idxmin(), 'obv']
+                r_lo_obv = right.loc[right['close'].idxmin(), 'obv']
+                if r_lo < l_lo * 0.995 and r_lo_obv > l_lo_obv * 1.01:
+                    diver_obv.iloc[i - 1] = '底背离'
+
+        df['macd_divergence'] = diver_macd
+        df['macd_bar_divergence'] = diver_bar
+        df['obv_divergence'] = diver_obv
         return df
 
     @staticmethod

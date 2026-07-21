@@ -31,11 +31,114 @@ from storage.sqlite.stock_storage import get_db
 from utils.config import load_config
 from utils.logger import logger
 
+def _convert_to_feishu_markdown(text: str) -> str:
+    """
+    将标准 Markdown 转换为飞书友好格式：
+    1. 表格：确保每行列数一致，补充缺失的列，添加表头分隔行
+    2. 加粗：确保 **text** 格式正确
+    3. 标题：## 转成飞书支持的格式
+    4. 列表：优化嵌套列表显示
+    5. 代码块：添加语言标记
+    """
+    lines = text.split("\n")
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        
+        if line.startswith("|") and line.endswith("|"):
+            table_lines = [line]
+            i += 1
+            while i < len(lines) and (lines[i].startswith("|") or lines[i].strip().startswith(":--")):
+                table_lines.append(lines[i])
+                i += 1
+            
+            header = table_lines[0]
+            header_cells = [c.strip() for c in header.split("|") if c.strip()]
+            col_count = len(header_cells)
+            
+            has_separator = False
+            for tl in table_lines[1:]:
+                if tl.strip().startswith(":--") or tl.strip().startswith("---"):
+                    has_separator = True
+                    break
+            
+            if not has_separator and len(table_lines) > 1:
+                separator = "| " + " | ".join(["---"] * col_count) + " |"
+                table_lines.insert(1, separator)
+            
+            for j, tl in enumerate(table_lines):
+                cells = [c.strip() for c in tl.split("|") if c.strip()]
+                if len(cells) < col_count:
+                    cells += ["-"] * (col_count - len(cells))
+                elif len(cells) > col_count:
+                    cells = cells[:col_count]
+                table_lines[j] = "| " + " | ".join(cells) + " |"
+            
+            result.extend(table_lines)
+            if i < len(lines):
+                result.append("")
+            continue
+        
+        if line.startswith("## "):
+            result.append(line.replace("## ", "**## ").replace("## 📌", "**## 📌") + "**")
+            result.append("---")
+            i += 1
+            continue
+        
+        if line.startswith("### "):
+            result.append(line.replace("### ", "**### ") + "**")
+            i += 1
+            continue
+        
+        if line.startswith("- **"):
+            result.append(line.replace("- **", "• **"))
+            i += 1
+            continue
+        
+        if line.startswith("**") and ":" in line:
+            result.append(line)
+            i += 1
+            continue
+        
+        if "|" in line and not line.startswith("|") and not line.startswith("```"):
+            parts = line.split("|")
+            if len(parts) >= 3:
+                padded = []
+                for p in parts:
+                    padded.append(p.ljust(12)[:12])
+                result.append("  ".join(padded))
+                i += 1
+                continue
+        
+        if line.startswith("```"):
+            code_block = [line]
+            i += 1
+            while i < len(lines) and not lines[i].startswith("```"):
+                code_block.append(lines[i])
+                i += 1
+            if i < len(lines):
+                code_block.append(lines[i])
+                i += 1
+            if len(code_block) > 2 and not code_block[0].strip() == "```":
+                code_block[0] = "```text"
+            result.extend(code_block)
+            continue
+        
+        result.append(line)
+        i += 1
+    
+    return "\n".join(result)
+
+
 def split_report(text: str, limit: int = 4000) -> list:
     """
     长报告切分：优先在 ##/### 标题边界断段，段内超限再按行边界硬切，
     绝不在表格行/句子中间截断。返回切好的段列表。
+    输出前先转换为飞书友好格式。
     """
+    text = _convert_to_feishu_markdown(text)
+    
     if len(text) <= limit:
         return [text]
     parts, buf = [], ""

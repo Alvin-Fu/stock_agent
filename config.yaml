@@ -68,8 +68,8 @@ agents:
     model: "deepseek-v4-flash"
     temperature: 0.1
   # 示例：让报告生成表达更自然、路由换更便宜的模型（按需取消注释）
-  # responder:
-  #   temperature: 0.3
+  responder:
+    max_tokens: 16384     # 个股分析报告需覆盖10+章节，8192常截断导致「未覆盖」
   # router:
   #   model: "deepseek-v4-flash"
   # technical:

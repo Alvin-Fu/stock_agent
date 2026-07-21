@@ -12,6 +12,7 @@ import re
 from typing import List, Optional
 
 from utils.logger import logger
+from utils.retry_utils import retry_with_backoff
 
 
 def _latest_close(code: str) -> Optional[float]:
@@ -80,27 +81,34 @@ def fetch_profit_forecast_text(code: str, name: str = "") -> str:
     try:
         import akshare as ak
         df = None
+
+        def _fetch_one(fname, kwargs):
+            fn = getattr(ak, fname, None)
+            if fn is None:
+                raise ValueError(f"函数 {fname} 不存在")
+            result = fn(**kwargs)
+            if result is None or getattr(result, "empty", True):
+                raise ValueError("返回空数据")
+            return result
+
         for fname, kwargs in (
                 ("stock_profit_forecast_em", {"symbol": code}),
                 ("stock_profit_forecast_ths", {"symbol": code}),
                 ("stock_profit_forecast", {})):
-            fn = getattr(ak, fname, None)
-            if fn is None:
-                continue
             try:
-                df = fn(**kwargs)
-                if df is not None and not df.empty:
-                    # 全市场表时按代码过滤
+                raw_df = retry_with_backoff(_fetch_one, max_retries=2, fname=fname, kwargs=kwargs)
+                if raw_df is not None and not getattr(raw_df, "empty", True):
+                    df = raw_df.copy()
                     for col in ("代码", "股票代码"):
-                        if col in df.columns:
+                        if col in getattr(df, "columns", []):
                             df = df[df[col].astype(str).str.contains(code)]
                             break
-                    if not df.empty:
+                    if not getattr(df, "empty", True):
                         break
             except Exception as e:
                 logger.warning(f"[盈利预测] {fname} 失败: {e}")
                 df = None
-        if df is None or df.empty:
+        if df is None or getattr(df, "empty", True):
             report_source("机构盈利预测", False, "各接口均无数据")
             return ""
         report_source("机构盈利预测", True)

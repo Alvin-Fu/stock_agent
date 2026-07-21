@@ -235,7 +235,7 @@ class AkshareFetcher(BaseFetcher):
     name = "AkshareFetcher"
     priority = 1
     
-    def __init__(self, sleep_min: float = 10.0, sleep_max: float = 50.0):
+    def __init__(self, sleep_min: float = 2.0, sleep_max: float = 8.0):
         """
         初始化 AkshareFetcher
         

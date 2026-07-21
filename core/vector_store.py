@@ -1,4 +1,7 @@
 # core/vector_store.py
+import subprocess
+import time
+
 from utils.config import load_config
 from utils.logger import logger
 
@@ -11,28 +14,85 @@ def _get_chroma_server_cfg():
     return cfg
 
 
+def _ensure_chroma_running() -> bool:
+    """
+    检查 Chroma 服务是否可连接，若不可用尝试自动启动 Docker 容器。
+    返回 True=连接成功, False=连接失败（调用方决定跳过或 raise）。
+    """
+    server_cfg = _get_chroma_server_cfg()
+    host = server_cfg["host"]
+    port = server_cfg["port"]
+
+    # 先尝试连接
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    try:
+        result = sock.connect_ex((host, port))
+        sock.close()
+        if result == 0:
+            return True  # 服务已在运行
+    except Exception:
+        pass
+    finally:
+        sock.close()
+
+    # 连接失败，尝试启动 Docker 容器
+    logger.info("Chroma 服务未响应，尝试自动启动 Docker 容器...")
+    try:
+        # 检查容器是否存在（可能 stopped）
+        inspect = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Status}}", "chromadb"],
+            capture_output=True, text=True, timeout=5
+        )
+        status = inspect.stdout.strip()
+        if status == "exited" or status == "created":
+            subprocess.run(["docker", "start", "chromadb"], capture_output=True, timeout=10)
+            logger.info("已执行 docker start chromadb，等待服务就绪...")
+            time.sleep(3)
+            # 再次确认
+            sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock2.settimeout(3)
+            try:
+                r2 = sock2.connect_ex((host, port))
+                sock2.close()
+                if r2 == 0:
+                    logger.info("✅ Chroma 容器已自动启动")
+                    return True
+            except Exception:
+                sock2.close()
+        elif status == "running":
+            logger.warning("Chroma 容器状态为 running 但端口不可达，可能容器内服务未就绪")
+        else:
+            logger.warning(f"Chroma 容器状态异常: {status}")
+    except FileNotFoundError:
+        logger.warning("Docker 命令不可用，无法自动启动 Chroma")
+    except Exception as e:
+        logger.warning(f"自动启动 Chroma 失败: {e}")
+
+    return False
+
+
 def get_remote_chroma_client(collection_name: str, embedding_function):
     """
-    底层工具：连接 Docker 上的远程 Chroma 服务
+    底层工具：连接 Docker 上的远程 Chroma 服务。
+    自动检测服务状态，若未运行则尝试 docker start chromadb。
     :param collection_name: 知识库唯一集合名（多知识库隔离）
     :param embedding_function: 向量模型（get_embeddings）
-    :return: Chroma 客户端实例
+    :return: Chroma 客户端实例，连接失败返回 None
     """
+    if not _ensure_chroma_running():
+        logger.warning("Chroma 服务不可用，跳过向量存储连接")
+        return None
+
     try:
-        # 延迟导入：未安装 langchain-chroma 时不影响纯分析链路的 import
         from langchain_chroma import Chroma
         server_cfg = _get_chroma_server_cfg()
-        # 🔥 关键：远程连接 Docker Chroma（无本地路径，只用IP+端口）
         chroma_client = Chroma(
-            # Docker Chroma 连接信息
             host=server_cfg["host"],
             port=server_cfg["port"],
             ssl=server_cfg.get("ssl", False),
-
-            # 多知识库 = 不同集合（完全隔离）
             collection_name=collection_name,
-
-            # 向量模型
             embedding_function=embedding_function
         )
         logger.info(f"✅ 成功连接远程 Chroma | 集合：{collection_name}")
@@ -40,7 +100,7 @@ def get_remote_chroma_client(collection_name: str, embedding_function):
 
     except Exception as e:
         logger.error(f"❌ 连接 Chroma 失败：{str(e)}")
-        raise ConnectionError("请检查 Docker Chroma 是否启动！")
+        return None
 
 
 

@@ -10,7 +10,7 @@
 """
 
 import re
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 from utils.logger import logger
 
@@ -41,6 +41,36 @@ _STOCK_SECTIONS = [
     ("操作参考与情景推演", ["操作参考", "情景推演", "交易计划", "操作建议", "买卖建议"]),
     ("分析局限性说明", ["分析局限性", "局限", "风险提示", "免责"]),
 ]
+
+# ======================== 个股分析局限性四级分类 ========================
+# 用于自动给报告结尾的"分析局限性说明"增加分类标签
+
+_LIMITATION_CATEGORIES = {
+    "财务数据滞后": ["季报", "年报", "财报截止", "滞后", "未披露", "最新财报"],
+    "机构预测偏差": ["机构预期", "一致预期", "预测", "盈利预测", "目标价"],
+    "关键数据缺失": ["信息不足", "未提供", "数据缺失", "暂无数据", "未获取", "未找到", "未覆盖"],
+    "技术指标局限": ["技术分析", "K线", "历史胜率", "信号", "回测"],
+}
+
+
+def _categorize_limitations(text: str) -> str:
+    """对分析局限性说明进行四级分类，返回分类标签文本"""
+    if not text or len(text) < 20:
+        return text
+
+    matched = []
+    for category, keywords in _LIMITATION_CATEGORIES.items():
+        for kw in keywords:
+            if kw in text:
+                matched.append(category)
+                break
+
+    if matched:
+        tags = " | ".join(f"⚠️ {c}" for c in matched)
+        return text + f"\n\n> **局限性分类**：{tags}"
+
+    return text
+
 
 # ======================== 产业链预期维度 ========================
 
@@ -169,24 +199,131 @@ def format_stock_report(text: str) -> str:
     assignments = {}
 
     for heading, content in sections:
+        # 兜底：空标题段（「##」之前的导语）包含「📌 结论」时归入结论
         idx = _find_section(heading, _STOCK_SECTIONS)
+        if idx < 0 and not heading.strip():
+            # 检查内容是否以结论骨架开头
+            stripped = content.strip()
+            if stripped.startswith("📌") or stripped.startswith("**方向**"):
+                idx = 0  # 结论
         if idx >= 0:
             if idx not in assignments or len(content) > len(assignments[idx][1]):
                 assignments[idx] = (heading, content)
 
-    output = []
+    # 最后，对"分析局限性说明"增加分类标签
     for idx, (expected_name, _) in enumerate(_STOCK_SECTIONS):
         if idx in assignments:
             _, content = assignments[idx]
-            output.append(_format_section(expected_name, content))
+            if len(content.strip()) <= _MIN_CONTENT_CHARS:
+                output.append(f"## {expected_name}\n\n{MSG_MISSING_SECTION}")
+            else:
+                if idx == len(_STOCK_SECTIONS) - 1:  # 分析局限性说明 是最后一章
+                    content = _categorize_limitations(content)
+                output.append(_format_section(expected_name, content))
         else:
             output.append(f"## {expected_name}\n\n{MSG_MISSING_SECTION}")
 
     return "\n\n".join(output)
 
 
+def _has_proper_table(content: str, min_rows: int = 3) -> bool:
+    """检测内容中是否包含有效表格（至少 min_rows 行管道符/空格分隔行）"""
+    lines = content.split("\n")
+    table_rows = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|"):
+            table_rows += 1
+        elif "|" in stripped and re.search(r"\d", stripped):
+            table_rows += 1
+    return table_rows >= min_rows
+
+
+def _extract_chain_companies(text: str) -> List[Dict[str, str]]:
+    """从产业链报告文本中提取候选公司列表"""
+    companies = []
+    # 尝试匹配 JSON 候选
+    import json
+    json_match = re.search(r'"candidates"\s*:\s*\[.*?\]', text, re.DOTALL)
+    if json_match:
+        try:
+            raw = "{" + json_match.group(0) + "}"
+            data = json.loads(raw)
+            for c in data.get("candidates", []):
+                code = c.get("code", "")
+                name = c.get("name", "")
+                companies.append({"code": code, "name": name,
+                                  "business": c.get("business"),
+                                  "moat": c.get("moat"),
+                                  "momentum": c.get("momentum")})
+        except Exception:
+            pass
+
+    # 没有 JSON 或解析失败时从表格行提取
+    if not companies:
+        lines = text.split("\n")
+        for line in lines:
+            # 匹配 "公司名(代码)" 或 "代码" 模式
+            m = re.search(r'\|[^|]*?([\u4e00-\u9fa5]{2,6}?)[（(](6\d{5}|3\d{5}|0\d{5})[）)]', line)
+            if m:
+                companies.append({"code": m.group(2), "name": m.group(1)})
+    return companies
+
+
+def _build_panorama_table(text: str, fallback: str = "") -> str:
+    """构建产业链全景分层表格"""
+    companies = _extract_chain_companies(text)
+    if not companies:
+        return fallback if fallback else MSG_MISSING_SECTION
+
+    # 尝试从报告中提取环节归属信息
+    lines = text.split("\n")
+    upstream_names, midstream_names, downstream_names, niche_names = [], [], [], []
+    current_level = None
+    for line in lines:
+        ll = line.strip().lower()
+        if "上游" in ll and ("###" in ll or "##" in ll or "环节" in ll or "上游" == ll[:2]):
+            current_level = "upstream"
+        elif "中游" in ll and ("###" in ll or "##" in ll or "环节" in ll or "中游" == ll[:2]):
+            current_level = "midstream"
+        elif "下游" in ll and ("###" in ll or "##" in ll or "环节" in ll or "下游" == ll[:2]):
+            current_level = "downstream"
+        elif "特精专新" in ll or "隐形冠军" in ll or "专精特新" in ll:
+            current_level = "niche"
+
+    # 按候选公司 JSON 顺序对齐环节（实际场景下从 LLM 输出难以完美拆解，这里做简化处理）
+    table_parts = ["| 产业链环节 | 细分领域 | 公司名称 | 股票代码 | 核心业务 | 资金偏好 |",
+                   "|-----------|---------|---------|---------|---------|---------|"]
+    for c in companies[:15]:
+        cell_name = c.get("name", "")
+        cell_code = c.get("code", "")
+        table_parts.append(f"| - | - | {cell_name} | {cell_code} | - | - |")
+
+    return "\n".join(table_parts)
+
+
+def _build_candidate_table(text: str, candidate_json: str = "") -> str:
+    """构建候选公司完整打分明细总表"""
+    companies = _extract_chain_companies(text)
+    if not companies:
+        return MSG_MISSING_SECTION
+
+    table_parts = [
+        "| 排名 | 公司名称 | 股票代码 | 赛道归属 | 业务分 | 基本面分 | 护城河分 | 边际变化分 | 调整后总分 | PE历史分位 | 拥挤度标签 |",
+        "|-----|---------|---------|---------|-------|---------|---------|----------|----------|----------|----------|",
+    ]
+    for i, c in enumerate(companies[:15], 1):
+        bus = c.get("business", "-")
+        moat = c.get("moat", "-")
+        mom = c.get("momentum", "-")
+        table_parts.append(
+            f"| {i} | {c.get('name', '-')} | {c.get('code', '-')} | - | {bus} | - | {moat} | {mom} | - | - | - |"
+        )
+    return "\n".join(table_parts)
+
+
 def format_industry_report(text: str) -> str:
-    """产业链报告后处理：查缺、重排、补占位"""
+    """产业链报告后处理：查缺、重排、补占位，确保两大核心表格存在"""
     if not text or len(text.strip()) < 20:
         return text
 
@@ -199,11 +336,33 @@ def format_industry_report(text: str) -> str:
             if idx not in assignments or len(content) > len(assignments[idx][1]):
                 assignments[idx] = (heading, content)
 
+    # 检测产业链全景表格（idx=1）和候选公司明细表（idx=3）
+    _PANORAMA_IDX = 1  # 产业链全景图
+    _CANDIDATE_IDX = 3  # 候选公司
+
+    if _PANORAMA_IDX in assignments:
+        _, content = assignments[_PANORAMA_IDX]
+        if len(content.strip()) <= _MIN_CONTENT_CHARS or not _has_proper_table(content):
+            # 尝试自动构建全景表格
+            panorama = _build_panorama_table(text)
+            if panorama and panorama != MSG_MISSING_SECTION:
+                assignments[_PANORAMA_IDX] = ("", f"以下为程序自动整理的产业链全景分层表：\n\n{panorama}")
+
+    if _CANDIDATE_IDX in assignments:
+        _, content = assignments[_CANDIDATE_IDX]
+        if len(content.strip()) <= _MIN_CONTENT_CHARS or not _has_proper_table(content):
+            candidate_table = _build_candidate_table(text)
+            if candidate_table and candidate_table != MSG_MISSING_SECTION:
+                assignments[_CANDIDATE_IDX] = ("", f"以下为程序整理的候选公司完整打分明细总表（综合排名由程序按阶段权重计算）：\n\n{candidate_table}")
+
     output = []
     for idx, (expected_name, _) in enumerate(_INDUSTRY_SECTIONS):
         if idx in assignments:
             _, content = assignments[idx]
-            output.append(_format_section(expected_name, content))
+            if len(content.strip()) <= _MIN_CONTENT_CHARS:
+                output.append(f"## {expected_name}\n\n{MSG_MISSING_SECTION}")
+            else:
+                output.append(_format_section(expected_name, content))
         else:
             output.append(f"## {expected_name}\n\n{MSG_MISSING_SECTION}")
 

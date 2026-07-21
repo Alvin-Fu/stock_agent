@@ -40,6 +40,8 @@ class MonitorScheduler:
         self.review_after_days = int(cfg.get("review_after_days", 5))
         self.industry_review_after_days = int(cfg.get("industry_review_after_days", 10))
         self.review_time = str(cfg.get("review_time", "15:40"))
+        self.pre_market_time = str(cfg.get("pre_market_time", "09:00"))
+        self.post_market_time = str(cfg.get("post_market_time", "19:30"))
         self.golden_enabled = bool(cfg.get("golden_enabled", True))
         self.golden_day = str(cfg.get("golden_day", "saturday")).lower()
         self.golden_time = str(cfg.get("golden_time", "09:00"))
@@ -103,6 +105,13 @@ class MonitorScheduler:
                 logger.info("低位价值发现扫描完成")
         except Exception as e:
             logger.error(f"低位价值发现扫描失败: {e}")
+        # 大盘估值快照
+        try:
+            val_text = self._fetch_market_valuation()
+            if val_text:
+                self.notifier.send(f"📈 **大盘估值快照**\n\n{val_text}")
+        except Exception as e:
+            logger.debug(f"大盘估值快照跳过: {e}")
 
     def _run_news_scan(self):
         hour = datetime.now().hour
@@ -120,6 +129,32 @@ class MonitorScheduler:
             self.review_runner.run_due_reviews(self.review_after_days, self.industry_review_after_days)
         except Exception as e:
             logger.error(f"[复盘] 定时复盘异常: {e}")
+
+    def _run_macro_analysis(self, session: str = "pre"):
+        """拉取大盘宏观数据快照并推送飞书"""
+        if not _is_weekday():
+            return
+        label = "开盘前" if session == "pre" else "收盘后"
+        try:
+            from .macro_watcher import fetch_macro_snapshot
+            text = fetch_macro_snapshot(session=session)
+            self.notifier.send(f"🏛 **大盘宏观数据快照（{label}）**\n\n{text[:6000]}")
+            logger.info(f"[宏观] {label}宏观分析推送完成")
+        except Exception as e:
+            logger.error(f"[宏观] {label}宏观分析异常: {e}")
+
+    @staticmethod
+    def _fetch_market_valuation() -> str:
+        """获取大盘估值快照文本（上证50/中证500 PE/PB + 沪深300 K线均线），用于盘后推送"""
+        from tools.market_context import _fetch_valuation_text, _fetch_index_kline_text
+        parts = []
+        val = _fetch_valuation_text()
+        if val:
+            parts.append(val)
+        kline = _fetch_index_kline_text()
+        if kline:
+            parts.append(f"沪深300K线:\n{kline}")
+        return "\n\n".join(parts) if parts else ""
 
     def _run_early_scout(self):
         """周六早期信号巡逻：扫描热门行业 → 选低位企稳的 → 自动深度分析 → 保存触发条件"""
@@ -201,6 +236,8 @@ class MonitorScheduler:
         self._schedule.every().day.at(self.signal_scan_time).do(self._run_signal_scan)
         self._schedule.every(self.news_interval).minutes.do(self._run_news_scan)
         self._schedule.every().day.at(self.review_time).do(self._run_reviews)
+        self._schedule.every().day.at(self.pre_market_time).do(self._run_macro_analysis, session="pre")
+        self._schedule.every().day.at(self.post_market_time).do(self._run_macro_analysis, session="post")
         self._schedule.every().day.at("22:30").do(self._run_backup)
         if self.golden_enabled:
             day_job = getattr(self._schedule.every(), self.golden_day, None)

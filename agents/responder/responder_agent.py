@@ -4,8 +4,9 @@
 （免责声明与合规修订由其后的 compliance 节点负责）
 """
 
+import traceback
 from datetime import date
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from agents.base import AgentState
@@ -23,12 +24,13 @@ _COMMON_RULES = """你是一位专业的财经顾问，请根据提供的资料�
 
 【回答要求】
 1. 语言专业、清晰、简洁
-2. 数据来源只允许使用以下表述（封闭枚举，禁止发明"业务数据"等新来源名）：
-   {source_enum}
-   （产销快报/定期报告等公告原文的数字用「根据公司公告」）；
-   不要编造更具体的来源（如具体研报名、公告编号），参考资料里没有就不写；
-   销量数字若材料中标注来自产销快报公告，必须优先引用且标「根据公司公告」，
-   禁止用搜索转述的销量数字覆盖公告数字
+2. 数据来源标注必须用以下封闭枚举（禁止发明新来源名），每个精确数字必须标注来源：
+   - 公司公告/财报原文 → **[财报]**
+   - 程序计算结果（PE分位/技术指标/交易计划等） → **[程序]**
+   - 券商/机构研报 → **[研报来源]**
+   - 网络公开数据（新闻/自媒体/行业平台） → **[公开数据]**
+   禁止：无出处的精确数字、禁止编造更具体的来源（如具体研报名、公告编号）；
+   销量数字若材料中标注来自产销快报公告，必须优先引用且标**[财报]**
 3. 如资料不足，请诚实说明缺失，禁止用"缺乏数据，但…"这类没有信息量的凑数表述
 4. 每个定性结论必须与数据一致，禁止套用与数据矛盾的模板化说法
    （例如：均价上涨时不得写"以价换量"）
@@ -53,61 +55,102 @@ _COMMON_RULES = """你是一位专业的财经顾问，请根据提供的资料�
      自相矛盾的句式，改写为"程序判定不介入（附原因，如盈亏比X不足1.5），
      回踩观察位XX～XX再重估"——观察位是重估条件，不是买入区
    - 没有程序计算的操作参考时，不得自行编造买卖点位和仓位建议
-8. 使用 Markdown 格式提升可读性，结构化输出：标题、列表、表格
-9. **报告必须以「📌 结论」开头**，按固定骨架逐行填空——行名固定、不许省略行，
-   没有对应材料的行填"无数据"（填空的遵守率远高于自由发挥）：
+8. 必须用 `##` Markdown 二级标题组织章节（格式：`## 📌 结论`、`## 公司概况与业务拆解`），
+   每个独立章节都必须有且仅有一个 `##` 标题行，禁止用 `###` 或加粗代替章节标题；
+   章节标题名必须精确使用个股/ETF/产业链规则中指定的标题（如个股必须写
+   `## 公司概况与业务拆解`，不能写成 `## 业务拆解`），否则章节会被程序漏检
+9. **报告必须以「## 📌 结论」标题开头**（`##` 后空一格再写 `📌 结论`），
+   结论卡必须压缩为**5行以内**，格式如下（行名固定、不许省略）：
    - **方向**：观望/回避/可考虑介入 +（一句话理由）
    - **操作**：程序数字（介入区或观察位/止损/目标/仓位）；程序判定不介入时写
      "不介入（原因，如盈亏比X不足1.5），回踩观察位XX～XX再重估"
-   - **核心逻辑**：一句话，必须含关键数字
-   - **最大风险**：一句话
+   - **核心逻辑**：一句话，必须含关键数字（如"2026Q1净利-55.38%，连续4季加速下滑"）
+   - **最大风险**：一句话（如"欧盟关税落地-30~50亿"）
+   - **等待信号**：满足可重新评估的具体条件（如"7月产销同比转正/中报降幅收窄/突破97.1"）
    （个股/产业链模式在各自规则里追加骨架行）详细分析放在结论之后
 
 {style_rules}
 - 分地区/分业务占比这类非主表数字还必须带来源（季报通常不披露分地区收入，
-  这类数字多来自研报转述，标「根据网络研究信息」）"""
+  这类数字多来自研报转述，标「根据网络研究信息」）
+
+【输出精简规则（严格执行）】
+1. 禁止在报告正文中写入系统内部运行统计（如"近N次方向判断命中率X%"、"历史成绩单"）；
+   但必须在「分析局限性说明」中提及模型容错率（如"本模型历史方向判断命中率约50%，结论因此偏保守"）
+2. 禁止写入中性/零信息含量的陈述（如"未来3个月无大额解禁"→没有解禁压力不是利好；
+   只有存在大额解禁时才写入风险小节；同理"无重大公告"、"无特殊事项"等一律跳过）
+3. 时序数据（季度营收/利润/销量等）禁止逐期罗列所有数字——只写结论：
+   "连续4个季度净利润同比下滑，降幅从-5%扩大至-15%；营收由+3%转负至-8%"
+   必要时只列首尾两个对比数字，不铺陈全序列
+4. 产品/车型/客户等明细清单禁止逐项罗列——只写结论汇总：
+   "销量主力为XX价位段产品，高端品牌占比Y%偏低"；不写"XX型号售出A台，YY型号售出B台"
+5. 行情描述（大盘/板块/alpha/beta分析）不超过3行结论，不展开过时走势复盘"""
 
 _STOCK_RULES = """
 【个股类问题的额外结构要求】
-- 「📌 结论」骨架追加两行（行名固定）：
-  - **护城河**：高/中/低 +（一句话依据，引用研究材料）——评级「低」时方向必须相应保守
+- 「📌 结论」骨架追加行（行名固定）：
   - **大盘环境**：顺风/中性/逆风（程序判定；材料没有就填"无数据"）
+- 报告章节标题必须严格按以下顺序和措辞使用 `##` 标题（禁止自行发明标题名）：
+   `## 📌 结论` → `## 公司概况与业务拆解` → `## 财务分析` → `## 护城河` →
+   `## 利润驱动与飞轮` → `## 大盘与筹码` → `## 关键支撑压力位` →
+   `## 估值` → `## 操作参考与情景推演` → `## 分析局限性说明`
 - 估值表述有 PEG 数据时必须引用（注明 trailing 口径，增速为负时写"PEG 不适用"）
+- 估值分位**必须同时给出3年/5年/10年三个窗口**（如：PE(TTM) XX倍，3年分位84%（偏贵）/5年分位50%（中位）/10年分位33%（长周期偏低）），
+  禁止只写单一窗口 cherry-pick 结论；各窗口矛盾时必须点破成因（如"盈利下滑被动抬高PE"）；
+  材料中缺少某个窗口的分位数时标注"数据不足"，不可自行编造
+- 估值一节**必须包含PS(TTM)历史分位**（3年/5年/10年），与PE/PB形成三维交叉验证
+- PE分位与PB分位背离时必须专门解读：
+  "PE/PB背离的核心矛盾：盈利下滑被动抬高PE，但资产端已处历史底部——"PE悬顶、PB托底"是当下估值辩证的完整表述"
 - 报告须包含「利润驱动与飞轮」一节，分三层表述：
   当前驱动（引用主营构成的收入/利润占比与毛利率数字）→
   第二曲线（正在放量的业务，须有占比提升或销量/订单数据佐证）→
-  远期期权（逐项标注证据强度：已投产/在建/公告立项/仅高管表态，无公开证据不写）
-- 飞轮效应有材料支撑才写传导链条；材料说"未见明显飞轮"就如实呈现，禁止强行升华
+  远期期权（公司公开布局但尚未贡献利润的方向，**用表格格式**：
+  方向 | 证据强度（已投产/在建/公告立项/仅高管表态）| 预计兑现时间
+  每行一个方向，禁止展开大段文字描述；无公开证据的方向不列入）
+- 「利润驱动与飞轮」中必须包含**业绩持续性判断**子节：对每项增长驱动力
+  区分是**一次性脉冲**（大客户集采/补贴抢装/低基数/资产处置等）还是
+  **持续性增长**（渗透率提升/客户覆盖面扩大/复购率高/产能有序释放等），
+  综合判断可持续利润占比；分析材料中未明确则写"材料不足以判断持续性"
+- 飞轮效应必须做双向判断：既有正向协同链条（如成本共享、渠道复用），也要列出反向约束（如低端降价损伤高端品牌、业务冲突）；材料说"未见明显飞轮"就如实呈现，禁止强行升华
 - 报告须包含「股东筹码与事件日历」一节：减持/增持/解禁/回购公告、股东户数变化、
   临近的除权除息与解禁日——材料里有必须列出（解禁减持是确定性抛压，必须进风险）；
   材料里没有该块就写"本次未获取到股东筹码数据"
 - 报告须包含「关键支撑压力位」一节：引用程序计算的关键位（支撑由近及远/压力由近及远）
   的具体价位与强度依据，结合均线/BOLL位给出多空分水岭判断；程序未计算时写
   "本次未获取到程序关键位数据（参考均线支撑/压力）"并自行从 K 线数据读出近期高低点
-- 估值一节的次序：先同行对比（相对贵贱）→ 再历史分位与 PEG →
-  材料提供了分部估值（SOTP）计算时引用其区间结论并保留"极粗略参考，非目标价"标注；
-  材料没做 SOTP 时禁止自行拼分部估值
-- 估值分位必须带窗口：材料里的分位数标注了统计窗口（如"近729个交易日"），
-  引用时必须保留（写作"近3年分位"），禁止只写"历史XX%分位"——
-  读者会误解为上市以来，PB 低分位的解读方向会整个被质疑
+- 若技术分析材料包含**多周期技术打分表**（均线排列/MACD/动量量价/支撑压力等维度
+  的0-10分项及综合总分），必须在「关键支撑压力位」小节之后**以表格形式原样呈现**，
+  保留各维度得分和综合总分（日线×0.5+周线×0.3+月线×0.2），
+  并附带技术入场阈值说明：综合分≥7.5为强势入场区间、6.0~7.5为中性区间、<6.0为谨慎区间；
+  不得省略或仅文字转述——打分表提供了标准化可对比的技术质量判断，是完整性硬要求；
+  材料中没有打分表则写"本次未获取到程序技术打分数据"
+- 估值一节的次序：先同行对比（相对贵贱）→ 再历史分位多窗口（含PS）与PEG →
+  材料提供了分部估值（SOTP）计算结果时，压缩为一句区间结论（如"SOTP每股内在价值XX-XX元"），
+  不展开估值假设讨论；材料没做 SOTP 时禁止自行拼分部估值
 - 财务材料含现金流数据（经营现金流/净现比/资本开支）时，报告必须保留「现金流质量」
   小节——净现比同比（同期对比）、经营现金流与利润的匹配度、资本开支强度；
   这一节漏掉等于把利润质量的核心证据丢了
-- 自由现金流只能引用材料中标注"程序计算"的 FCF 值，并同时给出经营现金流与
-  资本开支两个数；材料未给程序计算值时写"无法计算（缺资本开支数据）"，
+- 自由现金流：材料有程序计算的 FCF 值则引用，同时给出经营现金流与资本开支两个数；
+  材料未给程序计算值时，统一移至【分析局限性说明】中标注"缺资本开支数据"，正文不展开；
   **禁止自行心算 FCF**（实测心算错过一倍）；禁止让 FCF 和投资活动净额并排出现
   而不解释口径差异（投资净额含理财赎回等回流，读者手算对不上账）
 - 报告须包含「情景推演」一节：乐观/基准/悲观三情景表格
-  （情景 | 触发条件（可验证指标/事件） | 传导路径 | 应对纪律），
+  （情景 | 触发条件（可验证指标/事件） | 净利润区间（亿元）| 传导路径 | 应对纪律），
+  每个情景必须给出**具体净利润量化区间**（如悲观情景250亿以下、基准情景320-350亿、乐观情景380亿以上），
   应对纪律只能引用程序操作参考的数字（悲观触发→按止损纪律位执行；
   乐观确认→参照观察区/目标位重新评估）；可能性只用高/中/低，标注"推演非预测"
 - 操作结论为"不介入/观望"时，悲观情景的应对纪律禁止写"跌破XX无条件离场"这类
   持仓化措辞（0仓位无从离场），应写"若已持仓，跌破XX离场；未持仓维持不介入"
 - 结论与情景推演中出现的每个关键价位（观察位/止损位/支撑压力位/目标参考位）
-  都必须标注来源——"程序计算"或材料出处，全文标注口径一致，禁止一处标一处不标
+  都必须标注来源——"[程序]"或材料出处，全文标注口径一致，禁止一处标一处不标
 - 材料含「重估触发条件」时必须原样列出，并说明加入监控后系统自动盯梢、命中会推送；
   方向结论为"观望/回避"时必须带上"等什么"——引用触发条件或观察区价位，
-  禁止给没有后续动作的死结论"""
+  禁止给没有后续动作的死结论
+- 海外出口数据（如"海外收入占比43.5%"）必须标注统计口径：按出口量/总产量（含渠道库存与在途）
+  还是终端交付口径，禁止只说"海外收入占比"；口径出处来自研究材料，材料未说明则写"统计口径待确认"
+- 「分析局限性说明」中必须增加：
+  ① 模型历史方向判断命中率约50%，结论因此偏保守
+  ② 机构预测与实际的预期差风险（如"机构2026年EPS预测4.54元隐含全年净利润约413亿，
+     但Q1实际仅40.85亿，后三季度需环比Q1增长200%+方能兑现"）"""
 
 _ETF_RULES = """
 【ETF 类问题的额外结构要求】
@@ -128,6 +171,10 @@ _ETF_RULES = """
 
 _INDUSTRY_RULES = """
 【产业链/行业类问题的额外结构要求】
+- 报告章节标题必须严格按以下顺序和措辞使用 `##` 标题（禁止自行发明标题名）：
+   `## 📌 结论` → `## 产业链全景图` → `## 关键环节` → `## 候选公司` →
+   `## 行业趋势` → `## 环节利润迁移判断` → `## 投资建议` → `## 行业风险` →
+   `## 分析局限性说明`
 - 必须保留产业链分层全景：按上游/中游/下游/特精专新分节，每节用表格列出
   环节内全部候选公司（代码/核心业务/综合排名），不得把结构压扁成公司罗列；
   资金/机构动向只在有公开证据（北向/龙虎榜/机构调研）时标注并写出处，无证据不填；
@@ -196,18 +243,46 @@ class ResponderAgent:
                      industry_name: str, raw_answer: str,
                      research_result: dict) -> str:
         """构建报告标题行：标的身份标识"""
-        # ETF：优先从回答提取名称，否则用代码
+        # ETF：优先从行情数据取名称，再试研究摘要，最后从 LLM 输出解析
         if stock_type == "etf":
+            # 方法1：从行情数据查名称（最可靠）
+            try:
+                from tools.etf_tools import fetch_etf_spot
+                spot = fetch_etf_spot(code)
+                spot_name = spot.get("名称", "").strip() if spot else ""
+                if spot_name:
+                    return f"{spot_name}({code})"
+            except Exception:
+                pass
+
+            # 方法2：从 research_result 摘要中提取 ETF 名称
+            try:
+                summary = (research_result or {}).get("summary", "") or ""
+                for line in summary.split("\n")[:10]:
+                    line = line.strip().strip("#").strip()
+                    if "ETF" in line and len(line) > 4:
+                        # 去掉括号里的代码
+                        import re
+                        clean = re.sub(r'[（(].*?[）)]', '', line).strip()
+                        if clean:
+                            return f"{clean}({code})"
+            except Exception:
+                pass
+
+            # 方法3：从 raw_answer 开头取第一行有效文本
             name = ""
-            # 从 raw_answer 开头提取 ETF 名称
-            for line in raw_answer.split("\n")[:3]:
+            for line in raw_answer.split("\n")[:5]:
                 line = line.strip().strip("#").strip()
-                if line:
+                if line and not line.startswith("**📌"):
                     name = line
                     break
-            if name:
-                return f"{name}({stock_code})"
-            return f"ETF {stock_code}"
+            if name and len(name) > 2:
+                # 去掉含代码的行尾
+                import re
+                clean = re.sub(r'[（(].*?[）)]', '', name).strip()
+                if clean:
+                    return f"{clean}({code})"
+            return f"ETF {code}"
 
         # 行业/产业链：用 industry_name
         if industry_name or ("," in stock_code):
@@ -219,22 +294,39 @@ class ResponderAgent:
         if not code:
             return ""
 
-        # 尝试从 research_result 取公司名
+        # 方法1（优先）：从数据库/代码映射查公司名（最可靠）
+        try:
+            from tools.company_code_validator import find_company_name
+            looked_up = find_company_name(code)
+            if looked_up:
+                return f"{looked_up}({code})"
+        except Exception:
+            pass
+
+        # 方法2：从回答第一行取（LLM 开头写了名称时用）
         research = research_result or {}
         sources = research.get("sources") or []
         company_name = ""
-
-        # 方法1：从回答第一行取
         for line in raw_answer.split("\n")[:5]:
             stripped = line.strip().strip("#").strip()
             if stripped and len(stripped) > 2:
-                # 跳过 "结论" 这类标题行
-                if stripped not in ("结论", "核心结论", "公司概况与业务拆解"):
-                    company_name = stripped
-                    break
+                # 跳过 📌 标记、结论骨架行、常见章节标题
+                if stripped in ("📌 结论", "结论", "核心结论", "公司概况与业务拆解",
+                                "护城河", "估值", "利润驱动与飞轮", "大盘与筹码",
+                                "关键支撑压力位", "操作参考与情景推演",
+                                "财务分析", "分析局限性说明"):
+                    continue
+                if stripped.startswith("📌"):
+                    continue
+                # 跳过明显不是公司名的行（LLM 意外输出如 "- **方向**：观望..."）
+                if stripped.startswith("-") or stripped.startswith("**"):
+                    continue
+                company_name = stripped
+                break
 
         if company_name:
             return f"{company_name}({code})"
+
         return f"代码 {code}"
 
     def generate_node(self, state: AgentState) -> Dict[str, Any]:
@@ -275,40 +367,55 @@ class ResponderAgent:
                 HumanMessage(content=user_message),
             ]
 
-            response = self.llm.invoke(messages)
-            raw_answer = response.content
+            formatter_mode = self._get_formatter_mode(state)
+            from tools.report_formatter import format_report
+            _MODE_SECTION_COUNT = {"etf": 8, "stock": 10, "industry": 9}
+            expected = _MODE_SECTION_COUNT.get(formatter_mode, 10)
+            MAX_RETRIES = 2
 
-            # 报告格式后处理：内容重排、维度补缺
-            stock_code = state.get("stock_code", "")
-            stock_type = state.get("stock_type", "")
-            industry_name = state.get("industry_name", "")
-            if stock_type == "etf":
-                formatter_mode = "etf"
-            elif industry_name or ("," in stock_code):
-                formatter_mode = "industry"
-            elif stock_code:
-                formatter_mode = "stock"
-            else:
-                formatter_mode = None
+            for attempt in range(MAX_RETRIES + 1):
+                response = self.llm.invoke(messages)
+                raw_answer = response.content
 
-            if formatter_mode:
-                from tools.report_formatter import format_report
-                final_answer = format_report(raw_answer, formatter_mode)
-            else:
-                final_answer = raw_answer
+                # 格式后处理：内容重排、维度补缺
+                if formatter_mode:
+                    final_answer = format_report(raw_answer, formatter_mode)
+                else:
+                    final_answer = raw_answer
 
-            # 标题行：分析标的身份标识（标准格式一致，便于长报告阅读）
-            title = self._build_title(stock_code, stock_type, industry_name,
-                                      raw_answer,
-                                      state.get("research_result") or {})
-            if title:
-                final_answer = f"**{title}**\n\n{final_answer}"
+                # 标题行
+                title = self._build_title(
+                    state.get("stock_code", ""),
+                    state.get("stock_type", ""),
+                    state.get("industry_name", ""),
+                    raw_answer,
+                    state.get("research_result") or {},
+                )
+                if title:
+                    final_answer = f"**{title}**\n\n{final_answer}"
 
-            logger.info(f"回答生成完成（{formatter_mode or '通用'}模式）")
+                # 质量检测：综合评分（章节完整度 + 数据引用 + 风险提示）
+                from tools.report_quality_scorer import assess_report_quality, should_retry, build_retry_hint
+                quality = assess_report_quality(final_answer, formatter_mode)
+                if not should_retry(quality):
+                    logger.info(f"回答生成完成（{formatter_mode or '通用'}模式，质量评分{quality['score']}分，缺失{quality['missing_sections']}/{expected}章）")
+                    return {
+                        "final_answer": final_answer,
+                        "intermediate_steps": [("responder", final_answer[:200])],
+                    }
+                if attempt < MAX_RETRIES:
+                    logger.warning(
+                        f"报告质量评分{quality['score']}分（缺失{quality['missing_sections']}/{expected}章），第{attempt+1}次重试"
+                    )
+                    retry_hint = build_retry_hint(quality)
+                    messages = messages.copy()
+                    messages.append(HumanMessage(content=retry_hint))
 
+            # 重试用尽，返回最后一次的结果并标记质量警告
+            logger.warning(f"报告质量未达标（{quality['score']}分），返回最佳结果")
             return {
                 "final_answer": final_answer,
-                "intermediate_steps": [("responder", final_answer[:200])],
+                "intermediate_steps": [("responder", f"⚠质量警告 质量评分{quality['score']}分 {final_answer[:200]}")],
             }
         except Exception as e:
             logger.error(f"Responder 生成回答失败: {e} {traceback.format_exc()}")
@@ -316,6 +423,20 @@ class ResponderAgent:
                 "final_answer": f"抱歉，生成分析报告时发生了错误：{e}。请稍后重试或检查日志。",
                 "intermediate_steps": [("responder", f"ERROR: {e}")],
             }
+
+    @staticmethod
+    def _get_formatter_mode(state: AgentState) -> Optional[str]:
+        """根据 state 判断格式化模式"""
+        stock_code = state.get("stock_code", "")
+        stock_type = state.get("stock_type", "")
+        industry_name = state.get("industry_name", "")
+        if stock_type == "etf":
+            return "etf"
+        if industry_name or ("," in stock_code):
+            return "industry"
+        if stock_code:
+            return "stock"
+        return None
 
     @staticmethod
     def _format_feedback(stock_code: str, industry_name: str) -> str:
@@ -333,6 +454,14 @@ class ResponderAgent:
                      "涉及的数字/口径必须按纠错内容处理，与数据源冲突时在报告中说明差异而不是沿用旧错）】"]
             for r in records:
                 lines.append(f"· [{str(r['created_at'])[:10]}] {r['content']}")
+            # 追加自动生成的 prompt 优化补丁
+            try:
+                from tools.prompt_optimizer import get_prompt_patch_for_target
+                patch = get_prompt_patch_for_target(code=code, name=name)
+                if patch:
+                    lines.append(f"\n{patch}")
+            except Exception:
+                pass
             return "\n".join(lines)
         except Exception as e:
             logger.warning(f"读取用户纠错记录失败（不影响本次回答）: {e}")
@@ -377,6 +506,24 @@ class ResponderAgent:
                         f"并检查是否重复历史错误模式（如高位追多）；禁止把历史命中率写成对未来的胜率")
             except Exception:
                 pass
+
+            # 改进规则注入：从历史复盘提炼的规则作为硬性要求
+            try:
+                rules = db.get_active_rules(code=stock_code, limit=8)
+                if rules:
+                    rule_lines = ["【历史复盘改进规则（硬性要求：本次分析必须遵循以下规则，避免重复犯同类错误）】"]
+                    for r in rules:
+                        source = f"（来自{r.get('source_stock_name') or '通用'}）" if r.get("source_stock_name") else ""
+                        rule_lines.append(f"· [{r.get('error_pattern', '通用')}] {r['rule_text']}{source}")
+                        db.increment_rule_hit(r["id"])  # 统计引用次数
+                    # 附加该标的最近一次误判类别（如有），强化针对性
+                    if review and review.get("error_pattern") and review.get("direction_verdict") == "错误":
+                        rule_lines.append(f"【⚠️ 该标的最近一次复盘误判类别：{review['error_pattern']}】"
+                                          f"本次必须特别避免同类型误判，如方向不同的判断需提供更充分的证据支撑")
+                    parts.append("\n".join(rule_lines))
+            except Exception:
+                pass
+
             return "\n".join(parts)
         except Exception as e:
             logger.warning(f"读取历史分析记录失败（不影响本次回答）: {e}")

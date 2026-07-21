@@ -16,6 +16,7 @@ from datetime import datetime
 from langchain_core.tools import tool
 from utils.config import get_search_config
 from utils.logger import logger
+from utils.keys import get_zhihu_secrets, mark_zhihu_key_dead
 
 _init_lock = threading.Lock()
 _last_ddg_ts = 0.0
@@ -319,14 +320,220 @@ def _search_ddg_fallback(query: str) -> str:
         return ""
 
 
+def _search_searxng(query: str) -> str:
+    """SearXNG 本地实例（Docker，无 API 限制）；未配置或失败返回空串"""
+    base = (get_search_config().get("searxng_base_url") or "").strip()
+    if not base:
+        return ""
+    try:
+        import requests
+        resp = requests.get(
+            f"{base.rstrip('/')}/search",
+            params={"format": "json", "q": query},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results") or []
+        if not results:
+            return ""
+        lines = []
+        for r in results[:5]:
+            title = (r.get("title") or "").strip()
+            content = (r.get("content") or "").strip()
+            url = (r.get("url") or "").strip()
+            if title or content:
+                parts = []
+                if title:
+                    parts.append(title)
+                if content:
+                    parts.append(content)
+                if url:
+                    parts.append(f"({url})")
+                lines.append(": ".join(parts))
+        return "\n".join(lines)[:2000]
+    except Exception as e:
+        logger.warning(f"SearXNG 搜索失败 [{query[:50]}]: {str(e)[:150]}")
+        return ""
+
+
+def _search_chrome(query: str) -> str:
+    """Playwright 控制本地 Chromium 搜索 Google/Bing，绕过搜索 API 限额。
+    先试 channel/chrome（复用系统 Chrome 配置），失败回退 headless chromium + Bing。"""
+    import platform
+    import time
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.warning("playwright 未安装，跳过 Chrome 搜索")
+        return ""
+    try:
+        with sync_playwright() as p:
+            # ── 策略 1：系统 Chrome（仅当未占用时可用）──
+            user_data_dir = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+            if os.path.isdir(user_data_dir):
+                try:
+                    ctx = p.chromium.launch_persistent_context(
+                        user_data_dir,
+                        headless=True,
+                        channel="chrome" if platform.system() == "Darwin" else None,
+                        args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+                    )
+                    try:
+                        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                        page.goto(f"https://www.google.com/search?q={query}&hl=zh-CN&num=10", timeout=20000)
+                        time.sleep(2)
+                        results = _extract_google_results(page)
+                        if results:
+                            logger.info(f"Chrome(系统) 搜索完成 [{query[:40]}], {len(results)} 条结果")
+                            return "\n".join(results)[:2000]
+                    finally:
+                        try: ctx.close()
+                        except Exception: pass
+                except Exception:
+                    pass  # 被占用时静默跳到策略 2
+
+            # ── 策略 2：headless Chromium → Bing（Bing 不封 headless 浏览器）──
+            from urllib.parse import quote
+            b = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=ChromeWhatsNewUI",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            try:
+                page = b.new_page()
+                page.set_default_timeout(25000)
+                # 设置通用浏览器 UA 降低被侦测概率
+                page.set_extra_http_headers({
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                })
+                encoded = quote(query)
+                page.goto(f"https://www.bing.com/search?q={encoded}&setlang=zh-Hans&count=10", timeout=25000)
+                page.wait_for_selector("li.b_algo", timeout=10000)
+                # Bing 搜索结果选择器
+                results = page.query_selector_all("li.b_algo")
+                lines = []
+                for r in results[:5]:
+                    title_el = r.query_selector("h2 a")
+                    snippet_el = r.query_selector("p.b_lineclamp2, div.b_caption p")
+                    title = title_el.inner_text().strip() if title_el else ""
+                    snippet = snippet_el.inner_text().strip() if snippet_el else ""
+                    if title or snippet:
+                        lines.append(f"{title}: {snippet}" if title and snippet else (title or snippet))
+                if lines:
+                    logger.info(f"Chrome(Bing) 搜索完成 [{query[:40]}], {len(lines)} 条结果")
+                    return "\n".join(lines)[:2000]
+
+                # ── 策略 3：headless Chromium → Google（可能被 CAPTCHA）──
+                page.goto(f"https://www.google.com/search?q={query}&hl=zh-CN&num=10", timeout=25000)
+                page.wait_for_selector("div.g", timeout=10000)
+                lines = _extract_google_results(page)
+                if lines:
+                    logger.info(f"Chrome(Google headless) 搜索完成 [{query[:40]}], {len(lines)} 条结果")
+                    return "\n".join(lines)[:2000]
+                return ""
+            finally:
+                b.close()
+    except Exception as e:
+        logger.warning(f"Chrome 搜索失败 [{query[:50]}]: {str(e)[:150]}")
+        return ""
+
+
+def _extract_google_results(page) -> list:
+    """从 Google 搜索结果页提取标题+摘要；无结果返回空列表"""
+    results = page.query_selector_all("div.g")
+    lines = []
+    for r in results[:5]:
+        title_el = r.query_selector("h3")
+        snippet_el = r.query_selector("div[data-sncf], span.aCOpRe, div.VwiC3b")
+        title = title_el.inner_text().strip() if title_el else ""
+        snippet = snippet_el.inner_text().strip() if snippet_el else ""
+        if title or snippet:
+            lines.append(f"{title}: {snippet}" if title and snippet else (title or snippet))
+    return lines
+
+
+def _search_zhihu_global(query: str) -> str:
+    """知乎全局搜索 API（多 key 轮换）；可搜索全网内容，配额耗尽自动切下一个 key"""
+    secrets = get_zhihu_secrets()
+    if not secrets:
+        return ""
+
+    import requests
+    import time as t
+    errors = []
+    for secret in secrets:
+        try:
+            ts = str(int(t.time()))
+            resp = requests.get(
+                "https://developer.zhihu.com/api/v1/content/global_search",
+                params={"Query": query, "Count": 5},
+                headers={
+                    "Authorization": f"Bearer {secret}",
+                    "X-Request-Timestamp": ts,
+                    "Content-Type": "application/json",
+                },
+                timeout=15,
+            )
+            # 配额耗尽类错误：标记当前 key 死亡，继续尝试下一个
+            if resp.status_code in (429, 403, 401):
+                mark_zhihu_key_dead(secret, f"HTTP {resp.status_code}")
+                errors.append(f"key_{secret[:8]}: {resp.status_code}")
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            items = ((data.get("Data") or {}).get("Items")) or []
+            if not items:
+                return ""
+            lines = []
+            for item in items[:5]:
+                title = (item.get("Title") or "").strip()
+                content = (item.get("ContentText") or "").strip()
+                url = (item.get("Url") or "").strip()
+                author = (item.get("AuthorName") or "").strip()
+                source = (item.get("SourceName") or "").strip()
+                if title:
+                    parts = [title]
+                    if content:
+                        parts.append(content[:200])
+                    if source or author:
+                        src = f"{source}@{author}" if source and author else (source or author)
+                        parts.append(src)
+                    if url:
+                        parts.append(f"({url})")
+                    lines.append(": ".join(parts))
+            return "\n".join(lines)[:2000] if lines else ""
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response else 0
+            if status in (429, 403, 401):
+                mark_zhihu_key_dead(secret, f"HTTP {status}")
+                errors.append(f"key_{secret[:8]}: {status}")
+                continue
+            errors.append(f"key_{secret[:8]}: {str(e)[:60]}")
+            continue
+        except Exception as e:
+            errors.append(f"key_{secret[:8]}: {str(e)[:60]}")
+            continue
+
+    if errors:
+        logger.debug(f"知乎全局搜索失败 所有key均失败 [{query[:40]}]: {'; '.join(errors)}")
+    return ""
+
+
 # 引擎链：按顺序尝试，先出结果者胜（存函数名运行时查表，便于测试替换单个引擎）
+# 知乎最稳定放首位；Tavily 限流时快速失败；SearXNG 本地无限制兜底；DuckDuckGo 最后防线。
+# 已移除以下长超时/不可用引擎以加速降级：
+#   Brave（30s 超时）、SerpAPI（无额度）、TheNewsAPI（不稳定）、
+#   Google 免费（未安装）、Chrome（headless 浏览器的 20s+ 启动/超时）
 _PROVIDERS = (
+    ("Zhihu(全网)", "_search_zhihu_global"),
     ("Tavily", "_search_tavily"),
-    ("Brave", "_search_brave"),
-    ("SerpAPI(Google)", "_search_serpapi"),
-    ("TheNewsAPI", "_search_thenewsapi"),
-    ("Google(免费)", "_search_google_free"),
-    ("Google(CustomSearch)", "_search_google_api"),
+    ("SearXNG(本地)", "_search_searxng"),
     ("DuckDuckGo", "_search_ddg"),
     ("DuckDuckGo(SSL备用)", "_search_ddg_fallback"),
 )
