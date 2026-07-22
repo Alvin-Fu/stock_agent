@@ -2018,6 +2018,14 @@ class StockTools:
         df['report_year'] = df['report_date'].dt.year
         df['report_quarter'] = df['report_date'].dt.quarter
 
+        def _num(value):
+            if value is None or pd.isna(value):
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
         revenue_map = df.set_index(['report_year', 'report_quarter'])['total_revenue'].to_dict()
         profit_map = df.set_index(['report_year', 'report_quarter'])['net_profit'].to_dict()
 
