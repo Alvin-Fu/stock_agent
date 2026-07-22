@@ -114,6 +114,27 @@ def build_income_trend(records: List[Dict], max_periods: int = 6) -> str:
             word = _trend_word(a, b, "加速", "放缓")
             verdicts.append(f"{name} {_sign(b)}%→{_sign(a)}%，{word}")
 
+    # ---- 营收增速连续减速期数（精确判定，禁止 LLM 自行心算） ----
+    rev_vals = []  # [(date_label, value), ...] 时间升序
+    for r in reversed(shown):
+        v = r.get("rev_yoy")
+        if v is not None:
+            rev_vals.append((r["date"], v))
+    if len(rev_vals) >= 3:
+        decel_count = 0
+        for i in range(1, len(rev_vals)):
+            if rev_vals[i][1] < rev_vals[i - 1][1]:
+                decel_count += 1
+            else:
+                decel_count = 0
+        if decel_count >= 2:
+            end_idx = len(rev_vals) - 1
+            start_idx = end_idx - decel_count + 1
+            verdicts.append(
+                f"营收增速已连续{decel_count}个报告期下滑"
+                f"（{_quarter_label(rev_vals[start_idx][0])}→{_quarter_label(rev_vals[end_idx][0])}"
+                f"，{_sign(rev_vals[start_idx][1])}%→{_sign(rev_vals[end_idx][1])}%）")
+
     # 利润率：优先对上年同期（同 MM-DD），口径干净
     by_date = {r["date"]: r for r in rows}
     yoy_row = by_date.get(f"{int(latest['date'][:4]) - 1}{latest['date'][4:]}")

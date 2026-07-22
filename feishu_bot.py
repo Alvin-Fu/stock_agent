@@ -131,6 +131,246 @@ def _convert_to_feishu_markdown(text: str) -> str:
     return "\n".join(result)
 
 
+# ============================================================
+# 交互式卡片（interactive card）转换
+# ============================================================
+
+_CARD_ICONS = {
+    "投资结论": "📌", "公司概况": "🏢", "业务拆解": "🔧", "财务分析": "📊",
+    "护城河": "🛡️", "核心竞争力": "🛡️", "资金筹码": "💰", "技术分析": "📈",
+    "估值分析": "💎", "投资建议": "🎯", "风险提示": "⚠️", "同业对比": "📊",
+    "同行对比": "📊",
+}
+
+_MAX_CARD_ELEMENTS = 40  # 单张卡片最大元素数
+
+def _parse_markdown_table(lines: list) -> dict:
+    """
+    解析 markdown 表格文本为飞书 CardKit v2 table 组件。
+    优先使用 table 组件实现真正表格渲染，降级方案为 lark_md 文本排版。
+    """
+    header_cells = [c.strip() for c in lines[0].split("|") if c.strip()]
+    data_rows = []
+    for line in lines[2:]:  # 跳过表头和分隔行
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.split("|") if c.strip()]
+        if not cells:
+            continue
+        if len(cells) < len(header_cells):
+            cells += [""] * (len(header_cells) - len(cells))
+        else:
+            cells = cells[:len(header_cells)]
+        data_rows.append(cells)
+    if not data_rows:
+        return {}
+
+    n_cols = len(header_cells)
+    # CardKit v2 table 组件列数限制
+    if n_cols > 10 or len(data_rows) > 50:
+        return _build_text_table(header_cells, data_rows)
+
+    # 构建 CardKit v2 table 组件
+    # 列定义：col_0, col_1, ...
+    columns = []
+    for i, h in enumerate(header_cells):
+        col_name = f"col_{i}"
+        columns.append({
+            "name": col_name,
+            "display_name": h,
+            "data_type": "text",
+            "width": "auto",
+        })
+
+    # 行数据：用列名作 key
+    rows = []
+    for cells in data_rows:
+        row = {}
+        for i, c in enumerate(cells):
+            row[f"col_{i}"] = c if c else "-"
+        rows.append(row)
+
+    return {
+        "tag": "table",
+        "columns": columns,
+        "rows": rows,
+        "header_style": {"bold": True},
+    }
+
+
+def _build_text_table(header_cells: list, data_rows: list) -> dict:
+    """降级方案：用 lark_md 文本排版模拟表格（列数超过 10 时使用）"""
+    lines_text = ["| " + " | ".join(f"**{h}**" for h in header_cells) + " |"]
+    for cells in data_rows:
+        lines_text.append("| " + " | ".join(cells) + " |")
+    return {"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines_text)}}
+
+def _markdown_to_card_elements(text: str) -> list:
+    """
+    将 markdown 报告文本转换为飞书卡片的 elements 列表。
+    支持 ## 标题、| 表格、- 列表、加粗、分隔线。"""
+    elements = []
+    lines = text.strip().split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # ## 标题 → div with bold header
+        if line.startswith("## "):
+            title = line[3:].strip()
+            elements.append({"tag": "hr"})  # 标题前加分隔线
+            content = f"**{title}**"
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": content}
+            })
+            i += 1
+            # 收集标题后的内容直到下一个标题
+            body_lines = []
+            while i < len(lines) and not lines[i].startswith("## ") and not lines[i].startswith("```"):
+                if lines[i].startswith("|"):
+                    break  # 表格单独处理
+                body_lines.append(lines[i])
+                i += 1
+            if body_lines:
+                body_text = "\n".join(body_lines).strip()
+                if body_text:
+                    # 合并到前面的 div 或新加一个 div
+                    if elements and elements[-1].get("tag") == "div":
+                        elements[-1]["text"]["content"] += "\n" + body_text
+                    else:
+                        elements.append({
+                            "tag": "div",
+                            "text": {"tag": "lark_md", "content": body_text}
+                        })
+            continue
+
+        # 表格
+        if line.startswith("|"):
+            table_lines = [line]
+            i += 1
+            while i < len(lines) and (lines[i].startswith("|") or lines[i].strip().startswith(":--")):
+                table_lines.append(lines[i])
+                i += 1
+            # 跳过纯分隔行，取有效行
+            data_lines = [l for l in table_lines if not l.strip().startswith(":--") and not l.strip().startswith("---")]
+            if len(data_lines) >= 2:
+                element = _parse_markdown_table(data_lines)
+                if element:
+                    elements.append(element)
+            continue
+
+        # 代码块跳过（卡片不支持代码块，转 text）
+        if line.startswith("```"):
+            i += 1
+            while i < len(lines) and not lines[i].startswith("```"):
+                i += 1
+            i += 1
+            continue
+
+        # 普通行
+        body_lines = []
+        while i < len(lines) and not lines[i].startswith("## ") and not lines[i].startswith("```") and not lines[i].startswith("|"):
+            l = lines[i].strip()
+            if l:
+                # 列表优化
+                if l.startswith("-"):
+                    l = "• " + l[1:].strip()
+                body_lines.append(l)
+            i += 1
+        if body_lines:
+            body_text = "\n".join(body_lines)
+            if elements and elements[-1].get("tag") == "div":
+                elements[-1]["text"]["content"] += "\n" + body_text
+            else:
+                elements.append({
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": body_text}
+                })
+            continue
+
+        i += 1
+
+    # 移除开头的 hr（多余的无意义）
+    while elements and elements[0].get("tag") == "hr":
+        elements.pop(0)
+    # 合并连续的 div
+    merged = []
+    for el in elements:
+        if el["tag"] == "div" and merged and merged[-1]["tag"] == "div":
+            merged[-1]["text"]["content"] += "\n\n" + el["text"]["content"]
+        else:
+            merged.append(el)
+    return merged
+
+
+def _add_color_tags(text: str) -> str:
+    """给关键数字添加红绿色标签：负数为红，正数为绿"""
+    import re
+    def _colorize(m):
+        num = m.group(0)
+        if num.startswith("-"):
+            return f"<font color='red'>{num}</font>"
+        else:
+            return f"<font color='green'>{num}</font>"
+    # 匹配百分比和带正负号的数字
+    text = re.sub(r"[+-]?\d+\.?\d*%", _colorize, text)
+    text = re.sub(r"(?<=[（(])\+?\d+\.?\d*亿", _colorize, text)
+    return text
+
+
+def _report_to_cards(report_text: str, stock_label: str = "") -> list:
+    """
+    将完整 markdown 报告转换为多张交互式卡片消息 JSON。
+    返回 list[dict]，每张 dict 可直接作为 card_content 发送。
+    stock_label 用于卡片标题，如 "比亚迪(002594)"。"""
+    if not report_text or not report_text.strip():
+        return []
+
+    # 解析 elements
+    raw_elements = _markdown_to_card_elements(report_text)
+    if not raw_elements:
+        return []
+
+    # 将 lark_md 文本中的数字加上颜色标签
+    for el in raw_elements:
+        if el.get("tag") == "div":
+            el["text"]["content"] = _add_color_tags(el["text"]["content"])
+
+    # 添加结尾免责声明（CardKit v2 不支持 note 标签，改用 div）
+    has_note = any(e.get("tag") in ("note", "div") and "数据来源" in str(e) for e in raw_elements)
+    if not has_note:
+        raw_elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                     "content": "_数据来源：财报、程序监测 | 仅供参考，不构成投资建议_"}
+        })
+
+    # 按 _MAX_CARD_ELEMENTS 分卡
+    # 使用 CardKit v2 格式（schema: 2.0 + body.elements）
+    title_base = f"📊 {stock_label} 投研报告" if stock_label else "📊 投研报告"
+    cards = []
+    chunk_size = _MAX_CARD_ELEMENTS
+    for idx in range(0, len(raw_elements), chunk_size):
+        chunk = raw_elements[idx:idx + chunk_size]
+        total_cards = (len(raw_elements) + chunk_size - 1) // chunk_size
+        title = f"{title_base} ({idx // chunk_size + 1}/{total_cards})" if total_cards > 1 else title_base
+        card = {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": "blue"
+            },
+            "body": {
+                "elements": chunk,
+            },
+        }
+        cards.append(card)
+
+    return cards
+
+
 def split_report(text: str, limit: int = 4000) -> list:
     """
     长报告切分：优先在 ##/### 标题边界断段，段内超限再按行边界硬切，
@@ -209,6 +449,27 @@ class FeishuBot:
         for i, chunk in enumerate(chunks, 1):
             reply(f"({i}/{total})\n{chunk}" if total > 1 else chunk)
 
+    def _send_card_answer(self, answer: str, stock_label: str, receive_id: str,
+                          receive_id_type: str = "open_id"):
+        """
+        交互式卡片发送回答。
+        将 markdown 报告转换为 interactive card JSON 后发送。
+        转换失败时降级为普通文本分段发送。"""
+        if not answer or not answer.strip():
+            return
+        try:
+            cards = _report_to_cards(answer, stock_label)
+            if cards:
+                self.notifier.send_card_chunked(cards, receive_id, receive_id_type)
+                return
+        except Exception as e:
+            logger.warning(f"[卡片] 报告转卡片失败，降级为文本: {e}")
+        # 降级：通过 reply 发送（但这里没有 reply 闭包，用 text/post 兜底）
+        chunks = split_report(answer)
+        for i, chunk in enumerate(chunks, 1):
+            label = f"({i}/{len(chunks)})\n" if len(chunks) > 1 else ""
+            self.notifier.send_to(receive_id, f"{label}{chunk}", receive_id_type)
+
     def _run_analysis(self, question: str, thread_id: str, reply):
         try:
             executor = self._get_workflow()
@@ -219,7 +480,15 @@ class FeishuBot:
 
             if len(tasks) <= 1:
                 state = executor.run_sync(question, thread_id=thread_id)
-                self._send_answer(executor.get_final_answer(state), reply)
+                answer = executor.get_final_answer(state)
+                # 提取股票代码用于卡片标题
+                stock_code = state.get("stock_code", "")
+                stock_name = self._resolve_name(stock_code) if stock_code else ""
+                stock_label = f"{stock_name}({stock_code})" if stock_name else stock_code
+                if stock_code and stock_label:
+                    self._send_card_answer(answer, stock_label, thread_id)
+                else:
+                    self._send_answer(answer, reply)
                 return
 
             names = "、".join(t["target"] or f"对象{i}" for i, t in enumerate(tasks, 1))
@@ -233,7 +502,14 @@ class FeishuBot:
                     # 每个对象独立会话，互不污染对话记忆
                     state = executor.run_sync(t["question"], thread_id=f"{thread_id}:{label}")
                     answer = executor.get_final_answer(state)
-                    self._send_answer(f"【{label}】\n{answer}", reply)
+                    # 多对象时优先用卡片，失败降级为文本
+                    stock_code = state.get("stock_code", "")
+                    sname = self._resolve_name(stock_code) if stock_code else ""
+                    if stock_code:
+                        self._send_card_answer(f"【{label}】\n{answer}",
+                                               f"{sname}({stock_code})", thread_id)
+                    else:
+                        self._send_answer(f"【{label}】\n{answer}", reply)
                     plan = (state.get("technical_result") or {}).get("trade_plan")
                     if plan:
                         plans.append((label, plan))
@@ -484,6 +760,7 @@ class FeishuBot:
                     event_handler=handler, log_level=lark.LogLevel.INFO,
                 )
                 logger.info("🚀 飞书 WebSocket 连接已建立")
+                self._last_message_time = time.time()  # 重置时间戳，防止看门狗立即误判断连
                 self._ws_client.start()  # 阻塞，断开时返回
             except Exception as e:
                 logger.error(f"[飞书WS] 连接异常: {e}")
@@ -496,6 +773,16 @@ class FeishuBot:
         t = threading.Thread(target=self._ws_watchdog, name="feishu-ws-watchdog", daemon=True)
         t.start()
         logger.info("[飞书WS] 健康看门狗已启动（每5分钟检查一次）")
+
+    def _resolve_name(self, code: str) -> str:
+        """反查公司名称"""
+        if not code:
+            return ""
+        try:
+            from tools.company_code_validator import find_company_name
+            return find_company_name(code) or ""
+        except Exception:
+            return ""
 
     def _safe_scan(self, reply):
         try:

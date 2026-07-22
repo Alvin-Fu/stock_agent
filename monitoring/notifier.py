@@ -121,6 +121,50 @@ class FeishuNotifier:
                 logger.warning("post 格式失败，降级为 text 重试")
         return False
 
+    def send_card(self, receive_id: str, card_content: dict,
+                  receive_id_type: str = "open_id") -> bool:
+        """
+        发送交互式卡片消息（interactive）。
+        card_content 为卡片完整 JSON dict（含 config/header/elements）。
+        仅支持应用 API 通道（webhook 不支持 interactive）。
+        """
+        if not (self.app_id and self.app_secret):
+            logger.error("未配置 feishu.app_id/app_secret，无法发送卡片消息")
+            return False
+        import lark_oapi as lark
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        client = self._get_lark_client()
+        content = json.dumps(card_content, ensure_ascii=False)
+        req = CreateMessageRequest.builder() \
+            .receive_id_type(receive_id_type) \
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(receive_id)
+                .msg_type("interactive")
+                .content(content)
+                .build()
+            ).build()
+        resp = client.im.v1.message.create(req)
+        if not resp.success():
+            logger.error(f"飞书卡片发送失败: code={resp.code}, msg={resp.msg}")
+            return False
+        return True
+
+    def send_card_chunked(self, cards: list, receive_id: str,
+                          receive_id_type: str = "open_id") -> bool:
+        """
+        发送多张卡片（适用于超长报告分多卡）。cards 为 list[card_dict]。
+        每张卡独立发送，如某张失败继续下一张。
+        """
+        ok = True
+        for i, card in enumerate(cards):
+            try:
+                self.send_card(receive_id, card, receive_id_type)
+            except Exception as e:
+                logger.error(f"[卡片] 第{i+1}/{len(cards)}张发送失败: {e}")
+                ok = False
+        return ok
+
     def _send_via_webhook(self, text: str, msg_type: str = "text") -> bool:
         payload = {"msg_type": msg_type}
         if msg_type == "post":

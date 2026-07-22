@@ -75,22 +75,16 @@ def fetch_holder_events_text(code: str, name: str = "") -> str:
     except Exception as e:
         logger.warning(f"[股东筹码] 公告事件获取失败 {code}: {e}")
 
-    # 2-4. 东财接口（列名/接口名随版本漂移，generic 渲染真实数据）
-    specs = [
-        ("股东户数变化（户数下降=筹码集中）",
-         ["stock_zh_a_gdhs_detail_em"], {"symbol": code}),
-        ("限售解禁队列（未来的已知抛压）",
-         ["stock_restricted_release_queue_em"], {"symbol": code}),
-        ("分红送配（留意临近的除权除息日）",
-         ["stock_fhps_detail_em"], {"symbol": code}),
-    ]
-    for title, fn_names, kwargs in specs:
-        try:
-            block = _df_block(title, _try_call(fn_names, **kwargs))
-            if block:
-                blocks.append(block)
-        except Exception as e:
-            logger.warning(f"[股东筹码] {title} 获取失败 {code}: {e}")
+    # 2. 分红送配（留意临近的除权除息日）
+    # 注意：股东户数和限售解禁已在 stock_capital_fetcher.fetch_all_capital_data() 中统一提供，
+    # 此处不再重复获取，避免LLM输入冗余。
+    try:
+        block = _df_block("分红送配（留意临近的除权除息日）",
+                          _try_call(["stock_fhps_detail_em"], {"symbol": code}))
+        if block:
+            blocks.append(block)
+    except Exception as e:
+        logger.warning(f"[股东筹码] 分红送配获取失败 {code}: {e}")
 
     if not blocks:
         return ""

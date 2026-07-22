@@ -74,8 +74,8 @@ def _load_market_spot() -> Dict[str, Dict]:
 
 
 def _income_metrics(db, code: str, allow_fetch: bool) -> Dict[str, Optional[float]]:
-    """最新报告期营收/净利同比与毛利率；库里没有且允许时现拉一次"""
-    out = {"rev_yoy": None, "np_yoy": None, "gm": None}
+    """最新报告期营收/净利同比、毛利率、净利率；库里没有且允许时现拉一次"""
+    out = {"rev_yoy": None, "np_yoy": None, "gm": None, "nm": None}
     try:
         df = db.get_stock_income(code)
         if (df is None or df.empty) and allow_fetch:
@@ -87,6 +87,9 @@ def _income_metrics(db, code: str, allow_fetch: bool) -> Dict[str, Optional[floa
             out["rev_yoy"] = _num(latest.get("revenue_growth"))
             out["np_yoy"] = _num(latest.get("profit_growth"))
             out["gm"] = _num(latest.get("gross_margin"))
+            rev = _num(latest.get("total_revenue"))
+            np = _num(latest.get("net_profit"))
+            out["nm"] = np / rev * 100 if (rev is not None and np is not None and rev > 0) else None
     except Exception as e:
         logger.warning(f"[同行对比] {code} 财务指标获取失败: {e}")
     return out
@@ -102,11 +105,12 @@ def build_peer_table(target: Dict, peers: List[Dict], industry: str) -> str:
 
     lines = [f"【同行对比（行业「{industry}」，市值前{len(peers)}家；PE为动态口径，"
              f"与PE(TTM)略有差异；增速为最新报告期累计同比）】",
-             "公司 | 总市值(亿) | PE(动) | PB | 营收同比% | 净利同比% | 毛利率%"]
+             "公司 | 总市值(亿) | PE(动) | PB | 净利率% | 营收同比% | 净利同比% | 毛利率%"]
     for r in [target] + peers:
         tag = "★" if r is target else "· "
         lines.append(f"{tag}{r['name']}({r['code']}) | {_c(r.get('mv'), 0)} | {_c(r.get('pe'))} | "
-                     f"{_c(r.get('pb'), 2)} | {_c(r.get('rev_yoy'))} | {_c(r.get('np_yoy'))} | {_c(r.get('gm'))}")
+                     f"{_c(r.get('pb'), 2)} | {_c(r.get('nm'), 1)} | "
+                     f"{_c(r.get('rev_yoy'))} | {_c(r.get('np_yoy'))} | {_c(r.get('gm'))}")
 
     # 程序判读：目标 PE / 毛利率在同行中的位置
     verdicts = []
@@ -114,12 +118,19 @@ def build_peer_table(target: Dict, peers: List[Dict], industry: str) -> str:
     peer_pes = sorted(p["pe"] for p in peers if p.get("pe") is not None and p["pe"] > 0)
     if tpe is not None and tpe > 0 and len(peer_pes) >= 3:
         below = sum(1 for p in peer_pes if p < tpe)
-        verdicts.append(f"目标PE高于 {below}/{len(peer_pes)} 家同行（同行PE区间 {peer_pes[0]:.1f}~{peer_pes[-1]:.1f}）")
+        median_pe = peer_pes[len(peer_pes) // 2]
+        verdicts.append(f"目标PE {tpe:.1f}倍（同行中位数 {median_pe:.1f}倍，高于{below}/{len(peer_pes)}家）")
     tgm = target.get("gm")
     peer_gms = [p["gm"] for p in peers if p.get("gm") is not None]
     if tgm is not None and len(peer_gms) >= 3:
         verdicts.append(f"目标毛利率{'高于' if tgm > sum(peer_gms) / len(peer_gms) else '低于'}同行均值"
                         f"（{tgm:.1f}% vs {sum(peer_gms) / len(peer_gms):.1f}%）")
+    # 净利率同行相对位置
+    tnm = target.get("nm")
+    peer_nms = [p["nm"] for p in peers if p.get("nm") is not None]
+    if tnm is not None and len(peer_nms) >= 3:
+        verdicts.append(f"目标净利率{'高于' if tnm > sum(peer_nms) / len(peer_nms) else '低于'}同行均值"
+                        f"（{tnm:.1f}% vs {sum(peer_nms) / len(peer_nms):.1f}%）")
     if verdicts:
         lines.append("程序判读：" + "；".join(verdicts))
     return "\n".join(lines)

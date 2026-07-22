@@ -224,7 +224,13 @@ class AnalystAgent:
                                 pct = float((sub < float(cur)).mean() * 100)
                                 pct_parts.append(f"{win_label} {pct:.0f}%分位")
                         if pct_parts:
-                            parsed[f"{name}_分位"] = "，".join(pct_parts)
+                            # 附数据源和时点
+                            src_date = latest_basic.get("trade_date")
+                            src_str = f"数据源：Tushare daily_basic"
+                            if src_date is not None and not pd.isna(src_date):
+                                src_str += f"，截至{src_date}"
+                            pct_parts.append(src_str)
+                            parsed[f"{name}_分位"] = "；".join(pct_parts)
                         # PE/PB 背离判断（用近3年数据）
                         pe_pct = float((hist.head(750) < float(parsed.get("pe_ttm", 0))).mean() * 100) if len(hist) >= 750 and "pe_ttm" in parsed else None
                         pb_pct = float((hist.head(750) < float(parsed.get("pb", 0))).mean() * 100) if len(hist) >= 750 and "pb" in parsed else None

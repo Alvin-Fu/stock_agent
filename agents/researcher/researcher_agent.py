@@ -241,6 +241,27 @@ class ResearcherAgent:
 
     def __init__(self):
         self.llm = get_agent_llm("researcher")
+        self._llm_timeout = 180  # LLM调用单次超时秒数
+
+    def _llm_invoke_with_timeout(self, messages, timeout=None):
+        """带超时的 LLM.invoke 封装，防止 LLM API 挂死后进程卡死"""
+        import threading
+        timeout = timeout or self._llm_timeout
+        container, errors = [], []
+        def _invoke():
+            try:
+                container.append(self.llm.invoke(messages))
+            except Exception as e:
+                errors.append(e)
+        t = threading.Thread(target=_invoke, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            logger.warning(f"LLM 调用超时 ({timeout}s)，返回空结果")
+            return None
+        if errors:
+            raise errors[0]
+        return container[0] if container else None
 
     # ========== 结构化数据提取（通用） ==========
 
@@ -285,7 +306,10 @@ class ResearcherAgent:
 
         try:
             import json, re
-            response = self.llm.invoke([HumanMessage(content=prompt)])
+            response = self._llm_invoke_with_timeout([HumanMessage(content=prompt)], timeout=120)
+            if response is None:
+                logger.warning("结构化数据提取 LLM 超时，跳过")
+                return {"tables": [], "figures": [], "time_series": []}
             raw = response.content if hasattr(response, 'content') else str(response)
             match = re.search(r'\{.*\}', raw, re.DOTALL)
             if match:
@@ -1377,7 +1401,7 @@ ETF 名称：{etf_name}
             try:
                 from tools.stock_tools import (
                     call_fetch_forecast, call_fetch_express,
-                    call_fetch_dividend, call_fetch_report_rc,
+                    call_fetch_dividend_data, call_fetch_report_rc,
                     call_fetch_holder_trade, call_fetch_moneyflow,
                     call_fetch_pledge, call_fetch_block_trade,
                     call_fetch_repurchase,
@@ -1385,7 +1409,7 @@ ETF 名称：{etf_name}
                 parts = []
                 for name, func in [
                     ("业绩预告", call_fetch_forecast), ("业绩快报", call_fetch_express),
-                    ("分红送股", call_fetch_dividend), ("卖方盈利预测", call_fetch_report_rc),
+                    ("分红送股", call_fetch_dividend_data), ("卖方盈利预测", call_fetch_report_rc),
                     ("股东增减持", call_fetch_holder_trade), ("个股资金流向", call_fetch_moneyflow),
                     ("股权质押", call_fetch_pledge), ("大宗交易", call_fetch_block_trade),
                     ("股票回购", call_fetch_repurchase),
@@ -1471,7 +1495,14 @@ ETF 名称：{etf_name}
         ]
 
         logger.info("LLM 综合分析中...")
-        response = self.llm.invoke(messages)
+        response = self._llm_invoke_with_timeout(messages)
+        if response is None:
+            logger.warning("LLM 综合分析超时，返回空结果")
+            return {
+                "messages": [],
+                "research_result": {"summary": "LLM分析超时", "sources": queries},
+                "intermediate_steps": [("researcher", {"mode": "stock", "stock_code": stock_code, "queries": len(queries)})],
+            }
         summary = response.content if hasattr(response, 'content') else str(response)
 
         # 情景推演的重估触发条件落库：以公司名为 key 复用行业触发表，
@@ -1648,20 +1679,6 @@ ETF 名称：{etf_name}
                     r = call_fetch_financial_health_summary(c)
                     if r and '❌' not in r and len(r) > 50:
                         snap_lines.append(r.strip().split('\n')[:15])
-                except Exception:
-                    pass
-                # 股东户数
-                try:
-                    r = call_fetch_holder_number(c)
-                    if r and '❌' not in r and len(r) > 50:
-                        snap_lines.append(r.strip().split('\n')[:10])
-                except Exception:
-                    pass
-                # 北向资金持仓
-                try:
-                    r = call_fetch_northbound_hold(c)
-                    if r and '❌' not in r and len(r) > 50:
-                        snap_lines.append(r.strip().split('\n')[:10])
                 except Exception:
                     pass
                 # 筹码成本估算

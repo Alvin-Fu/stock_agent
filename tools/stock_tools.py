@@ -2027,7 +2027,8 @@ class StockTools:
                 return None
 
         revenue_map = df.set_index(['report_year', 'report_quarter'])['total_revenue'].to_dict()
-        profit_map = df.set_index(['report_year', 'report_quarter'])['net_profit'].to_dict()
+        profit_map = (df.set_index(['report_year', 'report_quarter'])['net_profit'].to_dict()
+                      if 'net_profit' in df.columns else {})
 
         revenue_growth_list = []
         profit_growth_list = []
@@ -2889,7 +2890,11 @@ def _format_cashflow_data(df: pd.DataFrame, stock_code: str) -> str:
     lines.append(f"  - 经营活动现金流净额: {to_yi(cur_ocf)} vs 去年同期 {to_yi(prev_ocf)}{g_str}")
     lines.append(f"  - 投资活动现金流净额: {to_yi(latest.get('investing_cashflow'))}")
     lines.append(f"  - 筹资活动现金流净额: {to_yi(latest.get('financing_cashflow'))}")
-    lines.append(f"  - 资本开支（购建固定资产等支付现金）: {to_yi(latest.get('capex'))}")
+    capex_val = _num(latest.get('capex'))
+    if capex_val is None:
+        lines.append("  - 资本开支（购建固定资产等支付现金）: 明细数据缺失，无法精确计算自由现金流")
+    else:
+        lines.append(f"  - 资本开支（购建固定资产等支付现金）: {capex_val / 1e8:.2f} 亿元")
     # 自由现金流由程序计算（经营现金流-资本开支），LLM 只许引用——
     # 实测让 LLM 心算 FCF 出过"-446.99亿"（正确值-202.51亿）这种错一倍的数字
     cur_capex = _num(latest.get('capex'))
@@ -3096,6 +3101,25 @@ def _format_main_business(df: pd.DataFrame, stock_code: str) -> str:
 
     lines.append("")
     lines.append("📌 数据来源：Tushare 财务数据（高可信）。")
+    lines.append("⚠️ 注意：分部利润占比为程序按「营收×毛利率」倒算的毛利贡献近似值，"
+                 "非财报直接披露的分部净利润。")
+    return "\n".join(lines)
+
+
+def _format_dividend(df: pd.DataFrame, stock_code: str) -> str:
+    """
+    格式化分红数据为易于大模型理解的文本
+    """
+    if df is None or df.empty:
+        return f"❌ 未获取到 {stock_code} 的分红数据"
+    df = df.copy()
+    df['ex_date'] = pd.to_datetime(df['ex_date'])
+    df = df.sort_values('ex_date', ascending=False).reset_index(drop=True)
+    lines = [f"✅ 【{stock_code} 分红数据】共 {len(df)} 条记录"]
+    for _, row in df.head(5).iterrows():
+        ex_date = row['ex_date'].strftime('%Y-%m-%d') if hasattr(row['ex_date'], 'strftime') else row['ex_date']
+        cash = row.get('cash_dvd', 'N/A')
+        lines.append(f"  - {ex_date}: 每股派息{cash}元")
     return "\n".join(lines)
 
 
@@ -4237,8 +4261,8 @@ def call_fetch_financial_health_summary(stock_code: str) -> str:
                 if fcf_val is not None:
                     lines.append(f"  自由现金流: {fcf_val / 1e8:.2f} 亿元（{fcf_note}）")
                     lines.append(f"  ├ 经营现金流: {ocf / 1e8:.2f} 亿{'（健康）' if ocf > 0 else '（为负）'}" if ocf else "")
-                    capex_str = f"{capex / 1e8:.2f} 亿" if capex is not None else "未披露"
-                    lines.append(f"  └ 资本开支: {capex_str}{'（扩张期）' if capex and capex > 0 else '（未披露/缺失，FCF 用投资净额近似）'}" if ocf else "")
+                    capex_str = f"{capex / 1e8:.2f} 亿" if capex is not None else "明细数据缺失，无法精确计算自由现金流"
+                    lines.append(f"  └ 资本开支: {capex_str}{'（扩张期）' if capex and capex > 0 else ''}" if ocf else "")
                     # FCF 同比
                     if cf_prev is not None:
                         prev_ocf = _num(cf_prev.get('operating_cashflow'))

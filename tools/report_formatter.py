@@ -211,6 +211,7 @@ def format_stock_report(text: str) -> str:
                 assignments[idx] = (heading, content)
 
     # 最后，对"分析局限性说明"增加分类标签
+    output = []
     for idx, (expected_name, _) in enumerate(_STOCK_SECTIONS):
         if idx in assignments:
             _, content = assignments[idx]
@@ -372,6 +373,86 @@ def format_industry_report(text: str) -> str:
 # ======================== 统一入口 ========================
 
 
+# ======================== LLM 内容强制修正 ========================
+# 以下修正针对 LLM 常见错误模式，用程序逻辑覆盖 LLM 不可控内容。
+# 仅在 stock/industry 模式下执行。
+
+
+def _fix_valuation_narrative(text: str) -> str:
+    """
+    修正估值分位数表述矛盾（LLM 常把 PE 高分位写"偏低"、PB 低分位写"高位"）。
+
+    规则：
+      - 若"PE.*分位.*%" 数值 > 60%，其后紧跟"偏低/低位/低" → 替换为"偏高/高位/偏高"
+      - 若"PB.*分位.*%" 数值 < 30%，其后紧跟"偏高/高位/高"  → 替换为"偏低/低位/偏低"
+    仅修正明显矛盾，不改变写法正确的段落。
+    """
+    if not text:
+        return text
+
+    def _invert_qualifier(match):
+        """根据百分位数值反转定性词"""
+        prefix = match.group(1)   # "PE"或"PB"
+        pct_val = float(match.group(2))  # 百分位数值
+        qualifier = match.group(3)  # 当前定性词
+
+        # PE：高百分位应写"偏高"，低百分位应写"偏低"
+        if "PE" in prefix.upper():
+            if pct_val > 60 and qualifier in ("偏低", "低位", "低"):
+                qualifier = "偏高"
+            elif pct_val < 30 and qualifier in ("偏高", "高位", "高"):
+                qualifier = "偏低"
+        # PB：高百分位应写"偏高"，低百分位应写"偏低"
+        elif "PB" in prefix.upper():
+            if pct_val > 60 and qualifier in ("偏低", "低位", "低"):
+                qualifier = "偏高"
+            elif pct_val < 30 and qualifier in ("偏高", "高位", "高"):
+                qualifier = "偏低"
+        return f"{match.group(0).replace(match.group(3), qualifier)}"
+
+    # 匹配 "PE...分位XX%(偏低/偏高/低位/高位)" 或 "PB...分位XX%(...)"
+    # 支持 "PE(TTM): 31.21倍，3年分位84% (偏低)" 和 "PE分位25% (偏低)" 两种格式
+    text = re.sub(
+        r'(PE|PB)\s*.*?分位\s*(\d+\.?\d*)\s*%\s*.*?[（(]\s*(偏低|偏高|低位|高位|低|高)\s*[）)]',
+        _invert_qualifier,
+        text,
+    )
+    return text
+
+
+def _fix_net_profit_label(text: str) -> str:
+    """
+    修正"净利润同比下降"表述为"归母净利润同比下降"。
+
+    LLM 常把含少数股东的"净利润"误标为"归母净利润"或相反。
+    仅修正明确错误的固定模式（百分比 + 季报口径）。
+    """
+    if not text:
+        return text
+    # 匹配 "净利润同比下降XX.XX%" 但前面没有 "归母" 修饰
+    # 注意不要误伤 "归母净利润" 的已有正确写法
+    text = re.sub(
+        r'(?<!归母)净利润\s*(?:同比)?\s*(下降|下滑|减少|增长|上升|增加)\s*(\d+\.?\d*)%',
+        r'归母净利润同比\1\2%',
+        text,
+    )
+    # 匹配 "净利润：-XX.XX%" / "净利润: X.XX%"（无同比词，仅数字）
+    text = re.sub(
+        r'(?<!归母)净利润[：:]\s*(-?\d+\.?\d*)%',
+        r'归母净利润：\1%',
+        text,
+    )
+    return text
+
+
+def _apply_llm_fixes(text: str, mode: str) -> str:
+    """对 LLM 生成内容执行强制修正"""
+    if mode in ("stock", "industry"):
+        text = _fix_valuation_narrative(text)
+        text = _fix_net_profit_label(text)
+    return text
+
+
 def format_report(text: str, mode: str) -> str:
     """
     报告格式后处理统一入口。
@@ -381,12 +462,16 @@ def format_report(text: str, mode: str) -> str:
         mode: "etf" / "stock" / "industry"
 
     Returns:
-        格式化后的报告（固定顺序 + 补缺）
+        格式化后的报告（固定顺序 + 补缺 + LLM 内容修正）
     """
     if not text or not text.strip():
         return text
 
     try:
+        # 1. LLM 常见错误强制修正
+        text = _apply_llm_fixes(text, mode)
+
+        # 2. 维度完整性 + 重排
         if mode == "etf":
             return format_etf_report(text)
         elif mode == "stock":

@@ -17,6 +17,7 @@ from utils.logger import logger
 
 # ---- 进程级内存缓存（同一次分析 + 30分钟短缓存） ----
 _capital_cache: Dict[str, tuple] = {}  # key → (data, expiry_ts)
+_FLOAT_SHARE_CACHE: Dict[str, float] | None = None  # code → 流通股本(万股)
 _CACHE_TTL_MINUTES = 30
 
 
@@ -61,6 +62,27 @@ def _cache_key_str(func_name: str, codes: List[str]) -> str:
     return f"{func_name}:{','.join(sorted(codes))}"
 
 
+def _load_float_shares() -> Dict[str, float]:
+    """从 Tushare stock_basic 获取流通股本（万股），缓存到模块变量"""
+    if _FLOAT_SHARE_CACHE is not None:
+        return _FLOAT_SHARE_CACHE
+    try:
+        import tushare as ts
+        df = ts.pro_api().stock_basic()
+        m = {}
+        for _, r in df.iterrows():
+            code = str(r.get("ts_code", ""))[:6]
+            fs = _safe_float(r.get("float_share"))
+            if code and fs:
+                m[code] = fs  # 万股
+        _FLOAT_SHARE_CACHE = m if m else {}
+        logger.info(f"[流通股本] 已加载 {len(_FLOAT_SHARE_CACHE)} 只")
+    except Exception as e:
+        logger.debug(f"[流通股本] 加载失败: {e}")
+        _FLOAT_SHARE_CACHE = {}
+    return _FLOAT_SHARE_CACHE
+
+
 def _em_symbol(code: str) -> str:
     """6位代码转东财带市场前缀写法（部分接口需要）"""
     if code.startswith("6"):
@@ -96,50 +118,105 @@ def _safe_float(val, default=None):
 def fetch_north_bound_holdings(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """
     北向资金持仓数据（沪深港通个股持股）。
-    数据来源：东方财富（通过 akshare stock_hsgt_individual_em）。
+    数据来源：优先 Tushare hk_hold，降级到 akshare stock_hsgt_individual_em。
     含缓存 + 重试，返回 {code: {"shares": 持股量, "ratio": 持股占流通A股比%, "value": 持股市值}}。
     """
     if not codes:
         return {}
 
-    def _do_fetch():
-        import akshare as ak
-        f = getattr(ak, "stock_hsgt_individual_em", None)
-        if f is None:
-            return {}
-        df = f()
-        if df is None or df.empty:
-            return {}
-
-        col_map = {}
-        for col in df.columns:
-            cl = str(col).strip()
-            if "代码" in cl:
-                col_map["code"] = col
-            elif "持股量" in cl:
-                col_map["shares"] = col
-            elif "占流通" in cl:
-                col_map["ratio"] = col
-            elif "持股市值" in cl or cl.endswith("市值"):
-                col_map["value"] = col
-        if "code" not in col_map:
-            return {}
-
-        result = {}
-        for code in codes:
-            try:
-                row = df[df[col_map["code"]].astype(str).str.strip() == code]
-                if row.empty:
+    def _try_tushare() -> Dict[str, Dict[str, Any]]:
+        """通过 Tushare hk_hold 获取北向资金持仓（ratio 重算为占流通A股比）"""
+        try:
+            from tools.stock.tushare_fetcher import TushareFetcher
+            from datetime import datetime, timedelta
+            tf = TushareFetcher()
+            end = datetime.now().strftime("%Y%m%d")
+            start = (datetime.now() - timedelta(days=30)).strftime("%Y%m%d")
+            float_shares = _load_float_shares()  # code → 万股
+            result = {}
+            for code in codes:
+                try:
+                    df = tf.hk_hold(f"{code}.SZ" if code.startswith(("0", "3"))
+                                    else f"{code}.SH", start, end)
+                    if df is not None and not df.empty:
+                        latest = df.iloc[-1]
+                        vol = _safe_float(latest.get("vol"), 0)
+                        # Tushare ratio 是按A股总股本算的，重算为占流通A股比
+                        fs = float_shares.get(code)  # 万股
+                        if fs and vol:
+                            calc_ratio = vol / (fs * 10000) * 100
+                        else:
+                            calc_ratio = _safe_float(latest.get("ratio"), 0)
+                        result[code] = {
+                            "shares": vol,
+                            "ratio": round(calc_ratio, 2),
+                            "value": _safe_float(latest.get("vol", 0), 0) * 0,
+                        }
+                except Exception:
                     continue
-                latest = row.iloc[-1]
-                result[code] = {
-                    "shares": _safe_float(latest.get(col_map.get("shares")), 0),
-                    "ratio": _safe_float(latest.get(col_map.get("ratio")), 0),
-                    "value": _safe_float(latest.get(col_map.get("value")), 0),
-                }
-            except Exception:
-                continue
-        return result
+            if result:
+                logger.info(f"[北向] Tushare 获取成功，{len(result)}只")
+            return result
+        except Exception as e:
+            logger.debug(f"[北向] Tushare获取失败，降级到Akshare: {e}")
+            return {}
+
+    def _try_akshare() -> Dict[str, Dict[str, Any]]:
+        """通过 akshare stock_hsgt_individual_em 降级获取"""
+        try:
+            import akshare as ak
+            f = getattr(ak, "stock_hsgt_individual_em", None)
+            if f is None:
+                return {}
+            df = f()
+            if df is None or df.empty:
+                return {}
+            # 该接口的列名通常为 ['持股日期','当日收盘价','当日涨跌幅','持股数量','持股市值','持股数量占A股百分比','今日增持股数','今日增持资金','今日持股市值变化']
+            # 无代码列，但可以用名称模糊匹配；仅作为最后的降级方案
+            name_col = None
+            shares_col = None
+            ratio_col = None
+            value_col = None
+            for col in df.columns:
+                cl = str(col).strip()
+                if "名称" in cl or "name" in cl.lower():
+                    name_col = col
+                elif "持股数量" == cl or cl == "持股数量":
+                    shares_col = col
+                elif "占A股" in cl:
+                    ratio_col = col
+                elif cl == "持股市值":
+                    value_col = col
+            if name_col is None:
+                return {}
+            from tools.company_code_validator import find_company_name
+            result = {}
+            for code in codes:
+                try:
+                    cname = find_company_name(code)
+                    if not cname:
+                        continue
+                    rows = df[df[name_col].astype(str).str.contains(cname[:4], na=False)]
+                    if rows.empty:
+                        continue
+                    latest = rows.iloc[-1]
+                    result[code] = {
+                        "shares": _safe_float(latest.get(shares_col), 0) if shares_col else 0,
+                        "ratio": _safe_float(latest.get(ratio_col), 0) if ratio_col else 0,
+                        "value": _safe_float(latest.get(value_col), 0) if value_col else 0,
+                    }
+                except Exception:
+                    continue
+            return result
+        except Exception as e:
+            logger.debug(f"[北向] Akshare降级失败: {e}")
+            return {}
+
+    def _do_fetch():
+        result = _try_tushare()
+        if result:
+            return result
+        return _try_akshare()
 
     return _cached_fetch("north_bound", codes, _do_fetch)
 
@@ -253,41 +330,100 @@ def fetch_margin_data(codes: List[str]) -> Dict[str, Dict[str, Any]]:
 def fetch_shareholder_count(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """
     股东户数数据。
-    数据来源：ak.stock_zh_a_gdhs()
+    数据来源：优先 Tushare holdernumber，降级到 ak.stock_zh_a_gdhs()。
     含缓存 + 重试，返回 {code: {"holders": 最新股东户数, "change_pct": 变化幅度%, "trend": 变化方向}}。
     """
     if not codes:
         return {}
 
-    def _do_fetch():
-        import akshare as ak
-        f = getattr(ak, "stock_zh_a_gdhs", None)
-        if f is None:
-            return {}
-        result = {}
-        for code in codes:
-            try:
-                df = f(symbol=code)
-                if df is None or df.empty:
+    def _try_tushare() -> Dict[str, Dict[str, Any]]:
+        """通过 Tushare holdernumber 获取股东户数"""
+        try:
+            import pandas as pd
+            from tools.stock.tushare_fetcher import TushareFetcher
+            from datetime import datetime, timedelta
+            tf = TushareFetcher()
+            end = datetime.now().strftime("%Y%m%d")
+            start = (datetime.now() - timedelta(days=365)).strftime("%Y%m%d")
+            result = {}
+            for code in codes:
+                try:
+                    ts_code = f"{code}.SZ" if code.startswith(("0", "3")) else f"{code}.SH"
+                    df = tf.holdernumber(ts_code, start, end)
+                    if df is not None and not df.empty:
+                        # 按 end_date 降序排列，最新的在前
+                        if 'end_date' in df.columns:
+                            df = df.sort_values('end_date', ascending=False)
+                        # 过滤出有实际数据的行（holder_num 不为 NaN 且 > 0）
+                        valid = df[pd.to_numeric(df['holder_num'], errors='coerce') > 0]
+                        if not valid.empty:
+                            latest = valid.iloc[0]  # 最新的有效行
+                            holders = _safe_float(latest.get("holder_num"), 0)
+                            # 取下一期（倒数第二新）计算变化
+                            prev = valid.iloc[1] if len(valid) >= 2 else None
+                            if prev is not None and holders > 0:
+                                prev_holders = _safe_float(prev.get("holder_num"), 0)
+                                if prev_holders and prev_holders > 0:
+                                    change_pct = (holders - prev_holders) / prev_holders * 100
+                                else:
+                                    change_pct = 0.0
+                            else:
+                                change_pct = 0.0
+                            trend = "集中" if change_pct < -3 else ("分散" if change_pct > 3 else "平稳")
+                            result[code] = {
+                                "holders": holders,
+                                "change_pct": round(change_pct, 2),
+                                "trend": trend,
+                            }
+                except Exception:
                     continue
-                holders_col = change_pct_col = trend_col = None
-                for col in df.columns:
-                    cl = str(col).strip()
-                    if "股东户数" in cl or "股东人数" in cl:
-                        holders_col = col
-                    elif "变化" in cl and ("%" in cl or "幅度" in cl or "比例" in cl):
-                        change_pct_col = col
-                    elif "变化" in cl and ("方向" in cl or "趋势" in cl):
-                        trend_col = col
-                latest = df.iloc[-1]
-                result[code] = {
-                    "holders": _safe_float(latest.get(holders_col), 0) if holders_col else 0,
-                    "change_pct": _safe_float(latest.get(change_pct_col), 0) if change_pct_col else 0,
-                    "trend": str(latest.get(trend_col, "")).strip() if trend_col else "未知",
-                }
-            except Exception:
-                continue
-        return result
+            if result:
+                logger.info(f"[股东户数] Tushare 获取成功，{len(result)}只")
+            return result
+        except Exception as e:
+            logger.debug(f"[股东户数] Tushare获取失败，降级到Akshare: {e}")
+            return {}
+
+    def _try_akshare() -> Dict[str, Dict[str, Any]]:
+        """通过 akshare stock_zh_a_gdhs 降级获取"""
+        try:
+            import akshare as ak
+            f = getattr(ak, "stock_zh_a_gdhs", None)
+            if f is None:
+                return {}
+            result = {}
+            for code in codes:
+                try:
+                    df = f(symbol=code)
+                    if df is None or df.empty:
+                        continue
+                    holders_col = change_pct_col = trend_col = None
+                    for col in df.columns:
+                        cl = str(col).strip()
+                        if "股东户数" in cl or "股东人数" in cl:
+                            holders_col = col
+                        elif "变化" in cl and ("%" in cl or "幅度" in cl or "比例" in cl):
+                            change_pct_col = col
+                        elif "变化" in cl and ("方向" in cl or "趋势" in cl):
+                            trend_col = col
+                    latest = df.iloc[-1]
+                    result[code] = {
+                        "holders": _safe_float(latest.get(holders_col), 0) if holders_col else 0,
+                        "change_pct": _safe_float(latest.get(change_pct_col), 0) if change_pct_col else 0,
+                        "trend": str(latest.get(trend_col, "")).strip() if trend_col else "未知",
+                    }
+                except Exception:
+                    continue
+            return result
+        except Exception as e:
+            logger.debug(f"[股东户数] Akshare降级失败: {e}")
+            return {}
+
+    def _do_fetch():
+        result = _try_tushare()
+        if result:
+            return result
+        return _try_akshare()
 
     return _cached_fetch("shareholder", codes, _do_fetch)
 
@@ -435,7 +571,7 @@ def fetch_all_capital_data(codes: List[str]) -> str:
 
     blocks = []
 
-    # 1. 北向资金
+    # 1. 北向资金（含趋势）
     try:
         nb = fetch_north_bound_holdings(codes)
         if nb:
@@ -448,6 +584,32 @@ def fetch_all_capital_data(codes: List[str]) -> str:
                         f"占流通A股{d['ratio']:.2f}%, "
                         f"持股市值{_fmt_num(d['value'])}元"
                     )
+                    # 尝试加趋势：查库内历史北向数据
+                    try:
+                        from storage.sqlite.stock_storage import get_db
+                        db = get_db()
+                        hist = db.get_stock_northbound_hold(code)
+                        if hist is not None and len(hist) >= 10:
+                            hist = hist.sort_values("trade_date")
+                            first_ratio = _safe_float(hist.iloc[0].get("ratio"))
+                            last_ratio = _safe_float(hist.iloc[-1].get("ratio"))
+                            # 用流通股本重算历史 ratio
+                            fs = _load_float_shares().get(code)
+                            if fs:
+                                first_vol = _safe_float(hist.iloc[0].get("vol"))
+                                last_vol = _safe_float(hist.iloc[-1].get("vol"))
+                                if first_vol and last_vol:
+                                    first_ratio_calc = first_vol / (fs * 10000) * 100
+                                    last_ratio_calc = last_vol / (fs * 10000) * 100
+                                    first_date = str(hist.iloc[0].get("trade_date"))[:10]
+                                    last_date = str(hist.iloc[-1].get("trade_date"))[:10]
+                                    trend = last_ratio_calc - first_ratio_calc
+                                    if trend < -0.5:
+                                        lines.append(f"    🔴 趋势判定：外资持续减持（{first_date} {first_ratio_calc:.2f}%→{last_date} {last_ratio_calc:.2f}%，累计变化{trend:.2f}个百分点）")
+                                    elif trend > 0.5:
+                                        lines.append(f"    🟢 趋势判定：外资持续增持（{first_date} {first_ratio_calc:.2f}%→{last_date} {last_ratio_calc:.2f}%，累计变化{trend:.2f}个百分点）")
+                    except Exception as e:
+                        logger.debug(f"[北向趋势] {code} 历史查询失败: {e}")
             if len(lines) > 1:
                 blocks.append("\n".join(lines))
     except Exception as e:

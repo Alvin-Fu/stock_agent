@@ -6932,11 +6932,12 @@ class DatabaseManager:
                         )
                     )
                 ).scalars().all()
-                existing_map = {r.end_date: r for r in existing_records}
+                # 统一用字符串作为 dict key，避免 date/datetime 类型不匹配
+                existing_map = {str(r.end_date): r for r in existing_records}
 
                 for _, row in df.iterrows():
                     end_date = parse_row_date(row.get('end_date'))
-                    existing = existing_map.get(end_date)
+                    existing = existing_map.get(str(end_date))
 
                     if existing:
                         existing.div_procf = row.get('div_procf')
