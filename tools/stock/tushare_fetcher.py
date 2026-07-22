@@ -624,7 +624,8 @@ class TushareFetcher(BaseFetcher):
                 start_date=ts_start,
                 end_date=ts_end,
                 fields=(
-                    "ts_code,ann_date,end_date,total_revenue,operate_profit,n_income,"
+                    "ts_code,ann_date,end_date,total_revenue,operate_profit,"
+                    "n_income,n_income_attr_p,"
                     "basic_eps,oper_cost,sell_exp,admin_exp,rd_exp,fin_exp,update_flag"
                 ),
             )

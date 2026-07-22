@@ -330,18 +330,30 @@ class ResearcherAgent:
 
         单条query超过 per_query_timeout 秒自动放弃，不让慢引擎（如DuckDuckGo）
         拖垮整批并行搜索。超时后直接返回失败，不再重试。
+        注意：不能在内层再包 ThreadPoolExecutor——嵌套池的超时只中断等待不中断任务，
+        会导致外层 worker 被僵尸线程占满，8个worker全堵死后整批搜索瘫痪。
         """
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _TimeoutError
+        import threading
         for attempt in range(max_retries):
             try:
                 logger.info(f"搜索: {query[:60]}...")
-                with ThreadPoolExecutor(max_workers=1) as _pool:
-                    _ft = _pool.submit(lambda: web_search.invoke({"query": query}))
+                result_container = []
+                error_container = []
+                def _do_search():
                     try:
-                        result = _ft.result(timeout=per_query_timeout)
-                    except _TimeoutError:
-                        logger.warning(f"搜索超时({per_query_timeout}s, attempt {attempt+1}): {query[:40]}")
-                        return f"搜索失败: 超时{per_query_timeout}s"
+                        r = web_search.invoke({"query": query})
+                        result_container.append(r)
+                    except Exception as e:
+                        error_container.append(e)
+                t = threading.Thread(target=_do_search, daemon=True)
+                t.start()
+                t.join(timeout=per_query_timeout)
+                if t.is_alive():
+                    logger.warning(f"搜索超时({per_query_timeout}s, attempt {attempt+1}): {query[:40]}")
+                    return f"搜索失败: 超时{per_query_timeout}s"
+                if error_container:
+                    raise error_container[0]
+                result = result_container[0] if result_container else ""
                 if isinstance(result, str):
                     # 工具兜底失败返回"搜索失败:"前缀
                     if result.startswith("搜索失败"):
@@ -484,12 +496,13 @@ class ResearcherAgent:
     - 举例：AI服务器业务中——"GB200出货量爆发"可能是一次性大客户集中部署，
       "液冷解决方案收入占比持续提升"才是持续性增长信号
 
-11. **资金筹码分析**（基于【资金筹码数据】程序数据块）：
+11. **资金筹码分析**（基于【资金筹码数据】程序数据块 + 【个股资金流向】补充数据块）：
     - **北向资金**：持股量变化趋势（增配/减配/新进）
     - **两融余额**：融资净买入方向，杠杆资金在加仓还是撤退
     - **股东户数**：户数变化趋势，筹码集中度在提升还是发散（户数↓=筹码集中，户数↑=筹码发散）
     - **机构持仓**：基金/机构家数及持仓占比变化
     - **限售解禁**：未来3个月大规模解禁预警（占流通股比>5%时单独警示）
+    - **个股资金流向**（基于【个股资金流向】数据）：当日主力净流入（万元/亿）、近5/10/20日累计主力净流入方向与规模、游资与散户方向是否与主力一致（分歧/共振——主力买入+散户卖出=机构吸筹，主力卖出+散户买入=机构出货），综合判断"机构主导还是游资炒作"
     - **综合判断**：整体资金面偏多/中性/偏空
 
 12. **SOTP分部估值**（如果程序计算模块提供了各业务净利润数据）：
@@ -550,6 +563,13 @@ class ResearcherAgent:
   - 出口量/总产量口径（含渠道库存与在途）= 非终端交付
   - 终端交付口径 = 实际销售给终端客户
   - 如果搜索结果中未明确口径，标注"统计口径待确认"
+- 重要：海外收入%与出口量%必须明确标注分子分母（如：海外收入/总收入 vs 出口量/总产量 vs 终端交付量/总交付量），两个数字不可混用
+- 如果材料中出现两个口径的数字（如年报38.65% vs 单月出口43.5%），必须分开表述并说明各自口径
+
+【同行对标补充要求】
+- 程序拉取的同行对比仅覆盖A股，不包含港股/美股同行
+- 如果目标公司在港股/美股有重要竞争对手（如吉利汽车00175.HK、理想汽车02015.HK等），必须在搜索结果中补充交叉比对
+- 同业对标必须区分"行业共性问题"（如价格战导致全行业毛利率下降）与"个股独特问题"（如某公司库存特别高）
 
 【风险对称要求】
 - 每条高影响力利好必须检查并列出对应风险（如：出口高增→关税/反补贴调查风险；大客户订单→客户集中度风险）
@@ -1242,8 +1262,8 @@ ETF 名称：{etf_name}
         # ---- 并行采集：网页搜索 + 程序数据拉取（互不依赖，同时进行） ----
         from concurrent.futures import ThreadPoolExecutor
         collected = {}
+        queries = self._build_stock_queries(stock_code)
         def _run_search():
-            queries = self._build_stock_queries(stock_code)
             return self._search_text(self._do_search(queries))
         def _run_industry():
             try:

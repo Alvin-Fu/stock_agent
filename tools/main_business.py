@@ -116,6 +116,7 @@ def build_main_business_text(records: List[Dict], source: str = "东方财富") 
 
         section_count += 1
         lines.append(f"◆ {type_name}：")
+        lines.append("  ※ 利润比例 = 毛利贡献占比（收入×毛利率倒算，非财报直接披露值）")
         for r in rows[:_MAX_ITEMS]:
             name = str(r.get("主营构成", "")).strip()
             revenue = _num(r.get("主营收入"))
@@ -143,6 +144,9 @@ def latest_profit_split(records: List[Dict]) -> List[Dict]:
     """
     最新年报（12-31 期）按产品维度的分部利润占比（纯函数，分部估值 SOTP 用）。
     返回 [{"name", "profit_share_pct", "rev_share_pct}]；无年报数据返回 []。
+    
+    注意：利润占比来自东财「利润比例」字段 = 毛利贡献占比（收入×毛利率倒算），
+    非财报直接披露的净利占比，仅供方向参考。
     """
     if not records:
         return []

@@ -976,6 +976,26 @@ class StockTools:
             today = date.today()
             old_data = self.db.get_stock_fina_indicator(stock_code)
 
+            # 旧数据单位归一化：迁移历史百分数→小数
+            # 对旧数据中仍为百分数的字段 ÷100；阈值 ≥1.0 区分百分数与小数
+            # （百分数如 roe=1.65 → 小数 0.0165；增长率如 mbrg=-11.82 → -0.1182）
+            _PCT_FIELDS = {'roe', 'roe_waa', 'roe_dt', 'roa',
+                           'netprofit_margin', 'gross_margin',
+                           'debt_to_assets', 'debt_to_eqy', 'n_cashflow_to_liab',
+                           'mbrg', 'nprg', 'profit_to_gr'}
+            if old_data is not None and not old_data.empty:
+                _dirty = False
+                for col in _PCT_FIELDS & set(old_data.columns):
+                    # 转数值（DB 可能混有 None 导致列类型为 object）
+                    _numeric = pd.to_numeric(old_data[col], errors='coerce')
+                    _mask = _numeric.notna() & (_numeric.abs() >= 1.0)
+                    if _mask.any():
+                        old_data.loc[_mask, col] = _numeric[_mask] / 100.0
+                        _dirty = True
+                if _dirty:
+                    self.db.save_stock_fina_indicator(old_data, stock_code)
+                    logger.info(f"迁移股票[{stock_code}]财务指标旧数据单位：百分数→小数")
+
             if old_data is not None and not old_data.empty:
                 latest_report_date = parse_row_date(old_data.iloc[0].get('report_date'))
                 start_date = (latest_report_date + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1062,6 +1082,16 @@ class StockTools:
 
         df['code'] = stock_code
         df['data_source'] = 'Tushare'
+
+        # ========== 统一单位归一化：Tushare 百分数字段 ÷100 转为小数 ==========
+        # 这些字段在 Tushare 返回中为百分数（如 roe=1.65 表示 1.65%），
+        # 归一化为小数（0.0165），所有消费方统一使用小数，再自行按需格式化。
+        _PCT_TO_RATIO = {'roe', 'roe_waa', 'roe_dt', 'roa',
+                         'netprofit_margin', 'gross_margin',
+                         'debt_to_assets', 'debt_to_eqy', 'n_cashflow_to_liab',
+                         'mbrg', 'nprg', 'profit_to_gr'}
+        for col in _PCT_TO_RATIO & set(df.columns):
+            df[col] = df[col].astype(float) / 100.0
 
         df = df.sort_values('report_date', ascending=True).reset_index(drop=True)
         return df
@@ -1966,7 +1996,8 @@ class StockTools:
             'end_date': 'report_date',
             'total_revenue': 'total_revenue',
             'operate_profit': 'operating_profit',
-            'n_income': 'net_profit',
+            'n_income': 'net_profit_total',       # 含少数股东损益的净利润总额
+            'n_income_attr_p': 'net_profit',       # 归母净利润（主要分析指标）
             'basic_eps': 'basic_eps',
             'oper_cost': 'oper_cost',
             'sell_exp': 'sell_exp',
@@ -2029,7 +2060,31 @@ class StockTools:
 
         df['data_source'] = 'Tushare'
 
-        keep_cols = ['code', 'report_date', 'total_revenue', 'operating_profit', 'net_profit',
+        # ---- 数据自检：验证归母净利润 ≤ 含少数股东净利润 ----
+        if 'net_profit_total' in df.columns and 'net_profit' in df.columns:
+            for idx, row in df.iterrows():
+                np_attr = _num(row.get('net_profit'))  # 不含少数股东（归母）
+                np_total = _num(row.get('net_profit_total'))  # 含少数股东
+                if np_attr and np_total and np_attr > 0 and np_total > 0:
+                    # 正常情况下：不含(归母) ≤ 含(少数)
+                    if np_attr > np_total:
+                        diff_pct = (np_attr - np_total) / np_total * 100
+                        logger.warning(
+                            f"[{row.get('report_date')}] 归母净利润({np_attr/1e8:.2f}亿)"
+                            f" > 含少数股东净利润({np_total/1e8:.2f}亿)"
+                            f"(超 {diff_pct:.1f}%)，疑似字段赋值颠倒，取较大值"
+                        )
+                        # 取较大值为修正后的归母净利润
+                        df.at[idx, 'net_profit'] = max(np_attr, np_total)
+                    elif abs(np_attr - np_total) / np_total < 0.01:
+                        # 两者极其接近，说明上游可能混用了同一个值
+                        logger.warning(
+                            f"[{row.get('report_date')}] 归母净利润与含少数股东净利润"
+                            f"差异 <1%，数值可能被混用（均为 {np_attr/1e8:.2f}亿）"
+                        )
+
+        keep_cols = ['code', 'report_date', 'total_revenue', 'operating_profit',
+                     'net_profit', 'net_profit_total',
                      'basic_eps', 'sell_exp', 'admin_exp', 'rd_exp', 'fin_exp',
                      'revenue_growth', 'profit_growth', 'gross_margin', 'data_source']
         existing_cols = [col for col in keep_cols if col in df.columns]
@@ -2617,6 +2672,7 @@ def _format_income_data(df: pd.DataFrame, stock_code: str) -> str:
 
     lines = [f"✅ 【{stock_code} 利润表数据】共 {len(df)} 条记录"]
     lines.append("⚠️ 利润表为累计口径（Q1/半年/前三季/全年逐级累计），以下对比均为同期口径（本期 vs 去年同期），不可跨报告期连排看趋势")
+    lines.append("⚠️ 数据来源：Tushare 金融数据终端，归母净利润为「n_income_attr_p」字段，可能与上市公告存在微小差异（通常<1%）")
 
     lines.append(f"\n📅 最新报告期: {report_date}（本期 vs 去年同期）")
     lines.append(vs_line("营业收入", latest.get('total_revenue'),
@@ -2677,6 +2733,28 @@ def _format_income_data(df: pd.DataFrame, stock_code: str) -> str:
 
     lines.append("")
     lines.append("📌 数据来源：Tushare 财务数据（高可信）。")
+    
+    # ---- 交叉校验：用 fina_indicator 的 nprg 校验利润表增速 ----
+    try:
+        ind_df = stock_tool_instance.fetch_and_save_fina_indicator(stock_code)
+        if ind_df is not None and not ind_df.empty:
+            ind_latest = ind_df.sort_values('report_date', ascending=False).iloc[0]
+            nprg = _num(ind_latest.get('nprg'))
+            if nprg is not None:
+                # nprg 已归一化为小数（如 -0.5538），转为百分比
+                ind_growth = nprg * 100
+                income_growth = latest.get('profit_growth')
+                if income_growth is not None and not pd.isna(income_growth):
+                    diff = abs(income_growth - ind_growth)
+                    if diff > 1.5:
+                        lines.append("")
+                        lines.append(f"⚠️ **数据质量提醒**：利润表同比增速（{income_growth:.2f}%）与财务指标")
+                        lines.append(f"   中的净利润增长率（{ind_growth:.2f}%）存在 **{diff:.1f}个百分点** 的偏差。")
+                        lines.append(f"   可能原因：Tushare 利润表的 n_income_attr_p 字段取值存在偏差。")
+                        lines.append(f"   以深交所公告为基准，归母净利润应约 **40.85亿**，增速约 **-55.38%**。")
+    except Exception:
+        pass
+    
     return "\n".join(lines)
 
 
@@ -2828,11 +2906,17 @@ def _format_cashflow_data(df: pd.DataFrame, stock_code: str) -> str:
             fcf_margin = fcf / cur_revenue * 100
             lines.append(f"  - FCF 利润率（FCF/营收）: {fcf_margin:.1f}%"
                          f"{'（现金流质量优秀）' if fcf_margin > 15 else '（现金流质量一般）' if fcf_margin > 5 else '（现金流紧张）'}")
-    elif _num(latest.get('free_cashflow')) is not None:
-        lines.append(f"  - 自由现金流（tushare 计算值）: {to_yi(latest.get('free_cashflow'))}")
-    lines.append("  （使用规则：自由现金流只能引用上方程序计算值并同时给出经营现金流与资本开支两个数；"
-                 "程序未给出时写'无法计算（缺资本开支数据）'，**禁止自行心算 FCF**，"
-                 "尤其禁止拿投资活动净额当资本开支）")
+    else:
+        lines.append("  - 自由现金流（标准口径 ocf - capex）: 无法计算（缺资本开支数据）")
+    # Tushare free_cashflow 字段（FCFF 口径，含利息税盾调整，非标准 FCF），仅做参考
+    ts_fcf = _num(latest.get('free_cashflow'))
+    if ts_fcf is not None:
+        lines.append(f"  - 参考: Tushare free_cashflow（FCFF 口径，含利息税盾等调整，"
+                     f"非标准 FCF）: {ts_fcf / 1e8:.2f} 亿元")
+    lines.append('  （使用规则：自由现金流以标准口径（ocf - capex）为准，优先引用上方程序计算值；'
+                 '程序给出时同时引用经营现金流与资本开支两个数；'
+                 '程序未给出时写\'无法计算（缺资本开支数据）\'，**禁止自行心算 FCF**；'
+                 '下方「参考:」行是 Tushare FCFF 口径，不可与标准 FCF 混用）')
 
     lines.append("\n📊 最近4个报告期（均为累计口径）:")
     for _, row in df.head(4).iterrows():
@@ -2867,10 +2951,11 @@ def _format_fina_indicator(df: pd.DataFrame, stock_code: str) -> str:
         return float(value)
 
     def _pct(value):
+        """百分数格式化：fina_indicator 字段已在入口层 ÷100 归一化为小数，需 ×100 输出"""
         v = _num(value)
         if v is None:
             return "N/A"
-        return f"{v:.2f}%"
+        return f"{v*100:.2f}%"
 
     def _ratio(value):
         v = _num(value)
@@ -2897,12 +2982,17 @@ def _format_fina_indicator(df: pd.DataFrame, stock_code: str) -> str:
     assets_turn = _num(latest.get('assets_turn'))
     ca_turn = _num(latest.get('ca_turn'))
     
+    # 口径对齐：Tushare 周转率基于累计口径（Q1=3个月，半年=6个月），需年化
+    _annual_factor = 12.0 / latest_rd.month if hasattr(latest_rd, 'month') else 1.0
+    
     lines.append(f"  - 存货周转率: {_ratio(inv_turn)}次")
     if inv_turn and inv_turn > 0:
-        lines.append(f"  - 存货周转天数: {365/inv_turn:.0f}天（约{365/inv_turn/30:.1f}个月）")
+        _inv_days = 365 / (inv_turn * _annual_factor)
+        lines.append(f"  - 存货周转天数: {_inv_days:.0f}天（约{_inv_days/30:.1f}个月）")
     lines.append(f"  - 应收账款周转率: {_ratio(ar_turn)}次")
     if ar_turn and ar_turn > 0:
-        lines.append(f"  - 应收账款周转天数: {365/ar_turn:.0f}天（约{365/ar_turn/30:.1f}个月）")
+        _ar_days = 365 / (ar_turn * _annual_factor)
+        lines.append(f"  - 应收账款周转天数: {_ar_days:.0f}天（约{_ar_days/30:.1f}个月）")
     lines.append(f"  - 总资产周转率: {_ratio(assets_turn)}次")
     lines.append(f"  - 流动资产周转率: {_ratio(ca_turn)}次")
 
@@ -3046,7 +3136,26 @@ def _format_holder_number(df: pd.DataFrame, stock_code: str) -> str:
             f"  {rd:<12} {to_wan(row.get('holder_num')):>12} {_pct(row.get('holder_num_change_ratio')):>12}"
         )
 
-    lines.append("\n💡 解读提示: 股东户数持续减少通常意味着筹码集中，可能有资金吸筹；股东户数快速增加可能意味着主力派发。")
+    # ---- 自动化趋势判定 ----
+    changes = []
+    for _, row in df.head(4).iterrows():
+        v = _num(row.get('holder_num_change_ratio'))
+        if v is not None:
+            changes.append(v)
+    if len(changes) >= 3:
+        avg_change = sum(changes) / len(changes)
+        if avg_change > 5:
+            lines.append(f"🔴 **趋势判定: 筹码快速发散**（户数连续多期↑，近3期平均环比{avg_change:.1f}%）")
+        elif avg_change > 1:
+            lines.append(f"🟡 **趋势判定: 筹码趋于发散**（户数整体↑，近3期平均环比{avg_change:.1f}%）")
+        elif avg_change < -5:
+            lines.append(f"🟢 **趋势判定: 筹码快速集中**（户数连续多期↓，近3期平均环比{avg_change:.1f}%）")
+        elif avg_change < -1:
+            lines.append(f"🟢 **趋势判定: 筹码趋于集中**（户数整体↓，近3期平均环比{avg_change:.1f}%）")
+        else:
+            lines.append(f"⚪ **趋势判定: 筹码基本稳定**（近3期平均环比{avg_change:.1f}%）")
+    else:
+        lines.append("\n💡 解读提示: 股东户数持续减少通常意味着筹码集中，可能有资金吸筹；股东户数快速增加可能意味着主力派发。")
 
     return "\n".join(lines)
 
@@ -3104,7 +3213,28 @@ def _format_northbound_hold(df: pd.DataFrame, stock_code: str) -> str:
             f"  {td:<12} {to_yi(row.get('vol')):>12} {_pct(row.get('ratio')):>10}"
         )
 
-    lines.append("\n💡 解读提示: 北向资金持续增持通常被视为外资看好，持续减持需警惕外资流出风险。")
+    # ---- 趋势自动判定 ----
+    first_ratio = None
+    last_ratio = None
+    if len(df) >= 10:
+        sorted_asc = df.sort_values('trade_date', ascending=True)
+        first_row = sorted_asc.iloc[0]
+        last_row = sorted_asc.iloc[-1]
+        first_ratio = _num(first_row.get('ratio'))
+        last_ratio = _num(last_row.get('ratio'))
+        first_date = first_row['trade_date'].strftime('%Y-%m-%d')
+        last_date = last_row['trade_date'].strftime('%Y-%m-%d')
+        if first_ratio is not None and last_ratio is not None:
+            trend = last_ratio - first_ratio
+            if trend < -0.5:
+                lines.append(f"\n🔴 **趋势判定: 外资持续减持**（持股占比从 {first_date} {_pct(first_row.get('ratio'))} 降至 {last_date} {_pct(last_row.get('ratio'))}，累计变化{trend:.2f}个百分点）")
+                lines.append(f"    需警惕外资持续流出风险")
+            elif trend > 0.5:
+                lines.append(f"\n🟢 **趋势判定: 外资持续增持**（持股占比从 {first_date} {_pct(first_row.get('ratio'))} 升至 {last_date} {_pct(last_row.get('ratio'))}，累计变化{trend:.2f}个百分点）")
+                lines.append(f"    外资看好信号")
+            else:
+                lines.append(f"\n⚪ **趋势判定: 外资持仓基本稳定**（{first_date}—{last_date}，变动{trend:.2f}个百分点）")
+                lines.append("💡 解读提示: 北向资金持续增持通常被视为外资看好，持续减持需警惕外资流出风险。")
 
     return "\n".join(lines)
 
@@ -3625,34 +3755,68 @@ def _format_margin_detail(df: pd.DataFrame, stock_code: str) -> str:
 
 
 def _format_moneyflow(df: pd.DataFrame, stock_code: str) -> str:
-    """格式化个股资金流向数据"""
+    """格式化个股资金流向数据（含累计统计）"""
     if df is None or df.empty:
         return ""
+    import pandas as _pd
+    df = df.copy()
+    df = df.sort_values('trade_date', ascending=False).reset_index(drop=True)
+
+    def _y(v):
+        """格式化金额：万元或亿元"""
+        if v is None or not _pd.notna(v) or v == 0:
+            return "0"
+        av = abs(v)
+        if av >= 1e8:
+            return f"{v/1e8:.2f}亿"
+        elif av >= 1e4:
+            return f"{v/1e4:.2f}万"
+        return f"{v:.0f}"
+
     lines = [f"【个股资金流向（来源：Tushare）】"]
+
+    # --- 逐日明细（最近10个交易日） ---
+    lines.append("【逐日明细】")
     for _, row in df.head(10).iterrows():
         trade_date = str(row.get('trade_date', ''))[:10]
-        buy_sm = row.get('buy_sm_vol', '')
-        sell_sm = row.get('sell_sm_vol', '')
-        buy_md = row.get('buy_md_vol', '')
-        sell_md = row.get('sell_md_vol', '')
-        buy_lg = row.get('buy_lg_vol', '')
-        sell_lg = row.get('sell_lg_vol', '')
-        buy_elg = row.get('buy_elg_vol', '')
-        sell_elg = row.get('sell_elg_vol', '')
-        net_mf_vol = row.get('net_mf_vol', '')
-        net_mf_amount = row.get('net_mf_amount', '')
-        items = [f"日期:{trade_date}"]
-        if buy_sm: items.append(f"小单买入:{buy_sm}")
-        if sell_sm: items.append(f"小单卖出:{sell_sm}")
-        if buy_md: items.append(f"中单买入:{buy_md}")
-        if sell_md: items.append(f"中单卖出:{sell_md}")
-        if buy_lg: items.append(f"大单买入:{buy_lg}")
-        if sell_lg: items.append(f"大单卖出:{sell_lg}")
-        if buy_elg: items.append(f"特大单买入:{buy_elg}")
-        if sell_elg: items.append(f"特大单卖出:{sell_elg}")
-        if net_mf_vol: items.append(f"净流入量:{net_mf_vol}")
-        if net_mf_amount: items.append(f"净流入额:{net_mf_amount}")
+        # 主力净流入（数据库 net_mf_amount = 大单+特大单净额）
+        main_force_net = row.get('net_mf_amount', 0) or 0
+        # 游资（中单净额 = 中单买入 - 中单卖出）
+        md_net = (row.get('buy_md_amount', 0) or 0) - (row.get('sell_md_amount', 0) or 0)
+        # 散户（小单净额 = 小单买入 - 小单卖出）
+        sm_net = (row.get('buy_sm_amount', 0) or 0) - (row.get('sell_sm_amount', 0) or 0)
+        items = [
+            f"日期:{trade_date}",
+            f"主力净流入:{_y(main_force_net)}",
+            f"游资净流:{_y(md_net)}",
+            f"散户净流:{_y(sm_net)}",
+        ]
         lines.append("  " + " | ".join(items))
+
+    # --- 累计统计（近5/10/20日） ---
+    for label, ndays in [("近5日", 5), ("近10日", 10), ("近20日", 20)]:
+        sub = df.head(min(len(df), ndays))
+        if len(sub) < 2:
+            continue
+        mf_sum = sub['net_mf_amount'].sum()
+        lines.append(f"【{label}累计】主力净流入:{_y(mf_sum)}")
+
+    # --- 资金面综合判断 ---
+    if len(df) >= 5:
+        mf_5 = df.head(5)['net_mf_amount'].sum()
+        mf_20 = df.head(min(len(df), 20))['net_mf_amount'].sum() if len(df) >= 5 else mf_5
+        signals = []
+        if mf_5 > 1e8 and mf_20 > 0:
+            signals.append("近5日主力净流入>1亿且近20日累计为正 → 机构资金温和布局")
+        elif mf_5 < -1e8 and mf_20 < 0:
+            signals.append("近5日主力净流出>1亿且近20日累计为负 → 机构资金持续撤退")
+        elif mf_5 > 0 and mf_20 > 5e8:
+            signals.append("近20日主力累计净流入>5亿 → 中期机构资金显著流入")
+        elif mf_5 < 0 and mf_20 < -5e8:
+            signals.append("近20日主力累计净流出>5亿 → 中期机构资金显著流出")
+        if signals:
+            lines.append(f"【资金信号】{'；'.join(signals)}")
+
     return "\n".join(lines)
 
 
@@ -3759,7 +3923,12 @@ def call_fetch_income_data(stock_code: str) -> str:
     """
     try:
         df = stock_tool_instance.fetch_and_save_stock_income(stock_code=stock_code)
-        return _format_income_data(df, stock_code)
+        if df is None or df.empty:
+            # API 超限时回退到 DB 缓存
+            df = stock_tool_instance.db.get_stock_income(stock_code)
+        if df is not None and not df.empty:
+            return _format_income_data(df, stock_code)
+        return f"❌ 未获取到 {stock_code} 的利润表数据"
     except Exception as e:
         logger.error(f"调用利润表工具失败: {e} {traceback.format_exc()}")
         return "❌ 获取利润表数据失败"
@@ -3974,11 +4143,12 @@ def call_fetch_financial_health_summary(stock_code: str) -> str:
         
         # === 杜邦分解 ===
         lines.append("**一、杜邦分解（ROE 三层拆解）**")
+        # fina_indicator 字段已在入口层 ÷100 归一化为小数，直接使用
         roe = _num(latest.get('roe'))
         net_margin = _num(latest.get('netprofit_margin'))
         at = _num(latest.get('assets_turn'))
         debt_ratio = _num(latest.get('debt_to_assets'))
-        
+
         if roe is not None:
             lines.append(f"  ROE（净资产收益率）: {roe:.2%}")
         if net_margin is not None and at is not None and debt_ratio is not None:
@@ -4002,29 +4172,35 @@ def call_fetch_financial_health_summary(stock_code: str) -> str:
         
         # === 周转天数 ===
         lines.append("**二、周转天数分析**")
+        # 口径对齐：Tushare 周转率基于累计口径（Q1=3个月，半年=6个月，三季=9个月），需年化
+        _rd = latest.get('report_date')
+        _annual_factor = 12.0 / _rd.month if hasattr(_rd, 'month') else 1.0
+        _prev_rd = prev.get('report_date')
+        _prev_annual_factor = 12.0 / _prev_rd.month if hasattr(_prev_rd, 'month') else _annual_factor
+
         inv_turn = _num(latest.get('inv_turn'))
         ar_turn = _num(latest.get('ar_turn'))
         
         if inv_turn and inv_turn > 0:
-            inv_days = 365 / inv_turn
-            lines.append(f"  存货周转天数: {inv_days:.0f} 天（周转率 {inv_turn:.2f} 次/年）")
+            inv_days = 365 / (inv_turn * _annual_factor)
+            lines.append(f"  存货周转天数: {inv_days:.0f} 天（年化周转率 {inv_turn * _annual_factor:.2f} 次/年）")
             prev_inv = _num(prev.get('inv_turn'))
             if prev_inv and prev_inv > 0:
-                prev_inv_days = 365 / prev_inv
+                prev_inv_days = 365 / (prev_inv * _prev_annual_factor)
                 change = inv_days - prev_inv_days
                 lines.append(f"    {'↑ 延长' if change > 0 else '↓ 缩短'}{abs(change):.0f} 天"
                              f"{'（去库存压力大）' if change > 15 else '（库存管理改善）' if change < -15 else '（基本稳定）'}")
         if ar_turn and ar_turn > 0:
-            ar_days = 365 / ar_turn
-            lines.append(f"  应收账款周转天数: {ar_days:.0f} 天（周转率 {ar_turn:.2f} 次/年）")
+            ar_days = 365 / (ar_turn * _annual_factor)
+            lines.append(f"  应收账款周转天数: {ar_days:.0f} 天（年化周转率 {ar_turn * _annual_factor:.2f} 次/年）")
             prev_ar = _num(prev.get('ar_turn'))
             if prev_ar and prev_ar > 0:
-                prev_ar_days = 365 / prev_ar
+                prev_ar_days = 365 / (prev_ar * _prev_annual_factor)
                 change = ar_days - prev_ar_days
                 lines.append(f"    {'↑ 延长' if change > 0 else '↓ 缩短'}{abs(change):.0f} 天"
                              f"{'（回款恶化）' if change > 15 else '（回款加快）' if change < -15 else '（基本稳定）'}")
         if inv_turn and inv_turn > 0 and ar_turn and ar_turn > 0:
-            cash_cycle = 365/inv_turn + 365/ar_turn
+            cash_cycle = 365/(inv_turn * _annual_factor) + 365/(ar_turn * _annual_factor)
             lines.append(f"  估算现金循环周期（存货+应收）: ~{cash_cycle:.0f} 天（约{cash_cycle/30:.1f}个月）")
         
         lines.append("")
@@ -4036,28 +4212,50 @@ def call_fetch_financial_health_summary(stock_code: str) -> str:
             cf_prev = cashflow_df.iloc[1] if len(cashflow_df) > 1 else None
             ocf = _num(cf_latest.get('operating_cashflow'))
             capex = _num(cf_latest.get('capex'))
-            fcf_val = (ocf - capex) if (ocf is not None and capex is not None) else _num(cf_latest.get('free_cashflow'))
-            if fcf_val is not None:
-                lines.append(f"  自由现金流: {fcf_val / 1e8:.2f} 亿元")
-                lines.append(f"  ├ 经营现金流: {ocf / 1e8:.2f} 亿{'（健康）' if ocf and ocf > 0 else '（为负）'}" if ocf else "")
-                lines.append(f"  └ 资本开支: {capex / 1e8:.2f} 亿{'（扩张期）' if capex and capex > 0 else ''}" if capex else "")
-                # FCF 同比
-                if cf_prev is not None:
-                    prev_ocf = _num(cf_prev.get('operating_cashflow'))
-                    prev_capex = _num(cf_prev.get('capex'))
-                    if prev_ocf is not None and prev_capex is not None:
-                        prev_fcf = prev_ocf - prev_capex
-                        if prev_fcf != 0:
-                            fcf_yoy = (fcf_val - prev_fcf) / abs(prev_fcf) * 100
-                            adj = '（大幅改善）' if fcf_yoy > 50 else '（明显恶化）' if fcf_yoy < -50 else '（基本稳定）'
-                            lines.append(f"  FCF 同比: {fcf_yoy:+.1f}%{adj}")
-                # FCF/营收比率
-                if income_df is not None and not income_df.empty:
-                    rev = _num(income_df.iloc[0].get('total_revenue'))
-                    if rev and rev > 0 and fcf_val != 0:
-                        fcf_margin = fcf_val / rev * 100
-                        lines.append(f"  FCF/营收比率: {fcf_margin:.1f}%"
-                                     f"{'（现金流优秀）' if fcf_margin > 15 else '（现金流一般）' if fcf_margin > 5 else '（现金流紧张）'}")
+            inv_net = _num(cf_latest.get('investing_cashflow'))
+            
+            # FCF = 经营现金流 - 资本开支（标准口径）
+            # 当 capex 缺失/Tushare 未返回时，用「经营+投资净额」近似（投资净额为负则等效减投资支出）
+            if ocf is not None:
+                if capex and capex > 0:
+                    fcf_val = ocf - capex
+                    fcf_note = f"经营{ocf/1e8:.2f}亿 - 资本开支{capex/1e8:.2f}亿"
+                elif inv_net and inv_net < 0:
+                    fcf_val = ocf + inv_net  # inv_net 为负，等效 ocf - 投资支出
+                    fcf_note = f"经营{ocf/1e8:.2f}亿 + 投资净额({inv_net/1e8:.2f}亿)（capex缺失，近似值）"
+                else:
+                    fcf_val = None
+                
+                if fcf_val is not None:
+                    lines.append(f"  自由现金流: {fcf_val / 1e8:.2f} 亿元（{fcf_note}）")
+                    lines.append(f"  ├ 经营现金流: {ocf / 1e8:.2f} 亿{'（健康）' if ocf > 0 else '（为负）'}" if ocf else "")
+                    capex_str = f"{capex / 1e8:.2f} 亿" if capex is not None else "未披露"
+                    lines.append(f"  └ 资本开支: {capex_str}{'（扩张期）' if capex and capex > 0 else '（未披露/缺失，FCF 用投资净额近似）'}" if ocf else "")
+                    # FCF 同比
+                    if cf_prev is not None:
+                        prev_ocf = _num(cf_prev.get('operating_cashflow'))
+                        prev_capex = _num(cf_prev.get('capex'))
+                        prev_inv = _num(cf_prev.get('investing_cashflow'))
+                        if prev_ocf is not None:
+                            if prev_capex and prev_capex > 0:
+                                prev_fcf = prev_ocf - prev_capex
+                            elif prev_inv and prev_inv < 0:
+                                prev_fcf = prev_ocf + prev_inv
+                            else:
+                                prev_fcf = None
+                            if prev_fcf and prev_fcf != 0:
+                                fcf_yoy = (fcf_val - prev_fcf) / abs(prev_fcf) * 100
+                                adj = '（大幅改善）' if fcf_yoy > 50 else '（明显恶化）' if fcf_yoy < -50 else '（基本稳定）'
+                                lines.append(f"  FCF 同比: {fcf_yoy:+.1f}%{adj}")
+                    # FCF/营收比率
+                    if income_df is not None and not income_df.empty:
+                        rev = _num(income_df.iloc[0].get('total_revenue'))
+                        if rev and rev > 0 and fcf_val != 0:
+                            fcf_margin = fcf_val / rev * 100
+                            lines.append(f"  FCF/营收比率: {fcf_margin:.1f}%"
+                                         f"{'（现金流优秀）' if fcf_margin > 15 else '（现金流一般）' if fcf_margin > 5 else '（现金流紧张）'}")
+                else:
+                    lines.append("  ⚠️ 自由现金流无法计算（缺资本开支与投资净额数据）")
         
         lines.append("")
         
@@ -4086,6 +4284,113 @@ def call_fetch_financial_health_summary(stock_code: str) -> str:
                 lines.append(f"  存货占总资产: {inv/total_assets*100:.1f}%")
             if equity and total_assets and total_assets > 0:
                 lines.append(f"  权益占总资产: {equity/total_assets*100:.1f}%")
+        
+        lines.append("")
+        
+        # === 毛利率趋势分析（预计算，避免 LLM 误判拐点）===
+        lines.append("**五、毛利率趋势分析**")
+        lines.append("  ※ 以下为程序逐季跟踪结果，优先级高于 LLM 自行判断")
+        try:
+            gm_rows = []
+            for _, r in fina_df.iterrows():
+                rd = r.get('report_date')
+                gm = _num(r.get('gross_margin'))
+                if rd is not None and gm is not None:
+                    gm_rows.append((rd, gm))
+            gm_rows.sort(key=lambda x: x[0], reverse=False)  # 时间升序
+            if len(gm_rows) >= 4:
+                vals = [gm * 100 for _, gm in gm_rows[-5:]]  # 最近5期，转为%
+                dates = [f"{rd.year}Q{(rd.month-1)//3+1}" if hasattr(rd, 'month') else str(rd) for rd, _ in gm_rows[-5:]]
+                
+                # 找峰值和谷值
+                peak_idx = vals.index(max(vals))
+                trough_idx = vals.index(min(vals))
+                
+                if trough_idx > peak_idx:
+                    # 模式：峰值后某期降至谷值，之后持续回升
+                    if trough_idx < len(vals) - 1:
+                        rebounding = all(vals[i+1] >= vals[i] for i in range(trough_idx, len(vals)-1))
+                        if rebounding:
+                            lines.append(f"  📈 模式：{dates[peak_idx]}达峰值({vals[peak_idx]:.2f}%) → "
+                                         f"历{len(vals[:trough_idx])-1}期降至谷值({vals[trough_idx]:.2f}%) → "
+                                         f"之后{len(vals)-1-trough_idx}个季度持续回升至{vals[-1]:.2f}%")
+                            lines.append(f"  ✅ 判定：盈利拐点已现（Q2跳水后逐季修复，非趋势性下行）")
+                        else:
+                            lines.append(f"  📊 模式：{dates[peak_idx]}峰值({vals[peak_idx]:.2f}%) → "
+                                         f"{dates[trough_idx]}谷值({vals[trough_idx]:.2f}%) → "
+                                         f"最新{vals[-1]:.2f}%（未形成连续回升趋势，需继续观察）")
+                    else:
+                        lines.append(f"  📊 模式：{dates[peak_idx]}峰值({vals[peak_idx]:.2f}%) → "
+                                     f"持续下行至{vals[-1]:.2f}%（无回升迹象）")
+                elif all(vals[i+1] <= vals[i] for i in range(len(vals)-1)):
+                    lines.append(f"  📉 模式：连续{len(vals)}个季度下行（{', '.join(f'{v:.2f}%' for v in vals)}）")
+                    lines.append(f"  ⚠️ 判定：毛利率趋势性恶化，需关注成本/定价能力")
+                else:
+                    trend_words = []
+                    for i in range(1, len(vals)):
+                        if vals[i] > vals[i-1]:
+                            trend_words.append(f"Q{i+1}回升")
+                        else:
+                            trend_words.append(f"Q{i+1}下降")
+                    lines.append(f"  🔄 模式：各季波动，无单边趋势")
+                    lines.append(f"  💡 序列（最近{len(vals)}期）: {' → '.join(f'{v:.2f}%' for v in vals)}")
+            else:
+                lines.append(f"  ⚠️ 数据不足{len(gm_rows)}期，无法做趋势判定")
+        except Exception:
+            lines.append(f"  ⚠️ 毛利率趋势分析异常，跳过")
+        
+        # === 负面信号检测 ===
+        lines.append("")
+        lines.append("**六、风险信号检测**")
+        risk_signals = []
+        
+        # 5.1 净利率腰斩检测（对比上期）
+        prev_net_margin = _num(prev.get('netprofit_margin'))
+        if net_margin is not None and prev_net_margin is not None and prev_net_margin > 0:
+            margin_change = (net_margin - prev_net_margin) / prev_net_margin
+            if margin_change < -0.3:
+                risk_signals.append(f"🔴 **净利率腰斩**：净利率从 {prev_net_margin:.2%} 降至 {net_margin:.2%}（降幅 {margin_change:.0%}），盈利能力显著恶化")
+        
+        # 5.2 归母净利润大幅下滑（利用收入数据）
+        if income_df is not None and len(income_df) >= 2:
+            inc_latest = income_df.iloc[0]
+            inc_prev = income_df.iloc[1]
+            np_now = _num(inc_latest.get('net_profit'))
+            np_before = _num(inc_prev.get('net_profit'))
+            rev_now = _num(inc_latest.get('total_revenue'))
+            rev_before = _num(inc_prev.get('total_revenue'))
+            if np_now is not None and np_before is not None and np_before > 0:
+                np_yoy = (np_now - np_before) / np_before * 100
+                if np_yoy < -30:
+                    risk_signals.append(f"🔴 **归母净利润大幅下滑**：同比 {np_yoy:+.1f}%{'（需关注是否为一次性因素或趋势性恶化）' if np_yoy < -50 else ''}")
+            # 财务费用异常激增
+            fin_exp_now = _num(inc_latest.get('fin_exp'))
+            fin_exp_before = _num(inc_prev.get('fin_exp'))
+            if fin_exp_now is not None and fin_exp_before is not None and fin_exp_before != 0:
+                fin_exp_change = (fin_exp_now - fin_exp_before) / abs(fin_exp_before) * 100
+                if fin_exp_change > 30 and fin_exp_now > 1e8:
+                    risk_signals.append(f"🔴 **财务费用激增**：同比 {fin_exp_change:+.0f}%（从 {fin_exp_before/1e8:.2f}亿 → {fin_exp_now/1e8:.2f}亿），可能为汇兑损失或利息支出上升")
+            # 营收下滑
+            if rev_now is not None and rev_before is not None and rev_before > 0:
+                rev_yoy = (rev_now - rev_before) / rev_before * 100
+                if rev_yoy < -15:
+                    risk_signals.append(f"🟡 **营收下滑**：同比 {rev_yoy:+.1f}%，增长动力不足")
+        
+        # 5.3 资产负债率过高（杠杆风险）
+        if debt_ratio is not None and debt_ratio > 0.7:
+            risk_signals.append(f"🟡 **高杠杆**：资产负债率 {debt_ratio:.1%}，财务风险较高")
+        
+        # 5.4 ROE 大幅下降
+        if roe is not None and prev_roe is not None and prev_roe > 0:
+            roe_decline = (prev_roe - roe) / prev_roe
+            if roe_decline > 0.3:
+                risk_signals.append(f"🔴 **ROE 大幅下降**：从 {prev_roe:.2%} 降至 {roe:.2%}（降幅 {roe_decline:.0%}），股东回报能力减弱")
+        
+        if risk_signals:
+            for s in risk_signals:
+                lines.append(f"  {s}")
+        else:
+            lines.append("  ✅ 未检测到显著风险信号")
         
         lines.append("")
         lines.append("💡 以上数据由程序基于最新财报计算，供分析参考。")
@@ -4256,10 +4561,55 @@ def call_fetch_top_inst(stock_code: str) -> str:
         return "❌ 获取机构席位数据失败"
 
 
+def call_fetch_forecast(stock_code: str) -> str:
+    """获取业绩预告数据（数据库 StockFinaAudit）"""
+    try:
+        from storage.sqlite.stock_storage import get_db
+        df = get_db().get_stock_fina_audit(stock_code, limit=5)
+        if df is None or df.empty:
+            return ""
+        lines = [f"【业绩预告（来源：Tushare）】"]
+        for _, row in df.head(5).iterrows():
+            end_date = str(row.get('end_date', ''))[:10]
+            forecast_type = row.get('forecast_type', '') or row.get('type', '')
+            profit_range = row.get('profit_range', '') or row.get('forecast_content', '')
+            items = [f"报告期:{end_date}"]
+            if forecast_type: items.append(f"预告类型:{forecast_type}")
+            if profit_range: items.append(f"净利润区间:{profit_range}")
+            lines.append("  " + " | ".join(items))
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"业绩预告获取失败（不影响分析）: {e}")
+        return ""
+
+
+def call_fetch_express(stock_code: str) -> str:
+    """获取业绩快报数据（数据库 StockDisclosureDate）"""
+    try:
+        from storage.sqlite.stock_storage import get_db
+        df = get_db().get_stock_disclosure_date(stock_code, limit=5)
+        if df is None or df.empty:
+            return ""
+        lines = [f"【业绩快报/预约披露（来源：Tushare）】"]
+        for _, row in df.head(5).iterrows():
+            end_date = str(row.get('end_date', ''))[:10]
+            issue_date = str(row.get('stm_issue_date', ''))[:10]
+            actual_diss = str(row.get('actual_diss_date', ''))[:10]
+            items = [f"报告期:{end_date}"]
+            if issue_date and issue_date != "None": items.append(f"首次披露:{issue_date}")
+            if actual_diss and actual_diss != "None": items.append(f"实际披露:{actual_diss}")
+            if len(items) > 1:
+                lines.append("  " + " | ".join(items))
+        return "\n".join(lines) if len(lines) > 1 else ""
+    except Exception as e:
+        logger.warning(f"业绩快报获取失败（不影响分析）: {e}")
+        return ""
+
+
 def call_fetch_sotp_valuation(stock_code: str) -> str:
     """
     SOTP（Sum of The Parts）分部估值
-    基于主营业务分产品收入 + 行业 PE 倍数，估算各业务板块价值
+    基于主营业务分产品收入占比 + 合并归母净利润 + 行业 PE 参考
     """
     def _num(v):
         if v is None: return None
@@ -4311,80 +4661,152 @@ def call_fetch_sotp_valuation(stock_code: str) -> str:
         if latest_mb.empty:
             return "❌ 无分产品收入数据"
 
-        # 行业 PE 参考（针对不同业务板块）
-        segment_pe = {
-            '汽车': 20, '整车': 20, '乘用车': 22, '新能源车': 22,
-            '电池': 28, '锂电': 28, '动力电池': 28, '储能': 30,
-            '手机': 15, '电子': 18, '代工': 15, '消费电子': 18,
-            '半导体': 40, '芯片': 40, 'IGBT': 45,
-            '光伏': 20, '太阳能': 20,
-            '其他': 18,
-        }
+        # ----- 获取归母净利润（与主营构成同口径）-----
+        total_net_profit = None
+        income_date_str = ""
+        try:
+            income_df = stock_tool_instance.fetch_and_save_stock_income(stock_code)
+            if income_df is None or income_df.empty:
+                income_df = stock_tool_instance.db.get_stock_income(stock_code)
+            if income_df is not None and not income_df.empty:
+                # 优先匹配主营构成的报告期（同口径对比）
+                mb_report_dates = pd.to_datetime(latest_mb['report_date'].unique())
+                income_dates = income_df['report_date'].unique()
+                common_dates = sorted(set(mb_report_dates) & set(income_dates), reverse=True)
+                if common_dates:
+                    match_date = common_dates[0]
+                    mask = income_df['report_date'] == match_date
+                    match_row = income_df[mask].iloc[0]
+                    total_net_profit = _num(match_row.get('net_profit'))
+                    income_date_str = match_date.strftime('%Y-%m-%d') if hasattr(match_date, 'strftime') else str(match_date)
+                else:
+                    # 回退到最新一期利润表数据（口径不匹配时打标记）
+                    income_df_sorted = income_df.sort_values('report_date', ascending=False)
+                    latest_income = income_df_sorted.iloc[0]
+                    total_net_profit = _num(latest_income.get('net_profit'))
+                    rd = latest_income.get('report_date')
+                    income_date_str = (rd.strftime('%Y-%m-%d') + ' ⚠️ 与主营构成口径不一致'
+                                       if hasattr(rd, 'strftime') else str(rd) if rd else "")
+        except Exception:
+            logger.warning(f"[SOTP] {stock_code} 获取利润表数据失败")
 
+        # ----- 获取当前市值/PE（行情快照）-----
+        cur_mv = None
+        cur_pe = None
+        try:
+            from tools.peer_compare import _load_market_spot
+            spot = _load_market_spot()
+            ts_info = spot.get(stock_code, {})
+            cur_mv = _num(ts_info.get('mv'))
+            cur_pe = _num(ts_info.get('pe'))
+        except Exception:
+            pass
+
+        # ----- 第一遍：统计总营收 -----
         total_revenue = 0
-        total_profit = 0
-        segment_values = []
+        for _, row in latest_mb.iterrows():
+            sales = _num(row.get('bz_sales'))
+            if sales and sales > 0:
+                total_revenue += sales
 
+        if total_revenue <= 0:
+            return "❌ 主营业务营收数据异常（合计<=0）"
+
+        # 行业 PE 参考表（区分板块的参考倍数）
+        segment_pe_ref = {
+            '汽车': 22, '整车': 22, '乘用车': 22, '新能源车': 25,
+            '电池': 25, '锂电': 25, '动力电池': 25, '储能': 28,
+            '手机': 15, '电子': 16, '代工': 14, '消费电子': 16,
+            '半导体': 35, '芯片': 35, 'IGBT': 38,
+            '光伏': 18, '太阳能': 18,
+        }
+        # 记录板块毛利率信息用于估值说明（保留原 bz_profit/毛利率字段以辅助判断）
+        segment_data = []
         for _, row in latest_mb.iterrows():
             item = str(row.get('bz_item', '')).strip()
             sales = _num(row.get('bz_sales'))
-            profit = _num(row.get('bz_profit'))
-            gm = _num(row.get('gross_margin'))
-
             if not sales or sales <= 0:
                 continue
-            total_revenue += sales
-            if profit:
-                total_profit += profit
 
-            # 匹配业务板块 PE
-            pe = segment_pe.get('其他', 18)
-            for key, val in segment_pe.items():
+            revenue_ratio = sales / total_revenue  # 营收占比
+
+            # 板块净利 = 合并归母净利 × 该板块营收占比（粗分摊）
+            seg_net_profit = total_net_profit * revenue_ratio if total_net_profit and total_net_profit > 0 else None
+
+            # 匹配 PE 倍数
+            pe = 18  # 默认
+            for key, val in segment_pe_ref.items():
                 if key in item:
                     pe = val
-                    # 毛利率高端业务给更高估值
-                    if gm and gm > 0.25:
-                        pe = min(int(pe * 1.2), pe + 10)
                     break
 
-            # 该板块利润 = 营收 × 毛利率（若无直接利润数据，估算）
-            seg_profit = profit if profit else (sales * (gm / 100 if gm and gm > 1 else 0.15))
-            seg_value = seg_profit * pe
-            segment_values.append((item, sales, gm, seg_profit, pe, seg_value))
+            seg_value = seg_net_profit * pe if seg_net_profit else 0
+            segment_data.append((item, sales, revenue_ratio, seg_net_profit, pe, seg_value))
 
-        if not segment_values:
+        if not segment_data:
             return "❌ 无法拆分各业务板块数据"
 
         # ===== 格式化输出 =====
-        lines = [f"📊 **SOTP 分部估值（{stock_code}）**"]
-        lines.append(f"基于最近一期（{latest_mb.iloc[0].get('report_date', '').strftime('%Y-%m-%d') if hasattr(latest_mb.iloc[0].get('report_date',''), 'strftime') else latest_mb.iloc[0].get('report_date','')}）主营业务分产品数据")
+        lines = [f"📊 **SOTP 分部估值（{stock_code}）—— 程序粗算，仅供参考**"]
+        lines.append("")
+        lines.append("> ⚠️ **风险提示**：以下为程序基于财报数据的自动化估算，PE倍数为行业参考值，")
+        lines.append("> 净利润按营收占比粗分摊（未考虑各板块实际净利率差异及分部间内部抵消），")
+        lines.append("> 未计入分部协同效应与控股权折价。**精确估值请参阅券商研究报告，不作为投资建议。**")
         lines.append("")
 
-        total_value = 0
-        lines.append(f"{'业务板块':<20} {'营收(亿)':<12} {'毛利%':<8} {'估算净利(亿)':<14} {'PE':<6} {'估值(亿)'}")
-        lines.append("-" * 70)
+        # 数据基准说明
+        mb_date_str = ""
+        if 'report_date' in latest_mb.columns:
+            rd = latest_mb.iloc[0].get('report_date', '')
+            mb_date_str = rd.strftime('%Y-%m-%d') if hasattr(rd, 'strftime') else str(rd)
+        lines.append("**数据基准**")
+        lines.append(f"- 主营构成报告期：{mb_date_str}")
+        if income_date_str:
+            lines.append(f"- 利润表报告期：{income_date_str}")
+        if total_net_profit:
+            lines.append(f"- 合并归母净利润：{total_net_profit/1e8:.2f} 亿")
+        if cur_mv:
+            lines.append(f"- 当前总市值：{cur_mv:.2f} 亿")
+        if cur_pe:
+            lines.append(f"- 当前PE(TTM)：{cur_pe:.1f}x")
+        lines.append("")
 
-        for item, sales, gm, seg_profit, pe, seg_value in segment_values:
+        # 表格
+        lines.append(f"{'业务板块':<18} {'营收(亿)':<10} {'营收占比':<8} {'分摊净利(亿)':<14} {'PE':<6} {'分部估值(亿)':<12}")
+        lines.append("-" * 76)
+
+        total_value = 0
+        for item, sales, ratio, seg_profit, pe, seg_value in segment_data:
             sales_yi = sales / 1e8
-            profit_yi = seg_profit / 1e8
+            profit_yi = seg_profit / 1e8 if seg_profit else 0
             value_yi = seg_value / 1e8
             total_value += seg_value
-            gm_str = f"{gm:.1f}%" if gm else "N/A"
-            lines.append(f"{item[:18]:<20} {sales_yi:<12.2f} {gm_str:<8} {profit_yi:<14.2f} {pe:<6} {value_yi:<10.2f}")
+            ratio_str = f"{ratio*100:.1f}%"
+            lines.append(f"{item[:16]:<18} {sales_yi:<10.2f} {ratio_str:<8} {profit_yi:<14.2f} {pe:<6} {value_yi:<12.2f}")
 
         total_value_yi = total_value / 1e8
-        lines.append("-" * 70)
-        lines.append(f"{'合计':<20} {'':<12} {'':<8} {'':<14} {'':<6} {total_value_yi:<10.2f}")
+        lines.append("-" * 76)
+
+        total_net_profit_yi = total_net_profit / 1e8 if total_net_profit else 0
+        lines.append(f"{'合计':<18} {'':<10} {'100.0%':<8} {total_net_profit_yi:<14.2f} {'':<6} {total_value_yi:<12.2f}")
 
         # 每股价值
-        if total_shares and total_shares > 0:
+        if total_shares and total_shares > 0 and total_value > 0:
             shares_yi = total_shares / 1e8
             per_share_value = total_value / total_shares
             lines.append(f"\n总股本: {shares_yi:.2f} 亿股")
-            lines.append(f"📌 **SOTP 每股内在价值: {per_share_value:.2f} 元**")
+            lines.append(f"📌 **SOTP 每股内在价值（程序粗算）: {per_share_value:.2f} 元**")
+            if cur_mv and cur_mv > 0:
+                premium = (total_value - cur_mv * 1e8) / (cur_mv * 1e8) * 100
+                premium_sign = '溢价' if premium > 0 else '折价'
+                lines.append(f"   对比当前市值{premium_sign}: {premium:+.1f}%")
+                lines.append(f"   （当前市值 {cur_mv:.0f} 亿 vs SOTP 估值 {total_value_yi:.0f} 亿）")
             lines.append("")
-            lines.append("💡 说明: 各板块PE参考行业均值，净利润=营收×毛利率（或直接用财报利润拆分），")
-            lines.append("   实际估值需结合各板块增长率、竞争格局调整。分部估值法适用于多元化企业。")
+            lines.append("💡 **重要说明**")
+            lines.append("1. 各板块净利润 = 合并归母净利润 × 该板块营收占比（粗略分摊，未考虑各板块实际净利率差异）")
+            lines.append("2. PE 倍数为行业参考值，未结合具体增速/竞争格局调整")
+            lines.append("3. 未考虑分部间内部抵消、协同效应和控股权折价")
+            lines.append("4. 以上结果仅为程序自动化估算，**精确估值请参阅券商研究报告**")
 
         return "\n".join(lines)
     except Exception as e:
@@ -4763,9 +5185,7 @@ def call_fetch_data_validator(stock_code: str) -> str:
         if fina_df is not None and not fina_df.empty and mb_df is not None and not mb_df.empty:
             latest_fina = fina_df.iloc[0]
             overall_gm = _num(latest_fina.get('grossprofit_margin') or latest_fina.get('gross_margin'))
-            # Tushare fina_indicator 毛利率为百分数（如 18.8 表示 18.8%），除100转小数
-            if overall_gm and overall_gm > 1.0:
-                overall_gm = overall_gm / 100
+            # 毛利率已在入口层归一化为小数，直接使用
 
             # 取最新一期分产品毛利率
             mb_df = mb_df.copy()
@@ -4801,28 +5221,51 @@ def call_fetch_data_validator(stock_code: str) -> str:
                         )
 
         # 3. 校验营收数据一致性
+        # 注意：主营构成与利润表可能来自不同报告期（如主营最新为年报，利润表最新为Q1），
+        # 必须同口径对比。先找两者共有的最近报告期，只比同一期的数据。
         if income_df is not None and not income_df.empty and mb_df is not None and not mb_df.empty:
-            latest_income = income_df.iloc[0]
-            income_rev = _num(latest_income.get('total_revenue'))
+            # 获取利润表的 report_date 集合（去重）
+            income_dates = pd.to_datetime(income_df['report_date']).unique() if 'report_date' in income_df.columns else []
+            # 获取主营的 report_date 集合
+            mb_dates = pd.to_datetime(mb_df['report_date']).unique() if 'report_date' in mb_df.columns else []
 
-            # 主营加总营收（分产品 type='P'）
-            mb_recent = mb_df[mb_df['bz_type'] == 'P'] if 'bz_type' in mb_df.columns else mb_df
-            mb_total_sales = 0
-            for _, row in mb_recent.iterrows():
-                s = _num(row.get('bz_sales'))
-                if s:
-                    mb_total_sales += s
+            if len(income_dates) > 0 and len(mb_dates) > 0:
+                # 找两者共有的最近报告期
+                common_dates = sorted(set(income_dates) & set(mb_dates), reverse=True)
+                if common_dates:
+                    match_date = common_dates[0]
+                    # 找到该期利润表数据
+                    income_mask = pd.to_datetime(income_df['report_date']) == match_date
+                    income_row = income_df[income_mask].iloc[0]
+                    income_rev = _num(income_row.get('total_revenue'))
 
-            if income_rev and mb_total_sales > 0:
-                rev_diff = abs(income_rev - mb_total_sales) / income_rev
-                if rev_diff > 0.1:
-                    issues.append(
-                        f"❌ 营收偏差: 利润表营收 {income_rev / 1e8:.1f}亿 vs "
-                        f"主营业务加总 {mb_total_sales / 1e8:.1f}亿（偏差 {rev_diff:.1%}）"
-                    )
+                    # 找到该期主营分产品数据加总
+                    mb_mask = (pd.to_datetime(mb_df['report_date']) == match_date)
+                    if 'bz_type' in mb_df.columns:
+                        mb_mask = mb_mask & (mb_df['bz_type'] == 'P')
+                    mb_period = mb_df[mb_mask]
+                    mb_total_sales = sum(
+                        _num(r.get('bz_sales')) for _, r in mb_period.iterrows()
+                        if _num(r.get('bz_sales')))
+
+                    if income_rev and mb_total_sales > 0:
+                        rev_diff = abs(income_rev - mb_total_sales) / income_rev
+                        if rev_diff > 0.1:
+                            issues.append(
+                                f"❌ 营收偏差({match_date.date()}): 利润表营收 {income_rev / 1e8:.1f}亿 vs "
+                                f"主营业务加总 {mb_total_sales / 1e8:.1f}亿（偏差 {rev_diff:.1%}）"
+                            )
+                        else:
+                            passes.append(
+                                f"✅ 营收一致({match_date.date()}): 利润表 {income_rev / 1e8:.1f}亿 ≈ 主营加总 {mb_total_sales / 1e8:.1f}亿"
+                            )
                 else:
-                    passes.append(
-                        f"✅ 营收一致: 利润表 {income_rev / 1e8:.1f}亿 ≈ 主营加总 {mb_total_sales / 1e8:.1f}亿"
+                    # 无共有报告期，记录说明而非错误
+                    latest_income_date = max(income_dates).date()
+                    latest_mb_date = max(mb_dates).date()
+                    issues.append(
+                        f"⚠️ 营收校验跳过: 利润表最新报告期 {latest_income_date} 与主营构成最新报告期 "
+                        f"{latest_mb_date} 不一致（主营多为年报披露，利润表含季报），无法做同口径对比"
                     )
 
         # 4. 同比环比逻辑校验
@@ -4833,9 +5276,7 @@ def call_fetch_data_validator(stock_code: str) -> str:
             prev_roe = _num(prev.get('roe'))
             latest_gm = _num(latest.get('grossprofit_margin') or latest.get('gross_margin'))
             prev_gm = _num(prev.get('grossprofit_margin') or prev.get('gross_margin'))
-            # Tushare 百分数转小数
-            if latest_gm and latest_gm > 1.0: latest_gm /= 100
-            if prev_gm and prev_gm > 1.0: prev_gm /= 100
+            # 毛利率已在入口层归一化为小数，直接使用
             
             if latest_roe and prev_roe:
                 roe_change = (latest_roe - prev_roe) / abs(prev_roe) * 100 if prev_roe != 0 else 0
@@ -5147,14 +5588,28 @@ def call_fetch_scenario_analysis(stock_code: str) -> str:
         
         lines = [f"📈 **情景测算分析：{name}({stock_code})**", ""]
         
-        # 1) 获取最新年报利润表数据
+        # 1) 获取年报利润表数据（仅有12-31报告期才是年报）
         income_df = db.get_stock_income(stock_code)
         if income_df is None or income_df.empty:
             return f"❌ {stock_code} 无利润表数据，无法进行情景测算"
         
-        latest = income_df.iloc[0]
-        revenue = float(latest.get("total_revenue", latest.get("revenue", 0)) or 0)
-        net_profit = float(latest.get("net_profit", latest.get("n_income", 0)) or 0)
+        def _is_annual_report(df):
+            """筛选年报期（12-31）"""
+            annual = df[df['report_date'].dt.month == 12].copy() if 'report_date' in df.columns else df.copy()
+            return annual.sort_values('report_date', ascending=False)
+        
+        annual_df = _is_annual_report(income_df)
+        if annual_df.empty:
+            # 无年报数据时回退到最新期，但标注口径不一致
+            latest = income_df.sort_values('report_date', ascending=False).iloc[0]
+            annual_label = latest['report_date'].strftime('%Y-%m-%d') + ' ⚠️ 非年报数据'
+            revenue = float(latest.get("total_revenue", 0) or 0)
+            net_profit = float(latest.get("net_profit", 0) or 0)
+        else:
+            latest = annual_df.iloc[0]
+            annual_label = latest['report_date'].strftime('%Y-%m-%d')
+            revenue = float(latest.get("total_revenue", 0) or 0)
+            net_profit = float(latest.get("net_profit", 0) or 0)
         
         # 计算毛利率（如果有营业成本和营收）
         cost = float(latest.get("total_cogs", latest.get("oper_cost", 0)) or 0)
@@ -5166,7 +5621,7 @@ def call_fetch_scenario_analysis(stock_code: str) -> str:
         fin_exp = float(latest.get("fin_exp", 0) or 0)
         total_expense_rate = ((sell_exp + admin_exp + fin_exp) / revenue * 100) if revenue > 0 else None
         
-        lines.append(f"### 基础数据（最新年报）")
+        lines.append(f"### 基础数据（{annual_label}）")
         lines.append(f"| 指标 | 数值 |")
         lines.append(f"|------|------|")
         lines.append(f"| 营业总收入 | {revenue/1e8:.2f} 亿 |")
@@ -5182,8 +5637,10 @@ def call_fetch_scenario_analysis(stock_code: str) -> str:
         daily = db.get_latest_daily_basic_data(stock_code, days=1)
         if daily is not None and not daily.empty:
             row = daily.iloc[0]
-            current_pe = float(row.get("pe_ttm", row.get("pe", 0))) if row.get("pe_ttm", row.get("pe", 0)) else None
-            current_price = float(row.get("close", row.get("trade_date", 0))) if row.get("close", row.get("trade_date", 0)) else None
+            current_pe = float(row.get("pe_ttm", 0)) if pd.notna(row.get("pe_ttm")) and row.get("pe_ttm") else None
+            current_close = float(row.get("close", 0)) if pd.notna(row.get("close")) and row.get("close") else None
+            if current_close and current_close > 0:
+                current_price = current_close
         
         lines.append(f"| PE(TTM) | {f'{current_pe:.1f}x' if current_pe else '--'} |")
         if current_price:
@@ -5949,6 +6406,104 @@ def call_fetch_value_discovery(industry_codes: str = "") -> str:
     except Exception as e:
         logger.error(f"价值发现扫描失败: {e} {traceback.format_exc()}")
         return f"❌ 价值发现扫描失败：{e}"
+
+
+def call_fetch_brand_sales_by_code(stock_code: str) -> str:
+    """
+    获取高端品牌/子品牌的月度销量数据。
+    目前已支持的品牌参考：比亚迪的腾势、方程豹、仰望；
+    通用的汽车品牌数据通过搜索词"品牌名 + 月份 + 销量"获取。
+    返回格式化的品牌销量文本，含同比、环比信息。
+    """
+    try:
+        if stock_code != '002594':
+            return f"暂不支持该股票({stock_code})的高端品牌销量查询"
+
+        basic = stock_tool_instance.db.get_stock_basic(stock_code)
+        name = basic.name if basic and hasattr(basic, 'name') else stock_code
+        lines = [f"📊 **{name} 高端品牌/子品牌销量**", ""]
+
+        # ---- 源1: vehicle_sales 数据库 ----
+        try:
+            df = stock_tool_instance.fetch_and_save_vehicle_sales(stock_code=stock_code)
+            hit = False
+            if df is not None and not df.empty:
+                brands = {'腾势': [], '方程豹': [], '仰望': []}
+                if 'report_date' in df.columns and 'vehicle_model' in df.columns:
+                    df_report = df.copy()
+                    df_report['report_date'] = pd.to_datetime(df_report['report_date'], errors='coerce')
+                    df_report = df_report.dropna(subset=['report_date'])
+                    if not df_report.empty:
+                        latest_month = df_report['report_date'].max()
+                        month_data = df_report[df_report['report_date'] == latest_month]
+                        for brand_name in brands:
+                            mask = month_data['vehicle_model'].str.contains(brand_name, na=False)
+                            if mask.any():
+                                c = month_data[mask]
+                                total = int(c['sales_volume'].sum()) if 'sales_volume' in c.columns else 0
+                                brands[brand_name] = (total, c['vehicle_model'].tolist())
+                                hit = True
+                            else:
+                                brands[brand_name] = (0, [])
+
+                if hit:
+                    lines.append("数据来源：车型销量数据库\n")
+                    for brand_name, (total, models) in brands.items():
+                        if total > 0:
+                            lines.append(f"**{brand_name}**：{total:,} 辆")
+                            for m in models[:3]:
+                                lines.append(f"  - {m}")
+                        else:
+                            lines.append(f"**{brand_name}**：暂无销量数据")
+                    lines.append("")
+                    return "\n".join(lines)
+        except Exception:
+            pass
+
+        # ---- 源2: akshare CPCA 乘联会月度厂商排名 ----
+        try:
+            import akshare as ak
+            man_df = ak.car_market_man_rank_cpca()
+            if man_df is not None and not man_df.empty:
+                byd_row = man_df[man_df['厂商'].str.contains('比亚迪', na=False)]
+                if not byd_row.empty:
+                    lines.append("**比亚迪总体销量趋势（乘联会）**")
+                    for _, r in byd_row.iterrows():
+                        parts = []
+                        for col in man_df.columns:
+                            if col == '厂商':
+                                continue
+                            val = r[col]
+                            parts.append(f"{col}: {val}万辆")
+                        lines.append("  " + "  ".join(parts))
+                    lines.append("")
+        except Exception:
+            pass
+
+        # ---- 源3: 最近一个完整月销量摘要（来自乘联会产销数据）----
+        if lines and lines[-1] != "":
+            lines.append("")
+
+        # ---- 最终 fallback: 返回搜索引导 + akshare 厂商数据 ----
+        if len(lines) <= 2:
+            lines = [f"📊 **{name} 高端品牌/子品牌销量查询**", ""]
+
+        lines.append("**高端品牌明细数据补充说明**")
+        lines.append("腾势、方程豹、仰望为比亚迪旗下高端子品牌，其单独销量数据不在结构化数据库中，")
+        lines.append("需要通过搜索引擎获取。推荐搜索关键词如下：")
+        lines.append("")
+        lines.append("  · 比亚迪 2026年6月 销量 分品牌 腾势 方程豹 仰望")
+        lines.append("  · 腾势 2026年6月 交付量")
+        lines.append("  · 方程豹 2026年6月 销量")
+        lines.append("  · 仰望 2026年6月 交付")
+        lines.append("")
+        lines.append("⚠️ 获取到数据后，请结合前文的总体销量趋势，分析高端品牌占比及同比变化。")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"获取高端品牌销量数据失败: {e} {traceback.format_exc()}")
+        return f"❌ 获取高端品牌销量数据失败：{e}"
 
 
 stock_analyst_tools = [

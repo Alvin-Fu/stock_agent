@@ -159,10 +159,12 @@ def calculate_valuation_ratios(financial_statements: Dict) -> Dict[str, object]:
             result["市净率 P/B"] = round(market_cap / total_equity, 2)
         else:
             result["市净率 P/B"] = "缺少数据"
-        if fs.get("pe_ttm_历史分位"):
-            result["PE(TTM) 历史分位"] = fs["pe_ttm_历史分位"]
-        if fs.get("pb_历史分位"):
-            result["PB 历史分位"] = fs["pb_历史分位"]
+        if fs.get("pe_ttm_分位"):
+            result["PE(TTM) 历史分位"] = fs["pe_ttm_分位"]
+        if fs.get("pb_分位"):
+            result["PB 历史分位"] = fs["pb_分位"]
+        if fs.get("ps_ttm_分位"):
+            result["PS(TTM) 历史分位"] = fs["ps_ttm_分位"]
         return result
     except Exception as e:
         logger.error(f"计算估值比率失败: {e}")

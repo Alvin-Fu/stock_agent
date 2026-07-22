@@ -200,24 +200,36 @@ class AnalystAgent:
             if parsed.get("operating_profit") is not None:
                 parsed["ebit"] = parsed["operating_profit"]
 
-            # 市值/PE/PB：从每日指标表取（total_mv 单位万元，转为亿元）
-            # 同时计算 PE/PB 在自身近3年历史中的分位数——比绝对值更有估值信息量
+            # 估值分位：PE(TTM)/PB 多窗口（3年 / 5年 / 10年）交叉验证
             try:
-                basic_df = self.db.get_latest_daily_basic_data(stock_code, 750)
+                basic_df = self.db.get_latest_daily_basic_data(stock_code, 2500)
                 if basic_df is not None and not basic_df.empty:
                     latest_basic = basic_df.iloc[0]
                     total_mv = latest_basic.get("total_mv")
                     if total_mv:
                         parsed["market_cap"] = float(total_mv) / 1e4
-                    for col, name in [("pe_ttm", "pe_ttm"), ("pb", "pb")]:
+                    for col, name in [("pe_ttm", "pe_ttm"), ("pb", "pb"), ("ps_ttm", "ps_ttm")]:
                         cur = latest_basic.get(col)
                         if cur is None or pd.isna(cur):
                             continue
                         parsed[name] = round(float(cur), 2)
                         hist = pd.to_numeric(basic_df[col], errors="coerce").dropna()
-                        if len(hist) >= 60:
-                            pct = float((hist < float(cur)).mean() * 100)
-                            parsed[f"{name}_历史分位"] = f"{pct:.0f}%（近{len(hist)}个交易日，越低越便宜）"
+                        # 多窗口分位
+                        # 注意：basic_df 按 trade_date DESC（最新在前），用 head() 取最近 N 条
+                        windows = {"近3年": 750, "近5年": 1250, "近10年": 2500}
+                        pct_parts = []
+                        for win_label, win_days in windows.items():
+                            sub = hist.head(min(len(hist), win_days))
+                            if len(sub) >= 60:
+                                pct = float((sub < float(cur)).mean() * 100)
+                                pct_parts.append(f"{win_label} {pct:.0f}%分位")
+                        if pct_parts:
+                            parsed[f"{name}_分位"] = "，".join(pct_parts)
+                        # PE/PB 背离判断（用近3年数据）
+                        pe_pct = float((hist.head(750) < float(parsed.get("pe_ttm", 0))).mean() * 100) if len(hist) >= 750 and "pe_ttm" in parsed else None
+                        pb_pct = float((hist.head(750) < float(parsed.get("pb", 0))).mean() * 100) if len(hist) >= 750 and "pb" in parsed else None
+                        if pe_pct and pb_pct and pe_pct > 70 and pb_pct < 30:
+                            parsed["估值背离"] = "PE悬顶、PB托底——盈利下滑被动抬高PE，但资产端已处历史底部"
 
                     # PEG = PE(TTM) ÷ 净利同比增速（trailing 口径，非预期增速；增速≤0 时不适用）
                     pe = parsed.get("pe_ttm")

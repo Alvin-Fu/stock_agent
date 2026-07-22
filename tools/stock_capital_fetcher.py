@@ -344,14 +344,56 @@ def fetch_lockup_calendar(codes: List[str], months: int = 3) -> Dict[str, List[D
 def fetch_institution_holdings(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """
     机构持仓数据。
-    数据来源：ak.stock_institute_hold()（如果可用）
+    优先从数据库 StockTop10Holder 读取（按机构类型统计基金/一般法人/其他），
+    不足时降级到 akshare。
     含缓存 + 重试，返回 {code: {"fund_count": 基金家数, "fund_ratio": 基金持股比例%,
                                  "institution_count": 机构家数, "institution_ratio": 机构持股比例%}}。
     """
     if not codes:
         return {}
 
+    def _try_db() -> Dict[str, Dict[str, Any]]:
+        """从数据库 StockTop10Holder 统计机构持仓"""
+        try:
+            from storage.sqlite.stock_storage import get_db
+            db = get_db()
+            result = {}
+            for code in codes:
+                top10 = db.get_stock_top10_holder(code, limit=30)
+                if not top10:
+                    continue
+                fund_count, fund_ratio = 0, 0.0
+                inst_count, inst_ratio = 0, 0.0
+                for row in top10:
+                    holder_type = str(row.get("holder_type") or "").strip()
+                    hold_ratio = _safe_float(row.get("hold_ratio"), 0)
+                    if "基金" in holder_type:
+                        fund_count += 1
+                        fund_ratio += hold_ratio
+                    elif "机构" in holder_type or "一般法人" in holder_type:
+                        inst_count += 1
+                        inst_ratio += hold_ratio
+                if fund_count > 0 or inst_count > 0:
+                    result[code] = {
+                        "fund_count": fund_count,
+                        "fund_ratio": round(fund_ratio, 2),
+                        "institution_count": inst_count,
+                        "institution_ratio": round(inst_ratio, 2),
+                    }
+            if result:
+                logger.info(f"[机构持仓] 数据库获取成功，{len(result)}只")
+            return result
+        except Exception as e:
+            logger.debug(f"[机构持仓] 数据库获取失败，降级: {e}")
+            return {}
+
     def _do_fetch():
+        # 优先数据库
+        db_result = _try_db()
+        if db_result:
+            return db_result
+
+        # 降级到 akshare
         import akshare as ak
         f = getattr(ak, "stock_institute_hold", None)
         if f is None: return {}
@@ -385,7 +427,7 @@ def fetch_institution_holdings(codes: List[str]) -> Dict[str, Dict[str, Any]]:
 def fetch_all_capital_data(codes: List[str]) -> str:
     """
     统一入口：调用以上所有函数，组装成格式化的文本块。
-    每节标注"根据Akshare"，适用于注入 LLM prompt。
+    每节标注来源（优先数据库/Tushare，AkShare 降级）。
     任何子模块失败不影响整体输出。
     """
     if not codes:
@@ -397,7 +439,7 @@ def fetch_all_capital_data(codes: List[str]) -> str:
     try:
         nb = fetch_north_bound_holdings(codes)
         if nb:
-            lines = ["【北向资金持仓（根据Akshare）】"]
+            lines = ["【北向资金持仓（数据库+Tushare）】"]
             for code in codes:
                 if code in nb:
                     d = nb[code]
@@ -415,7 +457,7 @@ def fetch_all_capital_data(codes: List[str]) -> str:
     try:
         mg = fetch_margin_data(codes)
         if mg:
-            lines = ["【两融余额（根据Akshare）】"]
+            lines = ["【两融余额（数据库+Tushare）】"]
             for code in codes:
                 if code in mg:
                     d = mg[code]
@@ -433,7 +475,7 @@ def fetch_all_capital_data(codes: List[str]) -> str:
     try:
         sh = fetch_shareholder_count(codes)
         if sh:
-            lines = ["【股东户数（根据Akshare）】"]
+            lines = ["【股东户数（数据库+Tushare）】"]
             for code in codes:
                 if code in sh:
                     d = sh[code]
@@ -469,7 +511,7 @@ def fetch_all_capital_data(codes: List[str]) -> str:
     try:
         ih = fetch_institution_holdings(codes)
         if ih:
-            lines = ["【机构持仓（根据Akshare）】"]
+            lines = ["【机构持仓（数据库+Tushare）】"]
             for code in codes:
                 if code in ih:
                     d = ih[code]
