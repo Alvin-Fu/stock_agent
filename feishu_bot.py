@@ -24,6 +24,7 @@ import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Optional
 
 from monitoring.notifier import FeishuNotifier
 from monitoring.scheduler import MonitorScheduler
@@ -81,13 +82,13 @@ def _convert_to_feishu_markdown(text: str) -> str:
             continue
         
         if line.startswith("## "):
-            result.append(line.replace("## ", "**## ").replace("## 📌", "**## 📌") + "**")
+            result.append(line)
             result.append("---")
             i += 1
             continue
         
         if line.startswith("### "):
-            result.append(line.replace("### ", "**### ") + "**")
+            result.append(line)
             i += 1
             continue
         
@@ -209,51 +210,68 @@ def _markdown_to_card_elements(text: str) -> list:
     """
     将 markdown 报告文本转换为飞书卡片的 elements 列表。
     支持 ## 标题、| 表格、- 列表、加粗、分隔线。"""
+    # 预处理1：在粗体子标题（**Xxx**：/：）前插入 \n\n
+    # 匹配不在行首的 **子标题**：，拆成独立段落
+    # 注意不要误拆引文标记如 **[财报]**。（后面跟 . 不是 ：）
+    text = re.sub(r'(?<!\n)(\*\*[^*]{1,10}?\*\*[:：])', r'\n\n\1', text)
+
+    # 预处理2：移除列表项开头的加粗关键词（如 **核心证据**：→ 核心证据：）
+    # 列表项关键词只做语义区分，不加粗，避免视觉上字号偏大、层级混乱
+    # （飞书 lark_md 中加粗文字视觉上比普通文字"重"，密集加粗会显大）
+    text = re.sub(r'^(\s*)(?:[•\-]|\d+\.)\s*\*\*([^*]+)\*\*([：:])',
+                  lambda m: f"{m.group(1)}{'• ' if m.group(0).strip()[0] in '-•' else m.group(0).split('.')[0]+'. '}{m.group(2)}{m.group(3)}",
+                  text, flags=re.MULTILINE)
+    text = re.sub(r'^([\s•\-\d\.]+)\*\*([^*]+)\*\*([：:])',
+                  r'\1\2\3', text, flags=re.MULTILINE)
+
     elements = []
     lines = text.strip().split("\n")
     i = 0
     while i < len(lines):
         line = lines[i]
 
-        # ## 标题 → div with bold header
+        # ## 标题 → div with heading text_size
         if line.startswith("## "):
             title = line[3:].strip()
-            elements.append({"tag": "hr"})  # 标题前加分隔线
-            content = f"**{title}**"
+            elements.append({"tag": "hr"})
             elements.append({
                 "tag": "div",
-                "text": {"tag": "lark_md", "content": content}
+                "text": {"tag": "lark_md", "content": f"**{title}**"},
+                "text_size": "heading-4"
             })
             i += 1
             # 收集标题后的内容直到下一个标题
             body_lines = []
             while i < len(lines) and not lines[i].startswith("## ") and not lines[i].startswith("```"):
-                if lines[i].startswith("|"):
-                    break  # 表格单独处理
+                stripped = lines[i].strip()
+                if stripped.startswith("|"):
+                    break
                 body_lines.append(lines[i])
                 i += 1
             if body_lines:
                 body_text = "\n".join(body_lines).strip()
                 if body_text:
-                    # 合并到前面的 div 或新加一个 div
-                    if elements and elements[-1].get("tag") == "div":
-                        elements[-1]["text"]["content"] += "\n" + body_text
-                    else:
+                    paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
+                    for p in paragraphs:
                         elements.append({
                             "tag": "div",
-                            "text": {"tag": "lark_md", "content": body_text}
+                            "text": {"tag": "lark_md", "content": p}
                         })
             continue
 
-        # 表格
-        if line.startswith("|"):
-            table_lines = [line]
+        # 表格（支持缩进的表格，如嵌在列表中的表格）
+        if line.strip().startswith("|"):
+            table_lines = [line.strip()]
             i += 1
-            while i < len(lines) and (lines[i].startswith("|") or lines[i].strip().startswith(":--")):
-                table_lines.append(lines[i])
-                i += 1
+            while i < len(lines):
+                stripped = lines[i].strip()
+                if stripped.startswith("|") or stripped.startswith(":--") or stripped.startswith("---"):
+                    table_lines.append(stripped)
+                    i += 1
+                else:
+                    break
             # 跳过纯分隔行，取有效行
-            data_lines = [l for l in table_lines if not l.strip().startswith(":--") and not l.strip().startswith("---")]
+            data_lines = [l for l in table_lines if not l.startswith(":--") and not l.startswith("---")]
             if len(data_lines) >= 2:
                 element = _parse_markdown_table(data_lines)
                 if element:
@@ -270,22 +288,27 @@ def _markdown_to_card_elements(text: str) -> list:
 
         # 普通行
         body_lines = []
-        while i < len(lines) and not lines[i].startswith("## ") and not lines[i].startswith("```") and not lines[i].startswith("|"):
-            l = lines[i].strip()
-            if l:
+        while i < len(lines):
+            li = lines[i]
+            if li.startswith("## ") or li.startswith("```"):
+                break
+            stripped = li.strip()
+            if stripped.startswith("|"):
+                break
+            if stripped:
                 # 列表优化
-                if l.startswith("-"):
-                    l = "• " + l[1:].strip()
-                body_lines.append(l)
+                if stripped.startswith("-"):
+                    stripped = "• " + stripped[1:].strip()
+                body_lines.append(stripped)
             i += 1
         if body_lines:
             body_text = "\n".join(body_lines)
-            if elements and elements[-1].get("tag") == "div":
-                elements[-1]["text"]["content"] += "\n" + body_text
-            else:
+            # 按双换行切分段落
+            paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
+            for p in paragraphs:
                 elements.append({
                     "tag": "div",
-                    "text": {"tag": "lark_md", "content": body_text}
+                    "text": {"tag": "lark_md", "content": p}
                 })
             continue
 
@@ -294,18 +317,13 @@ def _markdown_to_card_elements(text: str) -> list:
     # 移除开头的 hr（多余的无意义）
     while elements and elements[0].get("tag") == "hr":
         elements.pop(0)
-    # 合并连续的 div
-    merged = []
-    for el in elements:
-        if el["tag"] == "div" and merged and merged[-1]["tag"] == "div":
-            merged[-1]["text"]["content"] += "\n\n" + el["text"]["content"]
-        else:
-            merged.append(el)
-    return merged
+    return elements
 
 
 def _add_color_tags(text: str) -> str:
-    """给关键数字添加红绿色标签：负数为红，正数为绿"""
+    """给关键数字添加红绿色标签：负数为红，正数为绿。
+    注意：只给非加粗的数字加颜色；已在 **...** 中的数字只保留加粗，不再叠加颜色
+    （避免加粗+颜色双重放大导致字号不协调）。"""
     import re
     def _colorize(m):
         num = m.group(0)
@@ -313,9 +331,23 @@ def _add_color_tags(text: str) -> str:
             return f"<font color='red'>{num}</font>"
         else:
             return f"<font color='green'>{num}</font>"
-    # 匹配百分比和带正负号的数字
+
+    # 先把 **...** 加粗块保护起来，避免里面的数字被加颜色
+    bold_parts = []
+    def _save_bold(m):
+        bold_parts.append(m.group(0))
+        return f"\x00BOLD{len(bold_parts)-1}\x00"
+
+    text = re.sub(r'\*\*[^*]+\*\*', _save_bold, text)
+
+    # 给非加粗区域的数字加颜色
     text = re.sub(r"[+-]?\d+\.?\d*%", _colorize, text)
     text = re.sub(r"(?<=[（(])\+?\d+\.?\d*亿", _colorize, text)
+
+    # 还原加粗块
+    for i, bp in enumerate(bold_parts):
+        text = text.replace(f"\x00BOLD{i}\x00", bp)
+
     return text
 
 
@@ -402,28 +434,42 @@ def split_report(text: str, limit: int = 4000) -> list:
     return parts or [text[:limit]]
 
 
-HELP_TEXT = """🤖 股票分析助手使用说明
+HELP_TEXT = """# 🤖 股票分析助手使用说明
+
+## 基本用法
 · 直接提问：如「分析比亚迪」「600519 技术面怎么样」「白酒产业链有哪些机会」
-· 一条消息可以带多个对象：如「分析比亚迪和宁德时代」「看看比亚迪，再看看半导体产业链」
-  （自动拆开逐个分析，最多4个，最后附组合速览）
-· 监控 比亚迪 —— 加入监控清单（公司名或6位代码；识别不到代码时按行业监控）
+· 一条消息可带多个对象：如「分析比亚迪和宁德时代」「看看比亚迪，再看看半导体产业链」
+  （自动拆解，逐个分析，最后附组合速览）
+
+## 监控管理
+· 监控 比亚迪 —— 加入监控清单（公司名或6位代码；识别不到时按行业监控）
 · 取消监控 比亚迪
 · 监控列表
+
+## 运维指令
 · 立即扫描 —— 马上跑一轮信号+新闻扫描
 · 复盘 比亚迪 —— 对最近一次分析做复盘（对照实际走势）
-· 纠错 比亚迪 销量应该是38万不是41万 —— 指出报告里的错误，系统记住，下次分析严禁再犯
+
+## 纠错机制
+· 纠错 比亚迪 销量应该是38万不是41万 —— 指出报告错误，系统记住，下次分析不再重犯
 · 纠错列表 —— 查看已记录的纠错
+
+## 报告格式
+分析报告将以**交互式卡片**推送，支持表格渲染、段落分段和关键数据颜色标注。
 · 帮助 —— 显示本说明
-监控提醒：盘后技术信号 + 个股新闻/行业政策，自动推送到这里"""
+
+**监控提醒：** 盘后技术信号 + 个股新闻/行业政策，自动推送到这里"""
 
 
 class FeishuBot:
-    def __init__(self):
-        cfg = load_config().get("feishu", {}) or {}
+    def __init__(self, config_section: str = "feishu"):
+        self.config_section = config_section
+        cfg = load_config().get(config_section, {}) or {}
         self.app_id = (cfg.get("app_id") or "").strip()
         self.app_secret = (cfg.get("app_secret") or "").strip()
+        self.push_open_id = (cfg.get("push_open_id") or "").strip()
         self.db = get_db()
-        self.notifier = FeishuNotifier()
+        self.notifier = FeishuNotifier(config_section=config_section)
         self.monitor = MonitorScheduler(self.notifier)
         # 分析耗时较长，有限线程池防止并发打爆 LLM/数据源
         self.pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="feishu-worker")
@@ -432,6 +478,25 @@ class FeishuBot:
         # WebSocket 健康监控
         self._last_message_time = time.time()
         self._ws_watchdog_running = False
+
+        # 已知会话文件
+        self._known_chats_path = Path("data/known_chats.json")
+
+    @staticmethod
+    def _save_known_chat(chat_id: str, chat_type: str):
+        """自动记录群/会话 ID，重启后仍可用"""
+        path = Path("data/known_chats.json")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            known = {}
+            if path.exists():
+                known = json.loads(path.read_text())
+            if chat_id not in known:
+                known[chat_id] = {"type": chat_type, "first_seen": time.strftime("%Y-%m-%d %H:%M:%S")}
+                path.write_text(json.dumps(known, ensure_ascii=False, indent=2))
+                logger.info(f"[自动获取] 已记录 {chat_type} chat_id: {chat_id} → data/known_chats.json")
+        except Exception as e:
+            logger.debug(f"[自动获取] 记录失败: {e}")
 
     # ---------- 工作流 ----------
 
@@ -464,13 +529,43 @@ class FeishuBot:
                 return
         except Exception as e:
             logger.warning(f"[卡片] 报告转卡片失败，降级为文本: {e}")
-        # 降级：通过 reply 发送（但这里没有 reply 闭包，用 text/post 兜底）
+        # 降级：通过 text/post 兜底
         chunks = split_report(answer)
         for i, chunk in enumerate(chunks, 1):
             label = f"({i}/{len(chunks)})\n" if len(chunks) > 1 else ""
             self.notifier.send_to(receive_id, f"{label}{chunk}", receive_id_type)
 
-    def _run_analysis(self, question: str, thread_id: str, reply):
+    @staticmethod
+    def _extract_summary(report_text: str) -> str:
+        """从完整报告中提取结论摘要（## 结论 段），找不到时取前 15 行"""
+        import re
+        match = re.search(r'## 结论\n(.*?)(?=\n## |\Z)', report_text, re.DOTALL)
+        if match and match.group(1).strip():
+            return "## 📋 结论摘要\n\n" + match.group(1).strip()
+        lines = report_text.strip().split('\n')
+        return '\n'.join(lines[:15])
+
+    def _send_summary_with_doc(self, answer: str, label: str, receive_id: str,
+                               receive_id_type: str, reply):
+        """
+        统一入口：完整报告写入飞书文档，卡片只推结论摘要 + 文档链接。
+        文档或卡片创建失败时降级为全文文本发送。"""
+        if not answer or not answer.strip():
+            return
+        try:
+            doc_url = self.notifier.create_feishu_doc(f"{label} 完整报告", answer)
+            summary = self._extract_summary(answer)
+            card_text = (f"{summary}\n\n---\n📄 **[查看完整报告]({doc_url})**"
+                         if doc_url else answer)
+            cards = _report_to_cards(card_text, label)
+            if cards:
+                self.notifier.send_card_chunked(cards, receive_id, receive_id_type)
+                return
+        except Exception as e:
+            logger.warning(f"[摘要] 文档/卡片创建失败，降级文本: {e}")
+        self._send_answer(answer, reply)
+
+    def _run_analysis(self, question: str, thread_id: str, reply, receive_id_type: str = "open_id"):
         try:
             executor = self._get_workflow()
 
@@ -481,14 +576,12 @@ class FeishuBot:
             if len(tasks) <= 1:
                 state = executor.run_sync(question, thread_id=thread_id)
                 answer = executor.get_final_answer(state)
-                # 提取股票代码用于卡片标题
+                # 提取股票代码用于卡片标题；无 stock_code 时也走卡片格式
                 stock_code = state.get("stock_code", "")
                 stock_name = self._resolve_name(stock_code) if stock_code else ""
                 stock_label = f"{stock_name}({stock_code})" if stock_name else stock_code
-                if stock_code and stock_label:
-                    self._send_card_answer(answer, stock_label, thread_id)
-                else:
-                    self._send_answer(answer, reply)
+                label = stock_label or "分析报告"
+                self._send_summary_with_doc(answer, label, thread_id, receive_id_type, reply)
                 return
 
             names = "、".join(t["target"] or f"对象{i}" for i, t in enumerate(tasks, 1))
@@ -502,14 +595,8 @@ class FeishuBot:
                     # 每个对象独立会话，互不污染对话记忆
                     state = executor.run_sync(t["question"], thread_id=f"{thread_id}:{label}")
                     answer = executor.get_final_answer(state)
-                    # 多对象时优先用卡片，失败降级为文本
-                    stock_code = state.get("stock_code", "")
-                    sname = self._resolve_name(stock_code) if stock_code else ""
-                    if stock_code:
-                        self._send_card_answer(f"【{label}】\n{answer}",
-                                               f"{sname}({stock_code})", thread_id)
-                    else:
-                        self._send_answer(f"【{label}】\n{answer}", reply)
+                    # 统一走摘要+文档格式
+                    self._send_summary_with_doc(answer, label, thread_id, receive_id_type, reply)
                     plan = (state.get("technical_result") or {}).get("trade_plan")
                     if plan:
                         plans.append((label, plan))
@@ -537,7 +624,7 @@ class FeishuBot:
         """内置命令；返回 None 表示不是命令（走分析流程）"""
         text = text.strip()
         if text in ("帮助", "help", "菜单"):
-            return HELP_TEXT
+            return "__HELP__"
 
         if text == "监控列表":
             targets = self.db.get_watch_targets()
@@ -679,6 +766,29 @@ class FeishuBot:
                 text = json.loads(message.content).get("text", "")
             except (json.JSONDecodeError, TypeError):
                 return
+
+            # 群聊中：检查 mentions，判断是 @股票分析助手 还是 @股票技术面
+            is_tech_mention = False
+            if chat_type == "group":
+                mentions = message.mentions if hasattr(message, 'mentions') else []
+                if not mentions:
+                    raw_content = json.loads(message.content)
+                    mentions = raw_content.get("mentions", []) if isinstance(raw_content, dict) else []
+
+                mention_names = set()
+                for m in mentions:
+                    name = m.name if hasattr(m, 'name') else (m.get("name", "") if isinstance(m, dict) else "")
+                    mention_names.add(name)
+
+                if "股票技术面" in mention_names:
+                    is_tech_mention = True
+                elif "股票分析助手" in mention_names:
+                    is_tech_mention = False
+                elif mention_names:
+                    # @了其他用户（非机器人），跳过处理
+                    logger.debug(f"[飞书] 消息 @了其他用户 {mention_names}，跳过")
+                    return
+
             # 去掉群聊里的 @机器人 占位符
             text = re.sub(r"@_user_\d+\s*", "", text).strip()
             if not text:
@@ -689,6 +799,8 @@ class FeishuBot:
                 receive_id, receive_type = sender_open_id, "open_id"
             else:
                 receive_id, receive_type = message.chat_id, "chat_id"
+                # 自动记录群 chat_id，用于定时任务推送到群
+                self._save_known_chat(message.chat_id, "group")
 
             def reply(msg: str):
                 self.notifier.send_to(receive_id, msg, receive_type)
@@ -707,10 +819,22 @@ class FeishuBot:
             if queue_size > 0:
                 reply(f"⏳ 当前排队 {queue_size} 个任务，前序分析完成后立即处理…")
 
+            # 快速技术位查询（纯支撑/压力位，不走完整工作流）
+            # @股票技术面 → 总是走快速技术位；@股票分析助手 → 不走快速路径
+            if is_tech_mention or chat_type == "p2p":
+                quick = self._quick_technical_query(text)
+                if quick:
+                    reply(quick)
+                    return
+
             command_result = self._handle_command(text)
             if command_result == "__SCAN__":
                 reply("🔍 开始扫描，完成后推送结果…")
                 self.pool.submit(self._safe_scan, reply)
+                return
+            if command_result == "__HELP__":
+                self.notifier.send_card_text(HELP_TEXT, "股票分析助手",
+                                             receive_id, receive_type)
                 return
             if isinstance(command_result, tuple) and command_result[0] == "__REVIEW__":
                 reply("📋 复盘中…")
@@ -723,7 +847,8 @@ class FeishuBot:
             # 走完整分析流程
             reply("📊 收到，分析中（个股约3-6分钟，产业链10分钟以上），完成后回复…")
             thread_id = sender_open_id if chat_type == "p2p" else message.chat_id
-            self.pool.submit(self._run_analysis, text, thread_id, reply)
+            receive_type = "open_id" if chat_type == "p2p" else "chat_id"
+            self.pool.submit(self._run_analysis, text, thread_id, reply, receive_type)
 
         except Exception as e:
             logger.error(f"[飞书] 处理消息异常: {e}\n{traceback.format_exc()}")
@@ -784,6 +909,80 @@ class FeishuBot:
         except Exception:
             return ""
 
+    @staticmethod
+    def _quick_technical_query(text: str) -> Optional[str]:
+        """
+        检测纯技术位查询，直接返回结果，不走完整工作流。
+
+        触发条件（任一）：
+        1. 包含技术关键词（支撑/压力/止损/止盈/技术位/关键位）
+        2. 文本仅为股票名称/代码（无基本面分析意图），视为快速技术查询
+
+        返回 str 时直接回复；返回 None 时走完整分析。
+        """
+        # ---------- 第一步：尝试提取股票代码 ----------
+        # 优先找 6 位数字代码
+        code_match = re.search(r'(\d{6})', text)
+        code = code_match.group(1) if code_match else None
+        name = None
+
+        # 去掉可能的占位/无意义词，方便匹配公司名
+        _noise = re.compile(r'(支撑|压力|止损|止盈|技术位|关键位|技术面|[的\s,，。！？、])', re.I)
+        cleaned_text = _noise.sub('', text).strip()
+
+        if not code and cleaned_text:
+            from tools.company_code_validator import find_stock_code
+            try:
+                code = find_stock_code(cleaned_text)
+            except Exception:
+                code = None
+        if not code:
+            return None
+
+        # ---------- 第二步：判断是否应作为技术位返回 ----------
+        # 情形A：文本包含技术关键词 → 直接返回技术位
+        has_tech_kw = bool(re.search(r'(支撑|压力|止损|止盈|技术位|关键位)', text, re.I))
+        # 情形B：文本中除了公司名/代码外无分析意图内容 → 默认为技术查询
+        has_fund_kw = bool(re.search(
+            r'(财报|利润|营收|估值|PE|PB|ROE|护城河|竞争力|同业|对比|产业链|行业|分析|报告|基本面)',
+            text, re.I
+        ))
+
+        # 清理后只剩公司名 → 视为技术查询
+        is_pure_stock = cleaned_text and not re.search(
+            r'(财报|利润|营收|估值|分析|报告|监控|复盘|扫描|帮助)',
+            cleaned_text, re.I
+        )
+
+        if not has_tech_kw and has_fund_kw:
+            return None  # 明显的分析意图，走完整工作流
+        if not has_tech_kw and not is_pure_stock:
+            return None  # 既无技术关键词也不像纯股票名，走完整工作流
+
+        # ---------- 第三步：查询技术位 ----------
+        from tools.company_code_validator import find_company_name
+        name = find_company_name(code) or code
+
+        db = get_db()
+        df = db.get_all_daily_data(code)
+        if df is None or df.empty:
+            return None
+
+        from tools.support_resistance import compute_sr_levels, format_sr_levels
+        sr = compute_sr_levels(df)
+        sr_text = format_sr_levels(sr)
+        if not sr_text:
+            return None
+
+        close = sr.get("close", "N/A")
+        lines = [
+            f"⚡ {name}({code}) 技术关键位",
+            f"**现价**：{close}",
+            "",
+            sr_text,
+        ]
+        return "\n".join(lines)
+
     def _safe_scan(self, reply):
         try:
             result = self.monitor.run_once_now()
@@ -796,36 +995,30 @@ class FeishuBot:
     def _push_startup_help(self):
         """启动时推送使用说明。10分钟内重复启动不重发——launchd 崩溃拉起时防止刷屏，
         同时该提示缺席本身就是'进程在反复重启'的信号（正常重启一定会收到）"""
-        marker = Path("./data/.last_startup_push")
+        bot_name = "股票分析助手"
+        marker = Path(f"./data/.last_startup_push_{self.config_section}")
         try:
             if marker.exists() and time.time() - marker.stat().st_mtime < 600:
-                logger.info("[飞书] 10分钟内已推送过启动说明，跳过（崩溃拉起防刷屏）")
+                logger.info(f"[飞书/{self.config_section}] 10分钟内已推送过启动说明，跳过（崩溃拉起防刷屏）")
                 return
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.touch()
-            self.notifier.send("🚀 股票分析助手已启动，监控调度运行中\n\n" + HELP_TEXT)
+            self.notifier.send_card_text(HELP_TEXT, bot_name)
         except Exception as e:
-            logger.warning(f"[飞书] 启动说明推送失败（不影响运行）: {e}")
+            logger.warning(f"[飞书/{self.config_section}] 启动说明推送失败（不影响运行）: {e}")
 
     def start(self):
-        # 财报发布触发的自动重分析：丢进工作线程池跑，结果推到默认通道
+        # 启动监控调度（盘后信号 + 新闻/政策扫描 + 推送）
         self.monitor.set_analysis_runner(
             lambda question: self.pool.submit(
                 self._run_analysis, question, "report-trigger", self.notifier.send))
-
-        # 监控调度始终启动（有 watchlist 且配了任一推送通道即可工作）
         self.monitor.start()
 
-        # 启动即推送使用说明（纯推送模式也发：webhook 通道同样能收到）
+        # 启动即推送使用说明
         self._push_startup_help()
 
         if not (self.app_id and self.app_secret):
-            logger.warning("[飞书] 未配置 feishu.app_id/app_secret，进入纯监控推送模式（无法对话）")
-            try:
-                while True:
-                    time.sleep(60)
-            except KeyboardInterrupt:
-                self.monitor.stop()
+            logger.warning("[飞书] 未配置 feishu.app_id/app_secret，无法连接")
             return
 
         # 启动 WebSocket 健康看门狗 + 可自动重连的长连主循环
@@ -835,5 +1028,5 @@ class FeishuBot:
 
 if __name__ == "__main__":
     from utils.config import ensure_runtime_config
-    ensure_runtime_config()  # 关键配置缺失时启动即报错，不等跑到 LLM 调用才炸
-    FeishuBot().start()
+    ensure_runtime_config()
+    FeishuBot(config_section="feishu").start()

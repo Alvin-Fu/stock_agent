@@ -145,15 +145,18 @@ def fetch_macro_snapshot(session: str = "") -> str:
 
     raw_text = "\n\n---\n\n".join(parts)
 
-    # LLM 总结（失败不影响原始数据输出）
+    # LLM 总结（失败时返回原始数据核心要点）
     summary = _llm_summarize(raw_text, session=session)
+    label = {"pre": "【开盘前】", "post": "【收盘后】"}.get(session, "")
     if summary:
-        label = {"pre": "【开盘前】", "post": "【收盘后】"}.get(session, "")
-        output = f"🏛 **大盘宏观数据快照**（{today}）\n{'='*30}\n\n"
-        output += f"**LLM 核心解读**\n{summary}\n\n---\n\n{raw_text}"
+        output = f"{label} 🏛 **大盘宏观数据快照**（{today}）\n"
+        output += f"**LLM 核心解读**\n{summary}"
+    elif raw_text:
+        # LLM 失败时只取原始数据的前 1000 字符核心数值
+        output = f"{label} 🏛 **大盘宏观数据快照**（{today}）\n"
+        output += raw_text[:1000]
     else:
-        header = f"🏛 **大盘宏观数据快照**（{today}）\n{'='*30}"
-        output = header + "\n\n" + raw_text
+        return "（宏观数据暂不可用）"
     return output
 
 

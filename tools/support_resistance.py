@@ -136,22 +136,33 @@ def compute_sr_levels(df, lookback: int = 120, swing_k: int = 2,
         return None
 
 
-def _fmt_level(c: Dict) -> str:
+def _fmt_level(c: Dict, close: float) -> str:
     tags = []
     if c["touches"]:
         tags.append(f"触碰{c['touches']}次")
     if c["vol_node"]:
         tags.append("成交密集")
-    return f"{c['price']}（{'·'.join(tags)}）"
+    dist_pct = (c["price"] / close - 1) * 100
+    tags.append(f"距现价{dist_pct:+.1f}%")
+    # 距离≤2%的位标注经受考验状态——读者能直接判断"这些位正在被市场测试"
+    marker = ""
+    if c["price"] < close and abs(dist_pct) <= 2:
+        marker = " ⚠️正接受考验"
+    elif c["price"] > close and dist_pct <= 2:
+        marker = " ⚠️近在咫尺"
+    joiner = "·"
+    return f"{c['price']}（{joiner.join(tags)}{marker}）"
 
 
 def format_sr_levels(sr: Optional[Dict]) -> str:
     if not sr:
         return ""
+    close = sr.get("close")
     lines = ["【程序计算关键位（近120根K线：摆动点聚类+成交密集区，历史博弈价位）】"]
-    if sr["supports"]:
-        lines.append("  支撑（由近及远）：" + " ｜ ".join(_fmt_level(c) for c in sr["supports"]))
-    if sr["resistances"]:
-        lines.append("  压力（由近及远）：" + " ｜ ".join(_fmt_level(c) for c in sr["resistances"]))
-    lines.append("  说明：触碰次数越多、带成交密集标记的价位越硬；与均线/BOLL位互补使用")
+    if close and sr.get("supports"):
+        lines.append("  支撑（由近及远）：" + " ｜ ".join(_fmt_level(c, close) for c in sr["supports"]))
+    if close and sr.get("resistances"):
+        lines.append("  压力（由近及远）：" + " ｜ ".join(_fmt_level(c, close) for c in sr["resistances"]))
+    lines.append("  说明：距现价≤2%的位标注⚠️，表示正在被市场测试或突破中；触碰次数越多、"
+                 "带成交密集标记的价位越硬；与均线/BOLL位互补使用；大盘环境变化会导致技术位重算")
     return "\n".join(lines)

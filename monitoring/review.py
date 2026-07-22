@@ -649,7 +649,7 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
                 try:
                     from .macro_watcher import fetch_macro_snapshot
                     macro_text = fetch_macro_snapshot(session="post")
-                    self.notifier.send(f"🏛 **大盘宏观数据快照**\n\n{macro_text[:6000]}")
+                    self.notifier.send_card_text(macro_text[:6000], "大盘宏观数据快照")
                 except Exception as e:
                     logger.debug(f"[复盘] 宏观数据快照跳过: {e}")
             return 0
@@ -676,7 +676,7 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
             try:
                 from .macro_watcher import fetch_macro_snapshot
                 macro_text = fetch_macro_snapshot(session="post")
-                self.notifier.send(f"🏛 **大盘宏观数据快照**\n\n{macro_text[:6000]}")
+                self.notifier.send_card_text(macro_text[:6000], "大盘宏观数据快照")
                 logger.info("[复盘] 宏观数据快照推送完成")
             except Exception as e:
                 logger.debug(f"[复盘] 宏观数据快照跳过: {e}")

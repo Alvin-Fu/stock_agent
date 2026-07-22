@@ -27,7 +27,49 @@ def _latest_close(code: str) -> Optional[float]:
     return None
 
 
-def forward_pe_lines(df, close: Optional[float]) -> List[str]:
+def _get_total_shares(code: str) -> Optional[float]:
+    """
+    通过 Tushare daily_basic 获取总股本（亿股），用于 EPS × 总股本 → 净利润。
+    total_mv（万元）÷ close（元）= 总股本（万股）。
+    缓存总股本和 close 到模块变量，`_ts_close_cache` 供 `_latest_close` 兜底。
+    """
+    if _TS_SHARE_CACHE.get(code) is not None:
+        return _TS_SHARE_CACHE[code]  # type: ignore[return-value]
+    try:
+        import tushare as ts
+        ts_code = f"{code}.SZ" if code.startswith(('000', '002', '300')) else f"{code}.SH"
+        from datetime import date, timedelta
+        for days_back in range(0, 5):
+            d = (date.today() - timedelta(days=days_back)).strftime("%Y%m%d")
+            df = ts.pro_api().daily_basic(ts_code=ts_code, trade_date=d,
+                                          fields="close,total_mv")
+            if df is not None and not df.empty:
+                close = float(df.iloc[0].get("close") or 0)
+                total_mv = float(df.iloc[0].get("total_mv") or 0)
+                if close > 0 and total_mv > 0:
+                    shares = total_mv / close / 10000  # 万元÷元 → 万股 → 亿股
+                    _TS_SHARE_CACHE[code] = shares
+                    _TS_CLOSE_CACHE[code] = close  # 供 forward PE 兜底
+                    return shares
+        return None
+    except Exception as e:
+        logger.debug(f"[盈利预测] 取总股本失败 {code}: {e}")
+        return None
+
+# Tushare 缓存（模块级，进程内复用）
+_TS_SHARE_CACHE: dict = {}  # code → 总股本(亿股)
+_TS_CLOSE_CACHE: dict = {}  # code → close(元，供 forward PE 兜底)
+
+
+def _fallback_close(code: str) -> Optional[float]:
+    """兜底收盘价：优先 DB，其次 Tushare daily_basic 缓存"""
+    c = _latest_close(code)
+    if c is not None:
+        return c
+    return _TS_CLOSE_CACHE.get(code)
+
+
+def forward_pe_lines(df, close: Optional[float], total_shares: Optional[float] = None) -> List[str]:
     """
     程序计算 forward PE（纯函数）：兼容两种表形——
     A. 东财单行表：列名形如「2026预测每股收益」
@@ -63,8 +105,13 @@ def forward_pe_lines(df, close: Optional[float]) -> List[str]:
 
     pairs = sorted(set(pairs))[:3]
     for year, eps in pairs:
-        lines.append(f"  {year}年：预测EPS {eps:.2f}元 → forward PE {close / eps:.1f}倍"
-                     f"（现价{close:.2f}÷{eps:.2f}，程序计算）")
+        line = (f"  {year}年：预测EPS {eps:.2f}元 → forward PE {close / eps:.1f}倍"
+                f"（现价{close:.2f}÷{eps:.2f}，程序计算）")
+        if total_shares:
+            net_profit = round(eps * total_shares, 1)  # EPS(元) × 总股本(亿股) = 净利润(亿元)
+            line += (f" → 隐含净利润约{net_profit:.1f}亿"
+                     f"（EPS{eps:.2f}×总股本{total_shares:.1f}亿，程序计算）")
+        lines.append(line)
     # 预测增速也程序算：LLM 拿预测表自行推"3年净利润CAGR约9%"属于同一类心算病
     if len(pairs) >= 2:
         (y0, e0), (y1, e1) = pairs[0], pairs[-1]
@@ -114,18 +161,23 @@ def fetch_profit_forecast_text(code: str, name: str = "") -> str:
         report_source("机构盈利预测", True)
         text = df.head(6).to_string(index=False)[:900]
 
-        fpe_lines = forward_pe_lines(df, _latest_close(code))
+        total_shares = _get_total_shares(code)
+        fpe_lines = forward_pe_lines(df, _fallback_close(code), total_shares=total_shares)
         fpe_block = ""
         if fpe_lines:
             fpe_block = ("\n【forward PE（程序计算，引用时必须原样使用并标注\"基于机构预测\"）】\n"
                          + "\n".join(fpe_lines))
 
+        shares_note = ""
+        if total_shares:
+            shares_note = ("总股本{:.1f}亿股（Tushare daily_basic，程序获取）".format(total_shares)
+                           + "——净利润=EPS×总股本，由程序计算，引用时直接使用上方数值。")
         return ("【机构盈利预测（东财汇总，预测值仅供参考，不是事实）】\n" + text + fpe_block
-                + "\n（使用规则：forward PE 与预测增速只能引用上方程序计算值，**禁止自行用预测表心算**"
-                  "forward PE、净利润总额或增速/CAGR——尤其禁止 EPS×股本 反推净利润、"
-                  "禁止自行推算'N年净利润CAGR约X%'；"
+                + "\n（使用规则：净利润已由程序在上方forward PE段直接算好，**禁止自行用预测表心算**"
+                  "forward PE、净利润或增速/CAGR；"
                   "程序未给出 forward PE 时只说明有机构预测覆盖、不做换算；"
-                  "预测与已披露实际数矛盾时以实际数为准）")
+                  + ("\n{}".format(shares_note) if shares_note else "")
+                  + "预测与已披露实际数矛盾时以实际数为准）")
     except Exception as e:
         logger.warning(f"[盈利预测] 获取失败 {code}: {e}")
         report_source("机构盈利预测", False, str(e))

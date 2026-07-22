@@ -487,19 +487,40 @@ class StockTools:
             return None
 
     def fetch_and_save_stock_dividend(self, stock_code: str) -> Union[pd.DataFrame, None]:
-        """获取并保存分红送股数据（DB缓存：按code+end_date去重）"""
+        """获取并保存分红送股数据（DB缓存，增量更新）
+
+        分红数据更新频率低（季频/年频），缓存有效期设为 30 天。
+        """
         if stock_code is None:
             logger.error("股票代码为空")
             return None
         try:
             old = self.db.get_stock_dividend(stock_code, 1)
+            cache_fresh = False
             if old is not None and not old.empty:
-                logger.info(f"分红送股[{stock_code}]缓存已存在，直接返回")
+                latest_date = old.iloc[0].get('end_date')
+                if latest_date is not None:
+                    try:
+                        latest = pd.Timestamp(latest_date)
+                        today = pd.Timestamp(date.today())
+                        days_gap = (today - latest).days
+                        # 分红数据季频更新，30天内缓存有效
+                        if days_gap <= 30:
+                            cache_fresh = True
+                    except Exception:
+                        pass
+            if cache_fresh:
+                logger.info(f"分红送股[{stock_code}]最新数据为{latest_date}，缓存有效（{days_gap}天前）")
                 return old
+
             df = self.tushare.dividend(stock_code)
             if df is None or df.empty:
-                logger.error(f"获取股票[{stock_code}]分红送股数据为空")
+                if old is not None and not old.empty:
+                    logger.warning(f"[分红送股] 增量拉取无新数据，返回缓存")
+                    return old
                 return None
+            # 清理 NaN 再保存，避免 SQLite 唯一键异常
+            df = df.replace({float('nan'): None})
             save_count = self.db.save_stock_dividend(df, stock_code)
             logger.info(f"保存股票[{stock_code}]分红送股数据成功，新增[{save_count}]条记录")
             return self.db.get_stock_dividend(stock_code)
@@ -601,21 +622,48 @@ class StockTools:
             return None
 
     def fetch_and_save_stock_moneyflow(self, stock_code: str) -> Union[pd.DataFrame, None]:
-        """获取并保存个股资金流向数据（DB缓存）"""
+        """获取并保存个股资金流向数据（按日增量更新，DB缓存）
+
+        缓存策略：最新数据日期 ≥ 今天-1天 → 直接返回缓存；
+                 最新数据日期 < 今天-1天 → 从最新日期次日增量拉取、合并存储。
+                 拉取失败时降级返回旧缓存，不阻断分析。
+        """
         if stock_code is None:
             logger.error("股票代码为空")
             return None
         try:
             old = self.db.get_stock_moneyflow(stock_code, 1)
             if old is not None and not old.empty:
-                logger.info(f"个股资金流向[{stock_code}]缓存已存在，直接返回")
-                return old
-            today = date.today()
-            start = f"{today.year - 1}-01-01"
-            end = today.strftime("%Y-%m-%d")
+                latest_date = old.iloc[0].get('trade_date')
+                if latest_date is not None:
+                    try:
+                        latest = pd.Timestamp(latest_date)
+                        today = pd.Timestamp(date.today())
+                        days_gap = (today - latest).days
+                        # =0 天：今天数据已拉过，缓存直接有效
+                        if days_gap == 0:
+                            logger.info(f"个股资金流向[{stock_code}]最新数据为{latest_date}，缓存有效")
+                            return old
+                        # >0 天：尝试拉新（交易日有新数据）
+                        logger.info(f"个股资金流向[{stock_code}]缓存距今{days_gap}天，增量拉取")
+                        start = (latest + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                        end = today.strftime("%Y-%m-%d")
+                    except Exception as e:
+                        logger.warning(f"日期计算异常: {e}，回退全量拉取")
+                        start = f"{today.year - 1}-01-01"
+                        end = today.strftime("%Y-%m-%d")
+                else:
+                    start = f"{date.today().year - 1}-01-01"
+                    end = date.today().strftime("%Y-%m-%d")
+            else:
+                start = f"{date.today().year - 1}-01-01"
+                end = date.today().strftime("%Y-%m-%d")
+
             df = self.tushare.moneyflow(stock_code, trade_date='', start_date=start, end_date=end)
             if df is None or df.empty:
-                logger.error(f"获取股票[{stock_code}]个股资金流向数据为空")
+                if old is not None and not old.empty:
+                    logger.warning(f"[资金流向] 增量拉取无新数据，返回缓存（最新{latest_date}）")
+                    return old
                 return None
             save_count = self.db.save_stock_moneyflow(df, stock_code)
             logger.info(f"保存股票[{stock_code}]个股资金流向成功，新增[{save_count}]条记录")

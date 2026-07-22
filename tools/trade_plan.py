@@ -218,9 +218,12 @@ def format_trade_plan(plan: Optional[Dict[str, Any]]) -> str:
     elif plan["entry_note"]:
         lines.append(f"  买入参考：{plan['entry_note']}")
     stop_line = f"  止损纪律位：{plan['stop_loss']}（距现价 {plan['stop_pct']}%，跌破无条件离场）"
-    if plan["stop_pct"] is not None and plan["stop_pct"] <= -12:
-        stop_line += ("；⚠️该结构位距现价较远、风险敞口大（这也是盈亏比难达标的直接原因），"
-                      "若日后信号转多，应按当时的支撑重算止损，不得沿用本位")
+    if plan["stop_pct"] is not None:
+        if plan["stop_pct"] <= -12:
+            stop_line += ("；⚠️该结构位距现价较远、风险敞口大（这也是盈亏比难达标的直接原因），"
+                          "若日后信号转多，应按当时的支撑重算止损，不得沿用本位")
+        elif plan["stop_pct"] >= -3:
+            stop_line += "；⚠️止损位距现价不足3%，正在经受考验"
     lines.append(stop_line)
     if plan["targets"]:
         # 附带相对现价的空间百分比：这是"价位距离"不是涨幅预测，供收益空间评估

@@ -17,17 +17,18 @@ from utils.logger import logger
 
 
 class FeishuNotifier:
-    def __init__(self):
-        cfg = load_config().get("feishu", {}) or {}
+    def __init__(self, config_section: str = "feishu"):
+        cfg = load_config().get(config_section, {}) or {}
         self.app_id = (cfg.get("app_id") or "").strip()
         self.app_secret = (cfg.get("app_secret") or "").strip()
         self.push_open_id = (cfg.get("push_open_id") or "").strip()
         self.webhook_url = (cfg.get("webhook_url") or "").strip()
         self._lark_client = None
         self._lock = threading.Lock()
+        self.config_section = config_section
 
         if not self._app_ready() and not self.webhook_url:
-            logger.warning("飞书推送未配置（feishu.app_id/app_secret+push_open_id 或 feishu.webhook_url），"
+            logger.warning(f"飞书推送未配置（{config_section}.app_id/app_secret+push_open_id 或 {config_section}.webhook_url），"
                            "监控事件只写日志不推送")
 
     def _app_ready(self) -> bool:
@@ -150,6 +151,32 @@ class FeishuNotifier:
             return False
         return True
 
+    def send_card_text(self, text: str, title: str = "定时报告",
+                       receive_id: str = "", receive_id_type: str = "open_id") -> bool:
+        """
+        将 markdown 文本转换为交互式卡片发送。
+        转换失败时降级为普通文本 `send()`。
+        receive_id 为空时使用 push_open_id（默认推送目标）。"""
+        if not text or not text.strip():
+            return False
+        import lark_oapi as lark
+        from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
+        rid = receive_id or self.push_open_id
+        if not rid or not (self.app_id and self.app_secret):
+            return self.send(text)
+
+        # 延迟导入避免循环引用
+        try:
+            from feishu_bot import _report_to_cards
+            cards = _report_to_cards(text, title)
+            if cards:
+                return self.send_card_chunked(cards, rid, receive_id_type)
+        except Exception as e:
+            logger.debug(f"[卡片] send_card_text 转卡失败，降级文本: {e}")
+
+        return self.send(text)
+
     def send_card_chunked(self, cards: list, receive_id: str,
                           receive_id_type: str = "open_id") -> bool:
         """
@@ -164,6 +191,287 @@ class FeishuNotifier:
                 logger.error(f"[卡片] 第{i+1}/{len(cards)}张发送失败: {e}")
                 ok = False
         return ok
+
+    def create_feishu_doc(self, title: str, markdown_text: str) -> str:
+        """
+        创建飞书文档并写入内容。
+        返回文档 URL；失败返回空字符串。
+        需要飞书应用已开通 docx:document:write_only 权限。
+        """
+        if not (self.app_id and self.app_secret):
+            logger.error("未配置 feishu.app_id/app_secret，无法创建文档")
+            return ""
+
+        import lark_oapi as lark
+        client = self._get_lark_client()
+
+        # 1. 创建文档
+        try:
+            doc_req = lark.api.docx.v1.model.CreateDocumentRequest.builder() \
+                .request_body(
+                    lark.api.docx.v1.model.CreateDocumentRequestBody.builder()
+                    .title(title)
+                    .build()
+                ).build()
+            doc_resp = client.docx.v1.document.create(doc_req)
+            if not doc_resp.success():
+                logger.error(f"飞书文档创建失败: code={doc_resp.code}, msg={doc_resp.msg}")
+                return ""
+            document_id = doc_resp.data.document.document_id
+            logger.info(f"[飞书文档] 创建成功: {document_id}")
+        except Exception as e:
+            logger.error(f"飞书文档创建异常: {e}")
+            return ""
+
+        # 给用户添加编辑权限
+        try:
+            if self.push_open_id:
+                from lark_oapi.core.token.manager import TokenManager
+                import requests as http_req
+                lark_token = TokenManager.get_self_tenant_token(client.config)
+                perm_resp = http_req.post(
+                    f"https://open.feishu.cn/open-apis/drive/v1/permissions/{document_id}/members?type=docx&need_notification=false",
+                    headers={"Authorization": f"Bearer {lark_token}",
+                             "Content-Type": "application/json; charset=utf-8"},
+                    json={
+                        "member_type": "openid",
+                        "member_id": self.push_open_id,
+                        "perm": "full_access"
+                    }
+                )
+                pr = perm_resp.json()
+                if pr.get("code") == 0:
+                    logger.info(f"[飞书文档] 已授予编辑权限: {self.push_open_id}")
+                else:
+                    logger.warning(f"[飞书文档] 权限授予失败: code={pr.get('code')}, msg={pr.get('msg')}")
+        except Exception as e:
+            logger.warning(f"[飞书文档] 权限授予异常（不影响写入）: {e}")
+
+        # 2. 解析 markdown 为有序内容项列表
+        content_items = self._md_to_docx_items(markdown_text)
+
+        # 3. 有序写入：普通块 batch 提交，表格逐表创建
+        import requests as http_req
+        from lark_oapi.core.token.manager import TokenManager
+        lark_token = TokenManager.get_self_tenant_token(client.config)
+
+        flat_buffer = []
+        table_idx = 0
+        flat_ok = 0
+        table_ok = 0
+
+        def _flush_flat():
+            nonlocal flat_ok
+            if not flat_buffer:
+                return
+            batch_size = 50
+            for i in range(0, len(flat_buffer), batch_size):
+                batch = flat_buffer[i:i + batch_size]
+                try:
+                    body_builder = lark.api.docx.v1.model.CreateDocumentBlockChildrenRequestBody.builder()
+                    body_builder.children(batch)
+                    body_builder.index(-1)
+                    req = lark.api.docx.v1.model.CreateDocumentBlockChildrenRequest.builder() \
+                        .document_id(document_id) \
+                        .block_id(document_id) \
+                        .request_body(body_builder.build()) \
+                        .build()
+                    resp = client.docx.v1.document_block_children.create(req)
+                    if resp.success():
+                        flat_ok += len(batch)
+                except Exception as e:
+                    logger.error(f"[飞书文档] 普通块写入异常: {e}")
+            flat_buffer.clear()
+
+        for item in content_items:
+            if item["type"] == "block":
+                flat_buffer.append(item["data"])
+            elif item["type"] == "table":
+                _flush_flat()
+                tbl = item["data"]
+                try:
+                    n_rows, n_cols = tbl["n_rows"], tbl["n_cols"]
+                    rows = tbl["rows"]
+                    tid = table_idx
+                    table_idx += 1
+                    tbl_id = f"tb_{tid}"
+                    cell_ids = [f"tb_{tid}_c_{ri}_{ci}" for ri in range(n_rows) for ci in range(n_cols)]
+
+                    descendants = [{
+                        "block_id": tbl_id,
+                        "block_type": 31,
+                        "table": {"property": {"row_size": n_rows, "column_size": n_cols}},
+                        "children": cell_ids
+                    }]
+                    for ri in range(n_rows):
+                        for ci in range(n_cols):
+                            cell_id = f"tb_{tid}_c_{ri}_{ci}"
+                            text_id = f"tb_{tid}_t_{ri}_{ci}"
+                            ct = rows[ri][ci] if ci < len(rows[ri]) else ""
+                            el = (self._parse_inline_elements(f"**{ct}**")
+                                  if ri == 0 else self._parse_inline_elements(ct))
+                            descendants.append({
+                                "block_id": cell_id, "block_type": 32,
+                                "table_cell": {}, "children": [text_id]
+                            })
+                            descendants.append({
+                                "block_id": text_id, "block_type": 2,
+                                "text": {"elements": el}, "children": []
+                            })
+                    d_resp = http_req.post(
+                        f"https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks/{document_id}/descendant",
+                        headers={"Authorization": f"Bearer {lark_token}",
+                                 "Content-Type": "application/json; charset=utf-8"},
+                        json={"index": -1, "children_id": [tbl_id], "descendants": descendants}
+                    )
+                    if d_resp.json().get("code") == 0:
+                        table_ok += 1
+                except Exception as e:
+                    logger.error(f"[飞书文档] 表格创建异常: {e}")
+
+        _flush_flat()
+        logger.info(f"[飞书文档] 写入完成: {flat_ok} 普通块 + {table_ok} 表格")
+
+        return f"https://www.feishu.cn/docx/{document_id}"
+
+    @staticmethod
+    def _parse_inline_elements(text: str) -> list:
+        """将行内文本中的 **加粗** 和 <font color='...'>...</font> 解析为飞书 text_run 元素列表。"""
+        import re
+        _COLOR_MAP = {
+            "red": {"red": 230, "green": 50, "blue": 50},
+            "green": {"red": 0, "green": 170, "blue": 0},
+        }
+
+        pattern = re.compile(
+            r'\*\*([^*]+)\*\*'
+            r'|<font color=\'([^\']+)\'>([^<]+)</font>'
+        )
+
+        elements = []
+        pos = 0
+        for m in pattern.finditer(text):
+            if m.start() > pos:
+                elements.append({
+                    "text_run": {"content": text[pos:m.start()], "text_element_style": {}}
+                })
+            if m.group(1) is not None:
+                elements.append({
+                    "text_run": {"content": m.group(1), "text_element_style": {"bold": True}}
+                })
+            else:
+                rgb = _COLOR_MAP.get(m.group(2), {"red": 0, "green": 0, "blue": 0})
+                elements.append({
+                    "text_run": {"content": m.group(3), "text_element_style": {"text_color": rgb}}
+                })
+            pos = m.end()
+        if pos < len(text):
+            elements.append({
+                "text_run": {"content": text[pos:], "text_element_style": {}}
+            })
+        return elements if elements else [{"text_run": {"content": text, "text_element_style": {}}}]
+
+    @staticmethod
+    def _md_to_docx_items(markdown_text: str) -> list:
+        """
+        将 markdown 文本解析为有序的内容项列表。
+        每个 item 为 {"type": "block"|"table", "data": ...}。
+        - type="block": data 为飞书 block dict
+        - type="table": data 为 {"n_rows": int, "n_cols": int, "rows": [[cell, ...], ...]}
+        行内格式：**加粗**、<font color='...'>...</font>。
+        """
+        import re
+        parse = FeishuNotifier._parse_inline_elements
+        items = []
+        lines = markdown_text.strip().split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1
+                continue
+
+            # ## 标题 → heading2
+            if line.startswith("## "):
+                items.append({"type": "block", "data": {
+                    "block_type": 4,
+                    "heading2": {"elements": parse(line[3:].strip())}
+                }})
+                i += 1
+                continue
+
+            # --- 分隔线
+            if re.match(r"^---+\s*$", line):
+                items.append({"type": "block", "data": {"block_type": 22, "divider": {}}})
+                i += 1
+                continue
+
+            # 表格（支持 | 和 │）
+            sep = '│' if '│' in line else None
+            is_pipe_table = line.startswith("|")
+            if sep or is_pipe_table:
+                table_lines = []
+                while i < len(lines):
+                    sl = lines[i].strip()
+                    if (sep and '│' in sl) or (is_pipe_table and sl.startswith("|")):
+                        table_lines.append(sl)
+                        i += 1
+                    elif sl.strip().startswith(":--") or sl.strip().startswith("---"):
+                        i += 1
+                    else:
+                        break
+                sep_char = sep if sep else '|'
+                raw_rows = []
+                for row in table_lines:
+                    cells = [c.strip() for c in row.split(sep_char) if c.strip()]
+                    if all(re.match(r'^:?-{2,}:?$', c) for c in cells):
+                        continue
+                    if cells:
+                        raw_rows.append(cells)
+                if len(raw_rows) >= 2:
+                    n_cols = max(len(r) for r in raw_rows)
+                    padded = [r + [''] * (n_cols - len(r)) for r in raw_rows]
+                    items.append({"type": "table", "data": {
+                        "n_rows": len(padded), "n_cols": n_cols, "rows": padded
+                    }})
+                else:
+                    for row in raw_rows:
+                        items.append({"type": "block", "data": {
+                            "block_type": 2,
+                            "text": {"elements": parse(" │ ".join(row))}
+                        }})
+                continue
+
+            # - 或 • 列表 → bullet
+            if line.startswith("- ") or line.startswith("• "):
+                bline = line[2:].strip() if line.startswith("- ") else line[1:].strip()
+                raw_line = lines[i]
+                level = (len(raw_line) - len(raw_line.lstrip())) // 2
+                items.append({"type": "block", "data": {
+                    "block_type": 12,
+                    "bullet": {"elements": parse(bline), "style": {"level": level}}
+                }})
+                i += 1
+                continue
+
+            # 普通文本段落
+            paragraph = line
+            i += 1
+            while i < len(lines):
+                next_line = lines[i].strip()
+                if not next_line or next_line.startswith("## ") \
+                        or next_line.startswith("- ") or next_line.startswith("• ") \
+                        or next_line.startswith("|") or '│' in next_line \
+                        or re.match(r"^---+", next_line):
+                    break
+                paragraph += "\n" + next_line
+                i += 1
+            if paragraph.strip():
+                items.append({"type": "block", "data": {
+                    "block_type": 2,
+                    "text": {"elements": parse(paragraph)}
+                }})
+        return items
 
     def _send_via_webhook(self, text: str, msg_type: str = "text") -> bool:
         payload = {"msg_type": msg_type}

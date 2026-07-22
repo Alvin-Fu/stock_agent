@@ -101,7 +101,7 @@ class MonitorScheduler:
                 summary = "\n".join(summary_lines[:15]) if summary_lines else result[:500]
                 from monitoring.notifier import FeishuNotifier
                 notifier = FeishuNotifier()
-                notifier.send(f"📊 **低位价值发现扫描**\n\n{summary[:2000]}")
+                notifier.send_card_text(summary[:2000], "低位价值发现扫描")
                 logger.info("低位价值发现扫描完成")
         except Exception as e:
             logger.error(f"低位价值发现扫描失败: {e}")
@@ -109,7 +109,7 @@ class MonitorScheduler:
         try:
             val_text = self._fetch_market_valuation()
             if val_text:
-                self.notifier.send(f"📈 **大盘估值快照**\n\n{val_text}")
+                self.notifier.send_card_text(val_text, "大盘估值快照")
         except Exception as e:
             logger.debug(f"大盘估值快照跳过: {e}")
 
@@ -138,7 +138,7 @@ class MonitorScheduler:
         try:
             from .macro_watcher import fetch_macro_snapshot
             text = fetch_macro_snapshot(session=session)
-            self.notifier.send(f"🏛 **大盘宏观数据快照（{label}）**\n\n{text[:6000]}")
+            self.notifier.send_card_text(text[:6000], f"大盘宏观数据快照（{label}）")
             logger.info(f"[宏观] {label}宏观分析推送完成")
         except Exception as e:
             logger.error(f"[宏观] {label}宏观分析异常: {e}")
@@ -190,7 +190,7 @@ class MonitorScheduler:
                 logger.info("[Golden] 周度回归开始（预计数十分钟到数小时）")
                 from eval.golden_run import run as golden_run
                 summary = golden_run()
-                self.notifier.send("【Golden 周回归】\n" + summary[:3500])
+                self.notifier.send_card_text(summary[:3500], "Golden 周回归")
             except Exception as e:
                 logger.error(f"[Golden] 周度回归失败: {e}")
                 self.notifier.send(f"【Golden 周回归】运行失败: {e}")

@@ -181,7 +181,7 @@ def _push_to_feishu(title: str, content: str):
     try:
         from monitoring.notifier import FeishuNotifier
         notifier = FeishuNotifier()
-        notifier.send(f"🔭 **{title}**\n\n{content[:3500]}")
+        notifier.send_card_text(content[:3500], title)
     except Exception as e:
         logger.warning(f"飞书推送失败: {e}")
 

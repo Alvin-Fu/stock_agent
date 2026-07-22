@@ -6909,12 +6909,12 @@ class DatabaseManager:
 
     def save_stock_dividend(self, df: pd.DataFrame, code: str) -> int:
         """
-        保存分红送股数据到数据库（支持UPSERT操作）
+        保存分红送股数据到数据库（先删后插，避免 UNIQUE 冲突）
         Args:
-            df: 包含分红送股数据的DataFrame
+            df: 包含分红送股数据的DataFrame（NaN 已清理为 None）
             code: 股票代码
         Returns:
-            int: 新增的记录数
+            int: 写入的记录数
         """
         if df is None or df.empty:
             logger.warning(f"保存分红送股数据为空，跳过 {code}")
@@ -6923,49 +6923,59 @@ class DatabaseManager:
         saved_count = 0
         with self.get_session() as session:
             try:
-                end_dates = [parse_row_date(d) for d in df['end_date'].tolist()]
-                existing_records = session.execute(
-                    select(StockDividend).where(
+                # 防御性：确保 DataFrame 中无 NaN
+                df = df.copy()
+                for col in df.columns:
+                    if df[col].dtype.kind == 'f':
+                        df[col] = df[col].fillna(None)
+
+                # 统一解析 end_date，过滤无效行
+                rows_to_save = []
+                for _, row in df.iterrows():
+                    end_date = parse_row_date(row.get('end_date'))
+                    if end_date is None:
+                        continue
+                    rows_to_save.append((end_date, row))
+                if not rows_to_save:
+                    logger.warning(f"保存 {code} 分红送股数据失败：所有 end_date 解析为空")
+                    return 0
+
+                # 先删已存在的（code + end_date 唯一键），再批量插入
+                end_dates = [r[0] for r in rows_to_save]
+                session.execute(
+                    delete(StockDividend).where(
                         and_(
                             StockDividend.code == code,
                             StockDividend.end_date.in_(end_dates)
                         )
                     )
-                ).scalars().all()
-                # 统一用字符串作为 dict key，避免 date/datetime 类型不匹配
-                existing_map = {str(r.end_date): r for r in existing_records}
+                )
 
-                for _, row in df.iterrows():
-                    end_date = parse_row_date(row.get('end_date'))
-                    existing = existing_map.get(str(end_date))
+                def _v(v):
+                    """NaN → None 防御"""
+                    if v is None:
+                        return None
+                    try:
+                        return None if pd.isna(v) else v
+                    except Exception:
+                        return v
 
-                    if existing:
-                        existing.div_procf = row.get('div_procf')
-                        existing.stk_bo_rate = row.get('stk_bo_rate')
-                        existing.stk_co_rate = row.get('stk_co_rate')
-                        existing.cash_div = row.get('cash_div')
-                        existing.ex_date = parse_row_date(row.get('ex_date')) if row.get('ex_date') else None
-                        existing.pay_date = parse_row_date(row.get('pay_date')) if row.get('pay_date') else None
-                        existing.updated_at = datetime.now()
-                    else:
-                        record = StockDividend(
-                            code=code,
-                            end_date=end_date,
-                            div_procf=row.get('div_procf'),
-                            stk_bo_rate=row.get('stk_bo_rate'),
-                            stk_co_rate=row.get('stk_co_rate'),
-                            cash_div=row.get('cash_div'),
-                            ex_date=parse_row_date(row.get('ex_date')) if row.get('ex_date') else None,
-                            pay_date=parse_row_date(row.get('pay_date')) if row.get('pay_date') else None,
-                        )
-                        session.add(record)
-                        saved_count += 1
+                for end_date, row in rows_to_save:
+                    record = StockDividend(
+                        code=code,
+                        end_date=end_date,
+                        div_procf=_v(row.get('div_procf')),
+                        stk_bo_rate=_v(row.get('stk_bo_rate')),
+                        stk_co_rate=_v(row.get('stk_co_rate')),
+                        cash_div=_v(row.get('cash_div')),
+                        ex_date=parse_row_date(row.get('ex_date')) if row.get('ex_date') else None,
+                        pay_date=parse_row_date(row.get('pay_date')) if row.get('pay_date') else None,
+                    )
+                    session.add(record)
+                    saved_count += 1
 
                 session.commit()
-                if saved_count > 0:
-                    logger.info(f"保存 {code} 分红送股数据成功，新增 {saved_count} 条记录，更新 {len(df) - saved_count} 条记录")
-                else:
-                    logger.info(f"保存 {code} 分红送股数据成功，更新 {len(df)} 条记录")
+                logger.info(f"保存 {code} 分红送股数据成功，写入 {saved_count} 条记录")
             except Exception as e:
                 session.rollback()
                 logger.error(f"保存 {code} 分红送股数据失败: {e}")
