@@ -926,6 +926,8 @@ class StockBalanceSheet(Base):
     current_ratio = Column(Float)  # 流动比率（倍数）
     accounts_receivable = Column(Float)  # 应收账款（单位：元，营运资本趋势用）
     inventory = Column(Float)  # 存货（单位：元，营运资本趋势用）
+    fixed_assets = Column(Float)  # 固定资产（单位：元，产能扩张分析用）
+    construction_in_progress = Column(Float)  # 在建工程（单位：元，产能扩张分析用）
     data_source = Column(String(50))
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
@@ -2587,11 +2589,11 @@ class DatabaseManager:
                 # stock_balance_sheet：旧表缺应收/存货列时补齐（营运资本趋势用）
                 if 'stock_balance_sheet' in table_names:
                     bs_cols = [c['name'] for c in inspector.get_columns('stock_balance_sheet')]
-                    for col_name in ('accounts_receivable', 'inventory'):
+                    for col_name in ('accounts_receivable', 'inventory', 'fixed_assets', 'construction_in_progress'):
                         if col_name not in bs_cols:
                             conn.execute(text(f'ALTER TABLE stock_balance_sheet ADD COLUMN {col_name} FLOAT'))
                             conn.commit()
-                            logger.info(f"stock_balance_sheet 表补充 {col_name} 列（营运资本趋势用）")
+                            logger.info(f"stock_balance_sheet 表补充 {col_name} 列（{'营运资本趋势用' if col_name in ('accounts_receivable', 'inventory') else '产能扩张分析用'}）")
 
                 # analysis_snapshot：旧表缺列时补齐（trade_plan=条件触发；moat/flywheel=定性延续；
                 # fundamental_*=基本面前瞻对账闭环）
@@ -6909,12 +6911,12 @@ class DatabaseManager:
 
     def save_stock_dividend(self, df: pd.DataFrame, code: str) -> int:
         """
-        保存分红送股数据到数据库（先删后插，避免 UNIQUE 冲突）
+        保存分红送股数据到数据库（merge upsert，避免 UNIQUE 冲突）
         Args:
             df: 包含分红送股数据的DataFrame（NaN 已清理为 None）
             code: 股票代码
         Returns:
-            int: 写入的记录数
+            int: 写入/更新的记录数
         """
         if df is None or df.empty:
             logger.warning(f"保存分红送股数据为空，跳过 {code}")
@@ -6929,28 +6931,6 @@ class DatabaseManager:
                     if df[col].dtype.kind == 'f':
                         df[col] = df[col].fillna(None)
 
-                # 统一解析 end_date，过滤无效行
-                rows_to_save = []
-                for _, row in df.iterrows():
-                    end_date = parse_row_date(row.get('end_date'))
-                    if end_date is None:
-                        continue
-                    rows_to_save.append((end_date, row))
-                if not rows_to_save:
-                    logger.warning(f"保存 {code} 分红送股数据失败：所有 end_date 解析为空")
-                    return 0
-
-                # 先删已存在的（code + end_date 唯一键），再批量插入
-                end_dates = [r[0] for r in rows_to_save]
-                session.execute(
-                    delete(StockDividend).where(
-                        and_(
-                            StockDividend.code == code,
-                            StockDividend.end_date.in_(end_dates)
-                        )
-                    )
-                )
-
                 def _v(v):
                     """NaN → None 防御"""
                     if v is None:
@@ -6960,22 +6940,48 @@ class DatabaseManager:
                     except Exception:
                         return v
 
-                for end_date, row in rows_to_save:
-                    record = StockDividend(
-                        code=code,
-                        end_date=end_date,
-                        div_procf=_v(row.get('div_procf')),
-                        stk_bo_rate=_v(row.get('stk_bo_rate')),
-                        stk_co_rate=_v(row.get('stk_co_rate')),
-                        cash_div=_v(row.get('cash_div')),
-                        ex_date=parse_row_date(row.get('ex_date')) if row.get('ex_date') else None,
-                        pay_date=parse_row_date(row.get('pay_date')) if row.get('pay_date') else None,
-                    )
-                    session.add(record)
+                # 去重：同一 end_date 只保留一行（Tushare 可能返回多个版本）
+                df_dedup = df.drop_duplicates(subset=['end_date'], keep='first').reset_index(drop=True)
+
+                for _, row in df_dedup.iterrows():
+                    end_date = parse_row_date(row.get('end_date'))
+                    if end_date is None:
+                        continue
+                    # 查找已有记录
+                    existing = session.execute(
+                        select(StockDividend).where(
+                            and_(
+                                StockDividend.code == code,
+                                StockDividend.end_date == end_date
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        # 更新已有记录
+                        existing.div_procf = _v(row.get('div_procf'))
+                        existing.stk_bo_rate = _v(row.get('stk_bo_rate'))
+                        existing.stk_co_rate = _v(row.get('stk_co_rate'))
+                        existing.cash_div = _v(row.get('cash_div'))
+                        existing.ex_date = parse_row_date(row.get('ex_date')) if row.get('ex_date') else None
+                        existing.pay_date = parse_row_date(row.get('pay_date')) if row.get('pay_date') else None
+                        existing.updated_at = datetime.now()
+                    else:
+                        # 新增记录
+                        record = StockDividend(
+                            code=code,
+                            end_date=end_date,
+                            div_procf=_v(row.get('div_procf')),
+                            stk_bo_rate=_v(row.get('stk_bo_rate')),
+                            stk_co_rate=_v(row.get('stk_co_rate')),
+                            cash_div=_v(row.get('cash_div')),
+                            ex_date=parse_row_date(row.get('ex_date')) if row.get('ex_date') else None,
+                            pay_date=parse_row_date(row.get('pay_date')) if row.get('pay_date') else None,
+                        )
+                        session.add(record)
                     saved_count += 1
 
                 session.commit()
-                logger.info(f"保存 {code} 分红送股数据成功，写入 {saved_count} 条记录")
+                logger.info(f"保存 {code} 分红送股数据成功，写入/更新 {saved_count} 条记录")
             except Exception as e:
                 session.rollback()
                 logger.error(f"保存 {code} 分红送股数据失败: {e}")

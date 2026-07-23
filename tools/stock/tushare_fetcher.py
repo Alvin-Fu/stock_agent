@@ -662,7 +662,7 @@ class TushareFetcher(BaseFetcher):
                 end_date=ts_end,
                 fields=(
                     "ts_code,ann_date,end_date,n_cashflow_act,n_cashflow_inv_act,"
-                    "n_cash_flows_fnc_act,c_pay_acq_const_fids,free_cashflow,update_flag"
+                    "n_cash_flows_fnc_act,c_pay_acq_const_fiolta,free_cashflow,update_flag"
                 ),
             )
             if df.empty:

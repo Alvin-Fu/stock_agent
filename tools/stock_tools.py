@@ -621,12 +621,96 @@ class StockTools:
             logger.error(f"获取股票[{stock_code}]融资融券明细数据失败: {e} {traceback.format_exc()}")
             return None
 
+    @staticmethod
+    def _fetch_moneyflow_akshare(stock_code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """通过 AkShare 获取个股资金流向（Tushare 数据异常时兜底）
+
+        AkShare stock_individual_fund_flow 返回的金额单位为元，
+        列名：日期、主力净流入、小单净流入、中单净流入、大单净流入、超大单净流入等。
+        """
+        try:
+            import akshare as ak
+            import pandas as _pd
+            # 判断市场：6 开头是沪市，0/3 开头是深市
+            market = "sh" if stock_code.startswith("6") else "sz"
+            df = ak.stock_individual_fund_flow(stock=stock_code, market=market)
+            if df is None or df.empty:
+                return None
+            # AkShare 返回近 100 个交易日数据，需按 start/end 过滤
+            df = df.copy()
+            df.columns = [str(c).strip() for c in df.columns]
+            # 列名映射：AkShare 中 "日期" → "trade_date"，"主力净流入-净额" → net_mf_amount
+            date_col = None
+            mf_col = None
+            for c in df.columns:
+                if "日期" in c or "date" in c.lower():
+                    date_col = c
+            # 主力净额列：优先匹配含"净额"的主力列，避免匹配到"净占比"
+            mf_candidates = [c for c in df.columns if ("主力" in c or "主力净" in c) and "净额" in c]
+            if not mf_candidates:
+                mf_candidates = [c for c in df.columns if "主力净流入" in c or "主力净额" in c]
+            mf_col = mf_candidates[0] if mf_candidates else None
+            if date_col is None or mf_col is None:
+                logger.warning(f"[AkShare资金流] 列名不匹配: {list(df.columns)}")
+                return None
+            # 日期统一为 YYYY-MM-DD
+            df["trade_date"] = _pd.to_datetime(df[date_col]).dt.strftime("%Y-%m-%d")
+            # 过滤时间范围
+            df = df[(df["trade_date"] >= start_date) & (df["trade_date"] <= end_date)]
+            if df.empty:
+                return None
+            # 构建与 Tushare 兼容的 DataFrame
+            # AkShare 列：主力净流入-净额、超大单净流入-净额、大单净流入-净额、
+            #               中单净流入-净额、小单净流入-净额
+            # 映射：主力净额 → net_mf_amount
+            #       超大单+大单 → 主力（已在主力净额中体现）
+            #       中单 → 游资（md_*）
+            #       小单 → 散户（sm_*）
+            def _match_col(pattern):
+                matches = [c for c in df.columns if pattern in c]
+                return matches[0] if matches else None
+
+            mid_col = _match_col("中单净流入-净额")
+            sml_col = _match_col("小单净流入-净额")
+
+            def _parse_ak_val(v):
+                """AkShare 资金净额已是 float（元），直接返回；None 返回 0.0"""
+                if v is None:
+                    return 0.0
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    return 0.0
+
+            result_rows = []
+            for _, row in df.iterrows():
+                mf = _parse_ak_val(row.get(mf_col))
+                md = _parse_ak_val(row.get(mid_col)) if mid_col else 0.0
+                sm = _parse_ak_val(row.get(sml_col)) if sml_col else 0.0
+                # 正负分别填入 buy/sell（适配 _format_moneyflow 计算逻辑）
+                result_rows.append({
+                    "trade_date": row["trade_date"],
+                    "net_mf_amount": mf,
+                    "buy_md_amount": md if md > 0 else 0.0,
+                    "sell_md_amount": -md if md < 0 else 0.0,
+                    "buy_sm_amount": sm if sm > 0 else 0.0,
+                    "sell_sm_amount": -sm if sm < 0 else 0.0,
+                })
+            result = _pd.DataFrame(result_rows)
+            result = result.sort_values("trade_date", ascending=False).reset_index(drop=True)
+            logger.info(f"[AkShare资金流] 获取成功: {stock_code}, {len(result)} 条")
+            return result
+        except Exception as e:
+            logger.warning(f"[AkShare资金流] 获取失败: {e}")
+            return None
+
     def fetch_and_save_stock_moneyflow(self, stock_code: str) -> Union[pd.DataFrame, None]:
-        """获取并保存个股资金流向数据（按日增量更新，DB缓存）
+        """获取并保存个股资金流向数据（按日增量更新，DB缓存 + AkShare兜底）
 
         缓存策略：最新数据日期 ≥ 今天-1天 → 直接返回缓存；
                  最新数据日期 < 今天-1天 → 从最新日期次日增量拉取、合并存储。
                  拉取失败时降级返回旧缓存，不阻断分析。
+                 Tushare 数据异常（主力净流绝对值过低）时自动切 AkShare 重试。
         """
         if stock_code is None:
             logger.error("股票代码为空")
@@ -640,14 +724,19 @@ class StockTools:
                         latest = pd.Timestamp(latest_date)
                         today = pd.Timestamp(date.today())
                         days_gap = (today - latest).days
-                        # =0 天：今天数据已拉过，缓存直接有效
                         if days_gap == 0:
-                            logger.info(f"个股资金流向[{stock_code}]最新数据为{latest_date}，缓存有效")
-                            return old
-                        # >0 天：尝试拉新（交易日有新数据）
-                        logger.info(f"个股资金流向[{stock_code}]缓存距今{days_gap}天，增量拉取")
-                        start = (latest + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-                        end = today.strftime("%Y-%m-%d")
+                            latest_mf = pd.to_numeric(old.iloc[0].get('net_mf_amount', 0), errors='coerce') or 0
+                            if abs(latest_mf) >= 5_000_000:
+                                logger.info(f"个股资金流向[{stock_code}]最新数据为{latest_date}，缓存有效")
+                                return old
+                            else:
+                                logger.warning(f"个股资金流向[{stock_code}]缓存数据异常（main_inflow={latest_mf:.0f}），触发重拉")
+                                start = today.strftime("%Y-%m-%d")
+                                end = today.strftime("%Y-%m-%d")
+                        else:
+                            logger.info(f"个股资金流向[{stock_code}]缓存距今{days_gap}天，增量拉取")
+                            start = (latest + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                            end = today.strftime("%Y-%m-%d")
                     except Exception as e:
                         logger.warning(f"日期计算异常: {e}，回退全量拉取")
                         start = f"{today.year - 1}-01-01"
@@ -659,15 +748,50 @@ class StockTools:
                 start = f"{date.today().year - 1}-01-01"
                 end = date.today().strftime("%Y-%m-%d")
 
+            # 1. 先尝试 Tushare
             df = self.tushare.moneyflow(stock_code, trade_date='', start_date=start, end_date=end)
-            if df is None or df.empty:
-                if old is not None and not old.empty:
-                    logger.warning(f"[资金流向] 增量拉取无新数据，返回缓存（最新{latest_date}）")
-                    return old
-                return None
-            save_count = self.db.save_stock_moneyflow(df, stock_code)
-            logger.info(f"保存股票[{stock_code}]个股资金流向成功，新增[{save_count}]条记录")
-            return self.db.get_stock_moneyflow(stock_code)
+            # 2. 校验 Tushare 数据是否合理：最新一天的 net_mf_amount 若绝对值 < 500万，可能数据异常
+            df_valid = False
+            if df is not None and not df.empty:
+                df = df.sort_values('trade_date', ascending=False).reset_index(drop=True)
+                latest_mf = pd.to_numeric(df.iloc[0].get('net_mf_amount', 0), errors='coerce') or 0
+                if abs(latest_mf) >= 5_000_000:  # 500万以上认为合理
+                    df_valid = True
+                else:
+                    logger.warning(f"[资金流向] Tushare 数据异常: 最新日主力净流={latest_mf:.0f}元，尝试 AkShare 兜底")
+            # 3. Tushare 数据异常或为空，尝试 AkShare 兜底
+            if not df_valid:
+                ak_df = self._fetch_moneyflow_akshare(stock_code, start, end)
+                if ak_df is not None and not ak_df.empty:
+                    # 将 AkShare 数据转换为 Tushare 兼容格式，保存到 DB
+                    ts_cols = ['buy_sm_vol', 'buy_sm_amount', 'sell_sm_vol', 'sell_sm_amount',
+                               'buy_md_vol', 'buy_md_amount', 'sell_md_vol', 'sell_md_amount',
+                               'buy_lg_vol', 'buy_lg_amount', 'sell_lg_vol', 'sell_lg_amount',
+                               'buy_elg_vol', 'buy_elg_amount', 'sell_elg_vol', 'sell_elg_amount',
+                               'net_mf_amount']
+                    for c in ts_cols:
+                        if c not in ak_df.columns:
+                            ak_df[c] = None
+                    ak_df['trade_date'] = ak_df['trade_date'].astype(str)
+                    save_count = self.db.save_stock_moneyflow(ak_df, stock_code)
+                    logger.info(f"保存股票[{stock_code}]个股资金流向成功（AkShare兜底），新增[{save_count}]条记录")
+                    df = self.db.get_stock_moneyflow(stock_code)
+                elif df is not None and not df.empty:
+                    # AkShare 也失败，但 Tushare 有数据（虽然异常），仍保存并返回
+                    save_count = self.db.save_stock_moneyflow(df, stock_code)
+                    logger.info(f"保存股票[{stock_code}]个股资金流向成功（Tushare原样），新增[{save_count}]条记录")
+                    df = self.db.get_stock_moneyflow(stock_code)
+                else:
+                    if old is not None and not old.empty:
+                        logger.warning(f"[资金流向] 双源皆失败，返回缓存（最新{latest_date}）")
+                        return old
+                    return None
+            else:
+                save_count = self.db.save_stock_moneyflow(df, stock_code)
+                logger.info(f"保存股票[{stock_code}]个股资金流向成功，新增[{save_count}]条记录")
+                df = self.db.get_stock_moneyflow(stock_code)
+
+            return df
         except Exception as e:
             logger.error(f"获取股票[{stock_code}]个股资金流向数据失败: {e} {traceback.format_exc()}")
             return None
@@ -2179,6 +2303,8 @@ class StockTools:
             'total_hldr_eqy_exc_min_int': 'total_equity',
             'accounts_receiv': 'accounts_receivable',
             'inventories': 'inventory',
+            'fix_assets': 'fixed_assets',
+            'cip': 'construction_in_progress',
         }
 
         df = df.rename(columns=column_mapping)
@@ -2221,7 +2347,8 @@ class StockTools:
         keep_cols = ['code', 'report_date', 'total_assets', 'current_assets', 'non_current_assets',
                      'total_liabilities', 'current_liabilities', 'non_current_liabilities',
                      'total_equity', 'asset_liability_ratio', 'current_ratio',
-                     'accounts_receivable', 'inventory', 'data_source']
+                     'accounts_receivable', 'inventory', 'fixed_assets', 'construction_in_progress',
+                     'data_source']
         existing_cols = [col for col in keep_cols if col in df.columns]
         df = df[existing_cols]
 
@@ -2252,7 +2379,7 @@ class StockTools:
             'n_cashflow_act': 'operating_cashflow',
             'n_cashflow_inv_act': 'investing_cashflow',
             'n_cash_flows_fnc_act': 'financing_cashflow',
-            'c_pay_acq_const_fids': 'capex',
+            'c_pay_acq_const_fiolta': 'capex',
             'free_cashflow': 'free_cashflow',
         }
 
@@ -2462,6 +2589,20 @@ def _build_kline_summary(df: pd.DataFrame, stock_code: str, freq_label: str,
         if stats_text:
             lines.append("【信号历史胜率（该股全部历史的条件统计，不代表未来）】")
             lines.append(stats_text)
+
+    # 极端信号汇总（超买回调 + 超跌反弹）
+    _FREQ_MAP = {"日线": "daily", "周线": "week", "月线": "month"}
+    freq_key = _FREQ_MAP.get(freq_label)
+    if freq_key:
+        try:
+            from tools.extreme_signal import assess_extreme_signals, format_extreme_signals
+            extreme = format_extreme_signals(
+                assess_extreme_signals(df, freq=freq_key), freq_label=freq_label)
+            if extreme:
+                lines.append("【极端信号汇总】")
+                lines.append(extreme)
+        except Exception as e:
+            logger.warning(f"[极端信号] 计算失败: {e}")
 
     # 近10根紧凑行情表
     cols = [c for c in ["date", "open", "high", "low", "close", "volume", "volume_ratio", "pct_chg"]
@@ -4471,6 +4612,44 @@ def call_fetch_financial_health_summary(stock_code: str) -> str:
                 lines.append(f"  {s}")
         else:
             lines.append("  ✅ 未检测到显著风险信号")
+        
+        # === 利润归因分析 ===
+        lines.append("")
+        lines.append("**七、利润归因分析（瀑布分解）**")
+        lines.append("  ※ 归母净利润同比变动按瀑布模型拆分：营收贡献+毛利率变化+费用率变化+非经常性损益")
+        try:
+            from tools.profit_attribution import analyze_profit_decline, format_profit_attribution
+            pa_result = analyze_profit_decline(stock_code)
+            if "error" not in pa_result:
+                for f in pa_result.get("factors", []):
+                    sign = "+" if f["impact_yi"] >= 0 else ""
+                    lines.append(f"  {f['factor']}: {sign}{f['impact_yi']:.1f}亿（占比{f['impact_pct']:.0f}%）")
+                lines.append(f"  ────")
+                lines.append(f"  主因: {pa_result['primary_cause']}")
+                lines.append(f"  置信度: {pa_result['confidence']}")
+            else:
+                lines.append(f"  ⚠️ {pa_result['error']}")
+        except Exception as e:
+            lines.append(f"  ⚠️ 利润归因分析异常: {e}")
+        
+        # === 产能扩张分析 ===
+        lines.append("")
+        lines.append("**八、产能扩张分析**")
+        try:
+            from tools.capacity_analysis import analyze_capacity
+            ca_result = analyze_capacity(stock_code)
+            if "error" not in ca_result and ca_result.get("data_quality") == "完整":
+                for d in ca_result.get("details", []):
+                    lines.append(f"  • {d}")
+                judge = ca_result.get("expansion_judgment", "")
+                if judge == "扩张":
+                    lines.append(f"  📈 {ca_result.get('summary', '')}")
+                elif judge == "收缩":
+                    lines.append(f"  📉 {ca_result.get('summary', '')}")
+                else:
+                    lines.append(f"  ➡️ {ca_result.get('summary', '')}")
+        except Exception as e:
+            lines.append(f"  ⚠️ 产能扩张分析异常: {e}")
         
         lines.append("")
         lines.append("💡 以上数据由程序基于最新财报计算，供分析参考。")

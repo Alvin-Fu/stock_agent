@@ -557,25 +557,31 @@ class BaseFetcher(ABC):
 
             # 跳过 NA 过多的窗口（数据缺口导致指标断裂时的崩溃保护）
             _skip_na = lambda s: s is not None and s.notna().any()
+            # close 同样必须有值，否则 idxmax/idxmin 全 NA 崩溃
+            _valid_window = lambda w: w['close'].notna().sum() > len(w) // 2
+
+            # 窗口高低点（无 DIF/OBV 时供 MACD 柱/OBV 复用）
+            l_hi = left['close'].max()
+            r_hi = right['close'].max()
+            l_lo = left['close'].min()
+            r_lo = right['close'].min()
 
             # ── MACD DIF 背离 ──
-            if has_dif and _skip_na(left.get('DIF')) and _skip_na(right.get('DIF')):
-                l_hi = left['close'].max()
-                r_hi = right['close'].max()
+            if has_dif and _valid_window(left) and _valid_window(right) \
+                    and _skip_na(left.get('DIF')) and _skip_na(right.get('DIF')):
                 l_hi_dif = left.loc[left['close'].idxmax(), 'DIF']
                 r_hi_dif = right.loc[right['close'].idxmax(), 'DIF']
                 if r_hi > l_hi * 1.005 and r_hi_dif < l_hi_dif * 0.985:
                     diver_macd.iloc[i - 1] = '顶背离'
 
-                l_lo = left['close'].min()
-                r_lo = right['close'].min()
                 l_lo_dif = left.loc[left['close'].idxmin(), 'DIF']
                 r_lo_dif = right.loc[right['close'].idxmin(), 'DIF']
                 if r_lo < l_lo * 0.995 and r_lo_dif > l_lo_dif * 1.015:
                     diver_macd.iloc[i - 1] = '底背离'
 
             # ── MACD 柱状线背离（价格高低点 vs MACD柱值） ──
-            if has_macd and _skip_na(left.get('MACD')) and _skip_na(right.get('MACD')):
+            if has_macd and _valid_window(left) and _valid_window(right) \
+                    and _skip_na(left.get('MACD')) and _skip_na(right.get('MACD')):
                 r_hi_bar = right.loc[right['close'].idxmax(), 'MACD']
                 l_hi_bar = left.loc[left['close'].idxmax(), 'MACD']
                 if r_hi > l_hi * 1.005 and r_hi_bar < l_hi_bar * 0.985:
@@ -587,7 +593,8 @@ class BaseFetcher(ABC):
                     diver_bar.iloc[i - 1] = '底背离'
 
             # ── OBV 价量背离 ──
-            if has_obv and _skip_na(left.get('obv')) and _skip_na(right.get('obv')):
+            if has_obv and _valid_window(left) and _valid_window(right) \
+                    and _skip_na(left.get('obv')) and _skip_na(right.get('obv')):
                 l_hi_obv = left.loc[left['close'].idxmax(), 'obv']
                 r_hi_obv = right.loc[right['close'].idxmax(), 'obv']
                 if r_hi > l_hi * 1.005 and r_hi_obv < l_hi_obv * 0.99:
