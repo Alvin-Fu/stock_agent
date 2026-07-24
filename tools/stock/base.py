@@ -455,6 +455,7 @@ class BaseFetcher(ABC):
         df = self._calculate_boll(df)
         df = self._calculate_atr(df)
         df = self._calculate_obv(df)
+        df = self._calculate_turnover(df)
         df = self._calculate_pos_52w(df, self._POS_52W_WINDOW.get(freq, 244))
         df = self._calculate_signals(df)
         df = self._detect_divergence(df, lookback=self._DIVERGENCE_LOOKBACK.get(freq, 15))
@@ -517,6 +518,23 @@ class BaseFetcher(ABC):
         """OBV 能量潮：涨日加量、跌日减量的累积"""
         direction = np.sign(df['close'].diff()).fillna(0)
         df['obv'] = (direction * df['volume']).cumsum()
+        return df
+
+    @staticmethod
+    def _calculate_turnover(df: pd.DataFrame) -> pd.DataFrame:
+        """换手率衍生指标：均线 + 突变比（升序序列上计算）"""
+        if 'turnover_rate' not in df.columns:
+            df['turnover_ma5'] = np.nan
+            df['turnover_ma10'] = np.nan
+            df['turnover_ratio'] = np.nan
+            return df
+        # 换手率移动均值
+        df['turnover_ma5'] = df['turnover_rate'].rolling(5, min_periods=3).mean()
+        df['turnover_ma10'] = df['turnover_rate'].rolling(10, min_periods=5).mean()
+        # 突变比：当日换手率 / 5日均值（>1 放量，<1 缩量）
+        df['turnover_ratio'] = (
+            df['turnover_rate'] / df['turnover_ma5'].replace(0, np.nan)
+        ).round(2)
         return df
 
     @staticmethod
@@ -655,6 +673,14 @@ class BaseFetcher(ABC):
         df['gap_signal'] = ''
         df.loc[df['low'] > prev_high, 'gap_signal'] = '向上跳空'
         df.loc[df['high'] < prev_low, 'gap_signal'] = '向下跳空'
+
+        # 换手率信号
+        df['turnover_signal'] = ''
+        if 'turnover_ratio' in df.columns:
+            tr = df['turnover_ratio']
+            df.loc[tr >= 3.0, 'turnover_signal'] = '异常高换手'
+            df.loc[(tr >= 1.5) & (tr < 3.0), 'turnover_signal'] = '高换手'
+            df.loc[tr <= 0.5, 'turnover_signal'] = '低换手'
         return df
 
     def calculate_ma_ema(

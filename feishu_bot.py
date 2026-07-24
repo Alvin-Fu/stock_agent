@@ -576,11 +576,15 @@ class FeishuBot:
             if len(tasks) <= 1:
                 state = executor.run_sync(question, thread_id=thread_id)
                 answer = executor.get_final_answer(state)
-                # 提取股票代码用于卡片标题；无 stock_code 时也走卡片格式
+                # 提取股票代码用于卡片标题；产业链模式用行业名
                 stock_code = state.get("stock_code", "")
-                stock_name = self._resolve_name(stock_code) if stock_code else ""
-                stock_label = f"{stock_name}({stock_code})" if stock_name else stock_code
-                label = stock_label or "分析报告"
+                industry_name = state.get("industry_name", "")
+                if industry_name and "," in (stock_code or ""):
+                    label = f"【{industry_name}】产业链分析"
+                else:
+                    stock_name = self._resolve_name(stock_code) if stock_code else ""
+                    stock_label = f"{stock_name}({stock_code})" if stock_name else stock_code
+                    label = stock_label or "分析报告"
                 self._send_summary_with_doc(answer, label, thread_id, receive_id_type, reply)
                 return
 
@@ -785,9 +789,10 @@ class FeishuBot:
                 elif "股票分析助手" in mention_names:
                     is_tech_mention = False
                 elif mention_names:
-                    # @了其他用户（非机器人），跳过处理
-                    logger.debug(f"[飞书] 消息 @了其他用户 {mention_names}，跳过")
-                    return
+                    # 有 mention 但名字不匹配（Feishu 偶发字段缺失/别名/字符编码不统一）
+                    # 不直接 return（避免静默丢失消息），打警告后按 @股票分析助手 继续处理
+                    logger.warning(f"[飞书] 群聊 mention 名未匹配 [{mention_names}]，"
+                                   f"按 @股票分析助手 继续")
 
             # 去掉群聊里的 @机器人 占位符
             text = re.sub(r"@_user_\d+\s*", "", text).strip()
@@ -821,7 +826,8 @@ class FeishuBot:
 
             # 快速技术位查询（纯支撑/压力位，不走完整工作流）
             # @股票技术面 → 总是走快速技术位；@股票分析助手 → 不走快速路径
-            if is_tech_mention or chat_type == "p2p":
+            # p2p 私聊也不走快速路径（用户直接和"股票分析助手"对话，应跑完整分析）
+            if is_tech_mention:
                 quick = self._quick_technical_query(text)
                 if quick:
                     reply(quick)

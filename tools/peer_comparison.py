@@ -76,26 +76,26 @@ def _build_spot_map() -> dict:
             }
         return spot
 
+    import akshare as ak
+
+    sources = []
+
     def _fetch_em():
-        import akshare as ak
         df = ak.stock_zh_a_spot_em()
         return _parse_spot_df(df)
+    sources.append(("东财em", _fetch_em))
 
-    def _fetch_tencent():
-        import akshare as ak
-        df = ak.stock_zh_a_spot_tx()
-        return _parse_spot_df(df)
+    if hasattr(ak, "stock_zh_a_spot_tx"):
+        def _fetch_tencent():
+            df = ak.stock_zh_a_spot_tx()
+            return _parse_spot_df(df)
+        sources.append(("腾讯", _fetch_tencent))
 
-    def _fetch_sina():
-        import akshare as ak
-        df = ak.stock_zh_a_spot_sina()
-        return _parse_spot_df(df)
-
-    sources = [
-        ("东财em", _fetch_em),
-        ("腾讯", _fetch_tencent),
-        ("新浪", _fetch_sina),
-    ]
+    if hasattr(ak, "stock_zh_a_spot_sina"):
+        def _fetch_sina():
+            df = ak.stock_zh_a_spot_sina()
+            return _parse_spot_df(df)
+        sources.append(("新浪", _fetch_sina))
 
     spot = retry_with_multiple_sources(sources)
     if spot:

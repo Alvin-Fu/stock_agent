@@ -796,7 +796,7 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
 
             header = (f"📋 产业链复盘 | {industry}\n"
                       f"{snap_date} 分析 → {days_elapsed} 天后：组合 {verdicts['portfolio_return']:+.2f}% "
-                      f"vs 基准 {verdicts['benchmark_return']:+.2f}%（{verdicts['portfolio_verdict']}）｜"
+                      f"vs 基准 {'N/A' if verdicts['benchmark_return'] is None else f'{verdicts['benchmark_return']:+.2f}%'}（{verdicts['portfolio_verdict']}）｜"
                       f"排名{verdicts['rank_effective']}｜首选名次 {verdicts['top_pick_rank']}\n")
             card = header + content.strip()
 

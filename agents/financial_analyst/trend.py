@@ -5,7 +5,8 @@
   同比序列才是趋势信号）
 - 毛利率/净利率序列 + 与上年同期的变化（利润率改善/恶化）
 - 单季拆分：同年相邻累计期差分出真实单季营收/净利，并算单季同比
-- 程序判读：加速/放缓/改善/回落 由代码判定后写进文本，LLM 禁止另行心算
+- 程序判读：加速/放缓/改善/回落/连续负值/降幅收窄-扩大
+  由代码判定后写进文本，LLM 禁止另行心算或修改判读结论
 """
 
 from typing import Dict, List, Optional
@@ -89,8 +90,9 @@ def _single_quarters(rows: List[Dict]) -> List[Dict]:
     return singles
 
 
-def build_income_trend(records: List[Dict], max_periods: int = 6) -> str:
-    """输入 get_stock_income 的记录列表，输出趋势文本块；数据不足两期返回空串"""
+def build_income_trend(records: List[Dict], fina_records: Optional[List[Dict]] = None,
+                       max_periods: int = 6) -> str:
+    """输入 get_stock_income 的记录列表，输出趋势文本块；fina_records 用于数据交叉验证；数据不足两期返回空串"""
     rows = _norm_rows(records)
     if len(rows) < 2:
         return ""
@@ -152,12 +154,51 @@ def build_income_trend(records: List[Dict], max_periods: int = 6) -> str:
     if verdicts:
         lines.append("程序判读：" + "；".join(verdicts))
 
+    # ---- 数据交叉验证（多信源比对，差异>5%触发冲突标记） ----
+    cv_warnings = []
+    if fina_records:
+        # 建立 fina_indicator 日期索引：{date_str: gross_margin_pct}
+        fina_by_date = {}
+        for fr in fina_records:
+            rd = fr.get("ann_date") or fr.get("report_date")
+            gm_fina = fr.get("gross_margin")  # Tushare 原始毛利率（百分比，如 45.0=45%）
+            if rd is not None and gm_fina is not None:
+                d_str = str(rd)[:10]
+                if d_str not in fina_by_date or abs(gm_fina) > abs(fina_by_date.get(d_str, 0)):
+                    fina_by_date[d_str] = float(gm_fina)
+        # 对 each shown period 做比对
+        for r in shown:
+            d = r["date"]
+            gm_income = r.get("gm")  # income 表计算的毛利率
+            if gm_income is None or gm_income <= 0:
+                continue
+            gm_fina = fina_by_date.get(d)
+            if gm_fina is None:
+                continue
+            diff_pct = abs(gm_income - gm_fina) / max(gm_income, gm_fina, 0.001) * 100
+            if diff_pct > 5:
+                cv_warnings.append(
+                    f"⚠️ 数据冲突：{d} 毛利率程序算{gm_income:.1f}% vs 财报原文{gm_fina:.1f}%，"
+                    f"差异{diff_pct:.0f}%（数据可信度降低，结论仅供参考）")
+        # 也检查最新一期与其他关键指标
+        last = shown[0]
+        ld = last["date"]
+        lf_gm = fina_by_date.get(ld)
+        if lf_gm is not None and last.get("gm") is not None:
+            l_diff = abs(last["gm"] - lf_gm) / max(last["gm"], lf_gm, 0.001) * 100
+            if l_diff > 5:
+                cv_warnings.append(
+                    f"⚠️ 数据冲突：最近一期({ld})毛利率程序算{last['gm']:.1f}% vs 财报原文{lf_gm:.1f}%，"
+                    f"差异{l_diff:.0f}%（可能影响同比判断准确度，建议人工复核）")
+    if cv_warnings:
+        lines.append("数据交叉验证：" + "；".join(cv_warnings))
+
     # ---- 单季拆分 ----
     singles = [s for s in _single_quarters(rows) if s.get("rev") is not None]
     singles.sort(key=lambda s: s["date"], reverse=True)
     if singles:
         sq_lines = []
-        for s in singles[:4]:
+        for s in singles[:6]:
             seg = f"{s['label']} 营收{s['rev']:.1f}亿"
             if s.get("rev_yoy") is not None:
                 seg += f"(同比{_sign(s['rev_yoy'])}%)"
@@ -166,6 +207,51 @@ def build_income_trend(records: List[Dict], max_periods: int = 6) -> str:
                 seg += f"(同比{_sign(s['np_yoy'])}%)"
             sq_lines.append(seg)
         lines.append("单季拆分（累计差分）：" + "；".join(sq_lines))
+
+        # ---- 单季净利同比趋势判读（连续负值/连续改善 + 降幅收窄/扩大） ----
+        np_yoys = [(s["label"], s["np_yoy"]) for s in singles[:6]
+                   if s.get("np_yoy") is not None]
+        if len(np_yoys) >= 2:
+            sq_verdicts = []
+            # 连续负值期数（从最新一期往前数）
+            neg_count = 0
+            for label, v in sorted(np_yoys, key=lambda x: x[0], reverse=True):
+                if v < 0:
+                    neg_count += 1
+                else:
+                    break
+            if neg_count >= 2:
+                sq_verdicts.append(f"单季净利同比已连续{neg_count}期为负值")
+
+            # 连续改善期数（从最新一期往前数，每期增速均高于上一期）
+            improve_count = 0
+            for i in range(len(np_yoys) - 1):
+                if np_yoys[i][1] > np_yoys[i + 1][1]:
+                    improve_count += 1
+                else:
+                    break
+            if improve_count >= 2:
+                sq_verdicts.append(
+                    f"单季净利同比增速已连续{improve_count}期改善"
+                    f"（{np_yoys[improve_count][0]}→{np_yoys[0][0]}"
+                    f"，{_sign(np_yoys[improve_count][1])}%→{_sign(np_yoys[0][1])}%）")
+
+            # 最近两期对比：降幅收窄/扩大
+            latest_np = np_yoys[0][1]  # 最新一期
+            prev_np = np_yoys[1][1]    # 上一期
+            if latest_np < 0 and prev_np < 0:
+                if latest_np > prev_np:
+                    sq_verdicts.append("降幅收窄")
+                elif latest_np < prev_np:
+                    sq_verdicts.append("降幅扩大")
+            elif latest_np > 0 > prev_np:
+                sq_verdicts.append("由负转正")
+            elif latest_np < 0 < prev_np:
+                sq_verdicts.append("由正转亏")
+
+            if sq_verdicts:
+                lines.append("单季净利判读：" + "；".join(sq_verdicts)
+                             + f"（{np_yoys[1][0]} {_sign(prev_np)}% → {np_yoys[0][0]} {_sign(latest_np)}%）")
 
     return "\n".join(lines)
 
@@ -337,9 +423,10 @@ def build_working_capital_trend(balance_records: List[Dict], income_records: Lis
 
 def build_full_trend(income_records: List[Dict],
                      cash_records: Optional[List[Dict]] = None,
-                     balance_records: Optional[List[Dict]] = None) -> str:
-    """组合：利润趋势 + 费用率趋势 + 现金流趋势 + 营运资本趋势（缺哪块跳哪块）"""
-    blocks = [build_income_trend(income_records),
+                     balance_records: Optional[List[Dict]] = None,
+                     fina_records: Optional[List[Dict]] = None) -> str:
+    """组合：利润趋势 + 费用率趋势 + 现金流趋势 + 营运资本趋势 + 数据交叉验证（缺哪块跳哪块）"""
+    blocks = [build_income_trend(income_records, fina_records),
               build_expense_trend(income_records)]
     if cash_records:
         blocks.append(build_cashflow_trend(cash_records, income_records))

@@ -10,6 +10,7 @@
 依赖：pandas
 """
 
+import time
 from typing import List, Tuple, Optional
 from datetime import date, timedelta
 
@@ -71,20 +72,26 @@ def _fetch_kline_60min(stock_code: str, months: int = 2) -> pd.DataFrame:
     start = end - timedelta(days=30 * months)
     start_dt = start.strftime("%Y-%m-%d 09:00:00")
     end_dt = end.strftime("%Y-%m-%d 15:00:00")
-    try:
-        df = ak.stock_zh_a_hist_min_em(
-            symbol=stock_code, period="60",
-            start_date=start_dt, end_date=end_dt, adjust="qfq",
-        )
-        if df is not None and not getattr(df, "empty", True):
-            rename_map = {"时间": "date", "收盘": "close"}
-            df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.sort_values("date").reset_index(drop=True)
-            logger.info(f"[九转] {stock_code} 60min K线获取成功，{len(df)}条")
-            return df
-    except Exception as e:
-        logger.warning(f"[九转] {stock_code} 60min K线获取失败: {e}")
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = ak.stock_zh_a_hist_min_em(
+                symbol=stock_code, period="60",
+                start_date=start_dt, end_date=end_dt, adjust="qfq",
+            )
+            if df is not None and not getattr(df, "empty", True):
+                rename_map = {"时间": "date", "收盘": "close"}
+                df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.sort_values("date").reset_index(drop=True)
+                logger.info(f"[九转] {stock_code} 60min K线获取成功，{len(df)}条")
+                return df
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                logger.warning(f"[九转] {stock_code} 60min K线获取失败（第{attempt+1}次），重试: {e}")
+                time.sleep(1)
+    logger.warning(f"[九转] {stock_code} 60min K线获取失败（3次重试均失败）: {last_err}")
     return pd.DataFrame()
 
 

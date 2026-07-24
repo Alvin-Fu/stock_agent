@@ -120,6 +120,14 @@ def build_peer_table(target: Dict, peers: List[Dict], industry: str) -> str:
         below = sum(1 for p in peer_pes if p < tpe)
         median_pe = peer_pes[len(peer_pes) // 2]
         verdicts.append(f"目标PE {tpe:.1f}倍（同行中位数 {median_pe:.1f}倍，高于{below}/{len(peer_pes)}家）")
+    # PB 同行相对位置
+    tpb = target.get("pb")
+    peer_pbs = [p["pb"] for p in peers if p.get("pb") is not None and p["pb"] > 0]
+    if tpb is not None and tpb > 0 and len(peer_pbs) >= 3:
+        peer_pbs.sort()
+        below = sum(1 for p in peer_pbs if p < tpb)
+        median_pb = peer_pbs[len(peer_pbs) // 2]
+        verdicts.append(f"目标PB {tpb:.2f}倍（同行中位数 {median_pb:.2f}倍，高于{below}/{len(peer_pbs)}家）")
     tgm = target.get("gm")
     peer_gms = [p["gm"] for p in peers if p.get("gm") is not None]
     if tgm is not None and len(peer_gms) >= 3:

@@ -154,15 +154,65 @@ def _fmt_level(c: Dict, close: float) -> str:
     return f"{c['price']}（{joiner.join(tags)}{marker}）"
 
 
-def format_sr_levels(sr: Optional[Dict]) -> str:
+def _calibrate_support_with_anchor(supports: List[Dict], close: float,
+                                    anchor_price: Optional[float]) -> tuple[List[Dict], str]:
+    """
+    基本面锚校准：当技术支撑位与基本面锚差异>30%时，取更保守的位并标注。
+    返回 (校准后的支撑列表, 校准说明文本)。
+    """
+    if not anchor_price or not supports:
+        return supports, ""
+    if anchor_price <= 0:
+        return supports, ""
+
+    closest = supports[0]  # 最靠近现价的支撑（价格最高）
+    sp = closest["price"]
+    diff_pct = abs(sp - anchor_price) / max(sp, anchor_price, 0.01) * 100
+
+    if diff_pct > 30:
+        # 取更保守（更低）的那个
+        conservative = min(sp, anchor_price)
+        closer_name = "技术位" if sp == conservative else "基本面锚"
+        lines = [f"  ⚠️ 技术支撑{sp} vs 基本面锚{anchor_price}，差异{diff_pct:.0f}%>30%，"
+                 f"取更保守值{conservative}作为校准回踩观察位（{closer_name}为准）"]
+        # 替换最接近的支撑为保守值
+        if anchor_price < sp:
+            # 基本面锚更低，插入锚价作为校准支撑
+            calibrated = [{"price": round(anchor_price, 2), "touches": 0,
+                           "vol_node": False, "strength": 1, "anchor": True}]
+            calibrated += supports
+        else:
+            # 技术支撑更低，保持原样但标注锚价
+            calibrated = list(supports)
+        return calibrated, "\n".join(lines)
+    return supports, ""
+
+
+def format_sr_levels(sr: Optional[Dict], fundamental_anchor: Optional[float] = None) -> str:
+    """
+    格式化支撑/压力位文本。
+    fundamental_anchor：基本面锚价（PE历史中位对应价格），用于技术位校准。
+    """
     if not sr:
         return ""
     close = sr.get("close")
     lines = ["【程序计算关键位（近120根K线：摆动点聚类+成交密集区，历史博弈价位）】"]
-    if close and sr.get("supports"):
-        lines.append("  支撑（由近及远）：" + " ｜ ".join(_fmt_level(c, close) for c in sr["supports"]))
-    if close and sr.get("resistances"):
-        lines.append("  压力（由近及远）：" + " ｜ ".join(_fmt_level(c, close) for c in sr["resistances"]))
+    supports = sr.get("supports", [])
+    resistances = sr.get("resistances", [])
+
+    # 基本面锚校准
+    anchor_note = ""
+    if fundamental_anchor and close:
+        supports, calib_text = _calibrate_support_with_anchor(supports, close, fundamental_anchor)
+        if calib_text:
+            anchor_note = calib_text
+
+    if close and supports:
+        lines.append("  支撑（由近及远）：" + " ｜ ".join(_fmt_level(c, close) for c in supports))
+    if close and resistances:
+        lines.append("  压力（由近及远）：" + " ｜ ".join(_fmt_level(c, close) for c in resistances))
+    if anchor_note:
+        lines.append(anchor_note)
     lines.append("  说明：距现价≤2%的位标注⚠️，表示正在被市场测试或突破中；触碰次数越多、"
                  "带成交密集标记的价位越硬；与均线/BOLL位互补使用；大盘环境变化会导致技术位重算")
     return "\n".join(lines)

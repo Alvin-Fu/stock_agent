@@ -137,7 +137,7 @@ def collect_industry_valuation(codes: List[str]) -> Optional[Dict[str, Any]]:
         except Exception as e:
             logger.warning(f"[行业估值] {code} 每日指标获取失败: {e}")
 
-        # 近20日主力净流入（tushare moneyflow，单位万元→亿元）：
+        # 近20日主力净流入（tushare moneyflow，千元→亿元）：
         # 用程序数字替代"搜索文本猜主力/游资"；无 token/失败时静默缺失
         try:
             row["mf_net20"] = _moneyflow_net20(code)
@@ -169,7 +169,7 @@ def _moneyflow_net20(code: str) -> Optional[float]:
     vals = pd.to_numeric(df["net_mf_amount"], errors="coerce").dropna()
     if vals.empty:
         return None
-    return round(float(vals.head(20).sum()) / 1e4, 2)
+    return round(float(vals.head(20).sum()) / 1e4, 2)  # 万元→亿元（Tushare moneyflow 返回万元）
 
 
 def format_industry_valuation(metrics: Optional[Dict[str, Any]]) -> str:
@@ -193,6 +193,26 @@ def format_industry_valuation(metrics: Optional[Dict[str, Any]]) -> str:
     if metrics.get("bias_ma20_avg") is not None:
         lines.append(f"  乖离：收盘相对MA20平均乖离 {metrics['bias_ma20_avg']}%")
     lines.append(f"  程序参考标签：{metrics['overall']}（{'、'.join(metrics['labels'])}）")
+    # 逐股 PE 绝对值+分位（双阈值预警）
+    per_stock_display = []
+    for s in (metrics.get("per_stock") or []):
+        pe = s.get("pe_ttm")
+        pct = s.get("pe_percentile")
+        if pe is None:
+            continue
+        pe_str = f"PE{pe:.1f}倍"
+        pct_str = f"分位{pct:.0f}%" if pct is not None else ""
+        # 双阈值：分位>80% 或 绝对PE>100倍 → 红色预警；分位50-80%且PE 50-100倍 → 黄色；其余绿色
+        if (pct is not None and pct >= 80) or pe > 100:
+            level = "🔴"
+        elif (pct is not None and pct >= 50 and pct < 80) and 50 <= pe <= 100:
+            level = "🟡"
+        else:
+            level = "🟢"
+        per_stock_display.append(f"    {level} {s.get('code','')} {pe_str} {pct_str}".rstrip())
+    if per_stock_display:
+        lines.append("  逐股PE（双阈值预警：🔴分位>80%/PE>100倍 🟡分位50-80%且PE50-100倍 🟢其余）：")
+        lines.extend(per_stock_display)
     lines.append("  ⚠️ 使用规则：以上为历史/当前状态的量化描述，回调风险分析须基于这些数字展开，"
                  "禁止在此之外编造估值或概率数字；乖离为负=价格已回落到MA20下方（回调已发生），"
                  "禁止表述为'即将回落/存在回落压力'")

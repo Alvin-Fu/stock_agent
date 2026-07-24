@@ -25,10 +25,10 @@ class StockTools:
         Args:
             fetchers: 数据源列表（可选，默认按优先级自动创建）
         """
-        self.tushare = TushareFetcher()
+        self.db = get_db()
+        self.tushare = TushareFetcher(db=self.db)
         self.akshare = AkshareFetcher()
         self.data_manager = DataFetcherManager([self.tushare, self.akshare])
-        self.db = get_db()
 
     def _has_qfq_drift(self, old_df: pd.DataFrame, new_df: pd.DataFrame, rel_tol: float = 1e-4) -> bool:
         """
@@ -102,6 +102,9 @@ class StockTools:
         if end_date_str == start_date_str:
             logger.info(f"股票[{stock_code}]数据已经更新完成")
             return  old_daily_data
+        
+        # 确保 daily_basic 缓存（含换手率）先写入 DB，供 _fetch_raw_data 查询
+        self.fetch_and_save_stock_basic_daily(stock_code)
         try:
             daily_datas,  fetcher_name = self.data_manager.get_daily_data(stock_code, old_daily_data, start_date_str, end_date_str)
         except DataFetchError as e:
@@ -472,7 +475,20 @@ class StockTools:
 
             logger.info(f"获取股票[{stock_code}]利润表数据, start_date:{start_date}, end_date:{end_date_str}")
 
-            df = self.tushare.income(stock_code, start_date, end_date_str)
+            # Tushare 免费 API 超时频繁，重试 2 次
+            import time as _time
+            df = None
+            for attempt in range(3):
+                try:
+                    df = self.tushare.income(stock_code, start_date, end_date_str)
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        logger.warning(f"获取股票[{stock_code}]利润表数据第{attempt+1}次失败，重试: {e}")
+                        _time.sleep(5)
+                    else:
+                        raise
+
             if df is None or df.empty:
                 logger.error(f"获取股票[{stock_code}]利润表数据为空")
                 return None
@@ -726,7 +742,7 @@ class StockTools:
                         days_gap = (today - latest).days
                         if days_gap == 0:
                             latest_mf = pd.to_numeric(old.iloc[0].get('net_mf_amount', 0), errors='coerce') or 0
-                            if abs(latest_mf) >= 5_000_000:
+                            if abs(latest_mf) >= 500:  # 500万元（文档单位：万元）
                                 logger.info(f"个股资金流向[{stock_code}]最新数据为{latest_date}，缓存有效")
                                 return old
                             else:
@@ -750,15 +766,15 @@ class StockTools:
 
             # 1. 先尝试 Tushare
             df = self.tushare.moneyflow(stock_code, trade_date='', start_date=start, end_date=end)
-            # 2. 校验 Tushare 数据是否合理：最新一天的 net_mf_amount 若绝对值 < 500万，可能数据异常
+            # 2. 校验 Tushare 数据是否合理：最新一天的 net_mf_amount 若绝对值 < 500万元，可能数据异常
             df_valid = False
             if df is not None and not df.empty:
                 df = df.sort_values('trade_date', ascending=False).reset_index(drop=True)
                 latest_mf = pd.to_numeric(df.iloc[0].get('net_mf_amount', 0), errors='coerce') or 0
-                if abs(latest_mf) >= 5_000_000:  # 500万以上认为合理
+                if abs(latest_mf) >= 500:  # 500万元（文档单位：万元）
                     df_valid = True
                 else:
-                    logger.warning(f"[资金流向] Tushare 数据异常: 最新日主力净流={latest_mf:.0f}元，尝试 AkShare 兜底")
+                    logger.warning(f"[资金流向] Tushare 数据异常: 最新日主力净流={latest_mf:.0f}万元，尝试 AkShare 兜底")
             # 3. Tushare 数据异常或为空，尝试 AkShare 兜底
             if not df_valid:
                 ak_df = self._fetch_moneyflow_akshare(stock_code, start, end)
@@ -1856,7 +1872,7 @@ class StockTools:
             today = date.today()
             if old_data is not None and not old_data.empty:
                 latest = pd.to_datetime(old_data['float_date'].max())
-                if latest < today + timedelta(days=60):
+                if latest < pd.Timestamp(today + timedelta(days=60)):
                     logger.info("解禁数据缓存不足60天，重新拉取")
                 else:
                     logger.info("解禁数据缓存充足，直接返回")
@@ -1990,7 +2006,7 @@ class StockTools:
                 return None
             normalized_df = self._normalize_block_trade(df, stock_code)
             save_count = self.db.save_stock_block_trade(normalized_df, stock_code)
-            logger.info(f"保存[stock_code]大宗交易成功，新增[{save_count}]条")
+            logger.info(f"保存[{stock_code}]大宗交易成功，新增[{save_count}]条")
             return self.db.get_stock_block_trade(stock_code, days=90)
         except Exception as e:
             logger.error(f"获取大宗交易失败: {e} {traceback.format_exc()}")
@@ -2513,17 +2529,18 @@ def _fmt(value, nd: int = 2) -> str:
 
 
 def _build_kline_summary(df: pd.DataFrame, stock_code: str, freq_label: str,
-                         turnover: Optional[float] = None, rs_text: str = "") -> str:
+                         rs_text: str = "") -> str:
     """把带指标的K线 DataFrame 压缩成 LLM 友好的摘要文本（df 按日期降序，最新在前）"""
     latest = df.iloc[0]
     latest_date = parse_row_date(latest.get("date"))
     lines = [f"✅【{stock_code} {freq_label}数据】共 {len(df)} 根K线，数据截至 {latest_date}"]
 
     g = latest.get
+    turnover = g('turnover_rate')
     lines.append(
         f"【最新指标快照】收盘={_fmt(g('close'))} 涨跌幅={_fmt(g('pct_chg'))}% "
         f"量比={_fmt(g('volume_ratio'))}"
-        + (f" 换手率={_fmt(turnover)}%" if turnover is not None else "")
+        + (f" 换手率={_fmt(turnover)}%" if turnover is not None and not pd.isna(turnover) else "")
     )
     lines.append(
         f"  均线: MA5={_fmt(g('ma5'))} MA10={_fmt(g('ma10'))} MA20={_fmt(g('ma20'))} "
@@ -2657,7 +2674,6 @@ def call_fetch_daily_data(stock_code: str) -> str:
         df = _ensure_indicators(df, "daily")
         return _build_kline_summary(
             df, stock_code, "日线",
-            turnover=_get_latest_turnover(stock_code),
             rs_text=_calc_rs_text(df),
         )
     except Exception as e:
@@ -3984,15 +4000,16 @@ def _format_moneyflow(df: pd.DataFrame, stock_code: str) -> str:
     df = df.sort_values('trade_date', ascending=False).reset_index(drop=True)
 
     def _y(v):
-        """格式化金额：万元或亿元"""
+        """格式化金额：万元或亿元
+        注意：Tushare moneyflow API 返回单位为万元（文档标注）。
+        """
         if v is None or not _pd.notna(v) or v == 0:
             return "0"
         av = abs(v)
-        if av >= 1e8:
-            return f"{v/1e8:.2f}亿"
-        elif av >= 1e4:
-            return f"{v/1e4:.2f}万"
-        return f"{v:.0f}"
+        if av >= 1e4:  # 1万万 = 1亿元
+            return f"{v/1e4:.2f}亿"  # 万元 ÷ 1万 = 亿元
+        else:
+            return f"{v:.2f}万"  # 万元
 
     lines = [f"【个股资金流向（来源：Tushare）】"]
 
@@ -4027,13 +4044,13 @@ def _format_moneyflow(df: pd.DataFrame, stock_code: str) -> str:
         mf_5 = df.head(5)['net_mf_amount'].sum()
         mf_20 = df.head(min(len(df), 20))['net_mf_amount'].sum() if len(df) >= 5 else mf_5
         signals = []
-        if mf_5 > 1e8 and mf_20 > 0:
+        if mf_5 > 1e4 and mf_20 > 0:  # 1e4万元 = 1亿元
             signals.append("近5日主力净流入>1亿且近20日累计为正 → 机构资金温和布局")
-        elif mf_5 < -1e8 and mf_20 < 0:
+        elif mf_5 < -1e4 and mf_20 < 0:  # -1e4万元 = -1亿元
             signals.append("近5日主力净流出>1亿且近20日累计为负 → 机构资金持续撤退")
-        elif mf_5 > 0 and mf_20 > 5e8:
+        elif mf_5 > 0 and mf_20 > 5e4:  # 5e4万元 = 5亿元
             signals.append("近20日主力累计净流入>5亿 → 中期机构资金显著流入")
-        elif mf_5 < 0 and mf_20 < -5e8:
+        elif mf_5 < 0 and mf_20 < -5e4:  # -5e4万元 = -5亿元
             signals.append("近20日主力累计净流出>5亿 → 中期机构资金显著流出")
         if signals:
             lines.append(f"【资金信号】{'；'.join(signals)}")

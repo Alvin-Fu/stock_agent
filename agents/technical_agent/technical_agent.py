@@ -55,7 +55,10 @@ class TechnicalAgent:
 - 动量：RSI/KDJ 的超买超卖状态与拐点
 - 位置与区间：BOLL 上中下轨的位置关系、年内位置高低
 - 量能：量比/换手率/放缩量信号、OBV 趋势与价格是否背离
-- 支撑位和压力位：结合均线、BOLL 轨道和近期高低点给出具体价位
+- 支撑位和压力位：必须使用 K 线数据中的程序计算精确数值（至少精确到小数点后两位，如 MA10=34.30），禁止取整或近似；支撑按由近及远列出（MA10 → MA20/BOLL中轨 → BOLL下轨等），压力按由近及远列出（近日最高 → BOLL上轨 → 52周最高等）；每个价位必须注明来源（如"34.30（MA10）"），禁止仅写数字不注明依据；
+  下方【程序计算关键位】块是摆动点聚类结果，为参考辅助位，**优先以均线/BOLL/近日高低点等技术指标位为准**；
+  若程序聚类位与技术指标位不一致，使用技术指标位并标注"程序聚类位为XX（与此接近/偏差约XX%）"供参考；
+  禁止引用无技术指标匹配的程序聚类位作为主要支撑/压力
 - 波动风险：用 ATR 说明当前波动幅度，给出风险参考位
 - 多周期共振分析（日/周/月是否一致）
 
@@ -204,6 +207,56 @@ class TechnicalAgent:
             logger.warning(f"[{code}] 生成交易计划失败: {e}")
             return None, ""
 
+    @staticmethod
+    def _compute_fundamental_anchor(code: str) -> Optional[float]:
+        """
+        计算基本面锚价 = 历史中位PE对应价格。
+        用 PE(TTM) 历史分位数线性反推中位PE，再乘以 TTM EPS。
+        失败返回 None（不影响支撑位主流程）。
+        """
+        try:
+            from storage.sqlite.stock_storage import get_db
+            db = get_db()
+            basic = db.get_latest_daily_basic_data(code, 750)
+            if basic is None or basic.empty:
+                return None
+            cur_pe = None
+            for _, row in basic.iterrows():
+                try:
+                    v = float(row.get("pe_ttm", 0) or 0)
+                    if v > 0:
+                        cur_pe = v
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if not cur_pe:
+                return None
+            hist = pd.to_numeric(basic["pe_ttm"], errors="coerce").dropna()
+            if len(hist) < 60:
+                return None
+            pe_pct = float((hist < cur_pe).mean() * 100)
+            if pe_pct <= 0:
+                return None
+            # 收盘价
+            close = None
+            for _, row in basic.iterrows():
+                try:
+                    v = float(row.get("close", 0) or 0)
+                    if v > 0:
+                        close = v
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if not close:
+                return None
+            # 线性反推历史中位PE
+            median_pe_est = cur_pe * 0.5 / (pe_pct / 100)
+            anchor_price = close * median_pe_est / cur_pe
+            return round(anchor_price, 2)
+        except Exception as e:
+            logger.debug(f"[技术分析] 基本面锚计算失败 {code}: {e}")
+            return None
+
     def _compute_sr_text(self, code: str) -> str:
         """计算支撑压力位文本块（独立于交易计划，供报告直接引用）"""
         try:
@@ -241,7 +294,9 @@ class TechnicalAgent:
             df = pd.DataFrame(data_rows)
             from tools.support_resistance import compute_sr_levels, format_sr_levels
             sr = compute_sr_levels(df)
-            return format_sr_levels(sr) if sr else ""
+            # 基本面锚校准
+            anchor = self._compute_fundamental_anchor(code)
+            return format_sr_levels(sr, fundamental_anchor=anchor) if sr else ""
         except Exception as e:
             logger.warning(f"[{code}] 支撑压力位计算失败: {e}")
             return ""

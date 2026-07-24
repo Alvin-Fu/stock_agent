@@ -55,18 +55,20 @@ class TushareFetcher(BaseFetcher):
     name = "TushareFetcher"
     priority = 0  # 主数据源（Akshare 为备用）
 
-    def __init__(self, rate_limit_per_minute: int = 80):
+    def __init__(self, rate_limit_per_minute: int = 80, db=None):
         """
         初始化 TushareFetcher
-        
+
         Args:
             rate_limit_per_minute: 每分钟最大请求数（默认80，Tushare免费配额）
+            db: 数据库实例（可选，用于优先读取缓存的换手率等字段）
         """
         self.rate_limit_per_minute = rate_limit_per_minute
         self._call_count = 0  # 当前分钟内的调用次数
         self._minute_start: Optional[float] = None  # 当前计数周期开始时间
         self._api: Optional[object] = None  # Tushare API 实例
-        
+        self.db = db  # 数据库实例（缓存查询）
+
         # 尝试初始化 API
         self._init_api()
     
@@ -185,14 +187,9 @@ class TushareFetcher(BaseFetcher):
     def _fetch_raw_data(self, freq: str, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
         从 Tushare 获取原始数据
-        
-        使用 daily() 接口获取日线数据
-        
-        流程：
-        1. 检查 API 是否可用
-        2. 执行速率限制检查
-        3. 转换股票代码格式
-        4. 调用 API 获取数据
+
+        使用 daily() 接口获取日线数据，同时从 daily_basic 获取换手率。
+        换手率优先从 DB 缓存读取，缺的日期才调 API。
         """
         logger.info("使用tushare")
         if self._api is None:
@@ -200,7 +197,63 @@ class TushareFetcher(BaseFetcher):
         if freq != "daily":
             return self.fetch_raw_weekly_month_data(stock_code, start_date, end_date, freq)
 
-        return self.pro_bar(stock_code, start_date, end_date)
+        # 1. 获取 K 线数据
+        df = self.pro_bar(stock_code, start_date, end_date)
+        if df is None or df.empty:
+            return df
+
+        # 2. 合并换手率：优先从 DB 缓存读取
+        if 'trade_date' in df.columns:
+            df['trade_date'] = pd.to_datetime(df['trade_date'], format='%Y%m%d')
+        turnover_map = {}  # date_str -> turnover_rate
+
+        # 2a. 从 DB 读取缓存的 daily_basic 换手率
+        if self.db is not None:
+            try:
+                db_rows = self.db.get_daily_basic_data(stock_code, start_date, end_date)
+                if db_rows:
+                    for row in db_rows:
+                        td = row.trade_date
+                        if isinstance(td, str):
+                            td = td.replace('-', '')
+                        turnover_map[str(td)] = row.turnover_rate
+                    logger.info(f"[{stock_code}] DB 缓存命中 {len(turnover_map)} 条换手率")
+            except Exception as e:
+                logger.warning(f"[{stock_code}] 查询 DB 换手率缓存失败: {e}")
+
+        # 2b. DB 缓存不足时，调用 daily_basic API 补缺
+        db_trade_dates = set(turnover_map.keys())
+        api_trade_dates = set()
+        if 'trade_date' in df.columns:
+            for dt in df['trade_date']:
+                d_str = dt.strftime('%Y%m%d') if hasattr(dt, 'strftime') else str(dt).replace('-', '')
+                if d_str not in turnover_map:
+                    api_trade_dates.add(d_str)
+
+        if api_trade_dates:
+            try:
+                api_start = min(api_trade_dates)
+                api_end = max(api_trade_dates)
+                basic_df = self.daily_basic(stock_code, api_start, api_end)
+                if basic_df is not None and not basic_df.empty and 'turnover_rate' in basic_df.columns:
+                    for _, row in basic_df.iterrows():
+                        td = str(row['trade_date'])
+                        td_clean = td.replace('-', '') if '-' in td else td
+                        if td_clean in api_trade_dates:
+                            turnover_map[td_clean] = row['turnover_rate']
+                logger.info(f"[{stock_code}] daily_basic API 补充 {len(api_trade_dates)} 条换手率")
+            except Exception as e:
+                logger.warning(f"获取 daily_basic 换手率失败（不影响主流程）: {e}")
+
+        # 2c. 将换手率合并到 K 线 DataFrame
+        if turnover_map:
+            df['turnover_rate'] = df['trade_date'].apply(
+                lambda dt: turnover_map.get(
+                    dt.strftime('%Y%m%d') if hasattr(dt, 'strftime') else str(dt).replace('-', '')
+                )
+            )
+
+        return df
     
     def _normalize_data(self, freq: str, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
@@ -243,8 +296,8 @@ class TushareFetcher(BaseFetcher):
         # 添加股票代码列
         df['code'] = stock_code
         
-        # 只保留需要的列
-        keep_cols = ['code'] + STANDARD_COLUMNS
+        # 只保留需要的列（额外保留换手率，若存在则通过）
+        keep_cols = ['code'] + STANDARD_COLUMNS + ['turnover_rate']
         existing_cols = [col for col in keep_cols if col in df.columns]
         df = df[existing_cols]
         logger.info(f"thshare _normalize_data")
@@ -1112,7 +1165,7 @@ class TushareFetcher(BaseFetcher):
             if ts_code: kwargs['ts_code'] = ts_code
             if ts_start: kwargs['start_date'] = ts_start
             if ts_end: kwargs['end_date'] = ts_end
-            df = ts.pro_api().block_trade(**kwargs)
+            df = self._api.block_trade(**kwargs)
             if df.empty: return pd.DataFrame()
             return df
         except Exception as e:
@@ -1170,13 +1223,20 @@ class TushareFetcher(BaseFetcher):
             raise DataFetchError(f"Tushare pledge_detail err: {e}") from e
 
     def report_rc(self, stock_code: str, start_date: str = "", end_date: str = "") -> pd.DataFrame:
-        """获取券商卖方盈利预测数据"""
+        """获取券商卖方盈利预测数据（含一致预期净利润/营收/每股收益）"""
         if self._api is None:
             raise DataFetchError("Tushare API 未初始化")
         ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
         logger.info(f"report_rc({ts_code}, {ts_start}, {ts_end})")
         try:
-            df = ts.pro_api().report_rc(ts_code=ts_code, start_date=ts_start, end_date=ts_end)
+            df = ts.pro_api().report_rc(
+                ts_code=ts_code, start_date=ts_start, end_date=ts_end,
+                fields=(
+                    "ts_code,ann_date,end_date,revenue,profit,"
+                    "forecast_revenue,forecast_np,forecast_eps,"
+                    "forecast_roe,report_title,org_name,industry,rating"
+                ),
+            )
             if df.empty: return pd.DataFrame()
             return df
         except Exception as e:
@@ -1196,7 +1256,7 @@ class TushareFetcher(BaseFetcher):
         ts_code, _, _ = self.fetch_common(stock_code, "", "")
         logger.info(f"dividend({ts_code})")
         try:
-            df = ts.pro_api().dividend(ts_code=ts_code)
+            df = self._api.dividend(ts_code=ts_code)
             if df.empty: return pd.DataFrame()
             return df
         except Exception as e:
@@ -1212,7 +1272,7 @@ class TushareFetcher(BaseFetcher):
         ts_code, _, _ = self.fetch_common(stock_code, "", "")
         logger.info(f"fina_audit({ts_code})")
         try:
-            df = ts.pro_api().fina_audit(ts_code=ts_code)
+            df = self._api.fina_audit(ts_code=ts_code)
             if df.empty: return pd.DataFrame()
             return df
         except Exception as e:
@@ -1228,7 +1288,7 @@ class TushareFetcher(BaseFetcher):
         ts_code, _, _ = self.fetch_common(stock_code, "", "")
         logger.info(f"disclosure_date({ts_code})")
         try:
-            df = ts.pro_api().disclosure_date(ts_code=ts_code)
+            df = self._api.disclosure_date(ts_code=ts_code)
             if df.empty: return pd.DataFrame()
             return df
         except Exception as e:

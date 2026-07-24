@@ -173,7 +173,21 @@ def build_trade_plan(daily_row: Dict[str, Any],
         position = 0
         pos_notes.append(f"盈亏比{risk_reward}不足1.5，回踩到位也不参与")
 
-    # ---------- 5. 大盘环境降档：指数空头结构时，个股多头信号胜率打折 ----------
+    # ---------- 5. 突破确认检查：现价已突破观察位但信号尚未确认 ----------
+    # 场景：程序关键位（或均线支撑）已被价格跨越，但多周期信号分歧/盈亏比不足
+    # 导致方向结论仍为"观望"。此时不能无视突破事实写"等待回踩"（已突破不回去），
+    # 也不能直接改为"介入"（信号分不够），应当告知突破已触发、等确认再重估。
+    breakthrough_note = ""
+    if direction == "观望" and support is not None and close >= support:
+        pct_above = round((close / support - 1) * 100, 2)
+        if 0 < pct_above <= 8:  # 超出8%以上视为已确认突破，不需要"等确认"
+            breakthrough_note = (
+                f"现价{round(close, 2)}已向上突破观察位{round(support, 2)}（{support_label}），"
+                f"超出约+{pct_above}%；突破信号已触发一半，"
+                f"若连续2日站稳{round(support, 2)}则确认突破、届时重新评估"
+            )
+
+    # ---------- 6. 大盘环境降档：指数空头结构时，个股多头信号胜率打折 ----------
     if market_env == "逆风" and position > 1:
         position -= 1
         pos_notes.append("大盘逆风（沪深300空头结构）降1成")
@@ -192,6 +206,7 @@ def build_trade_plan(daily_row: Dict[str, Any],
         "position": position,
         "position_notes": pos_notes,
         "market_env": market_env,
+        "breakthrough_note": breakthrough_note,
     }
 
 
@@ -234,6 +249,8 @@ def format_trade_plan(plan: Optional[Dict[str, Any]]) -> str:
         note = "达标" if rr >= 1.5 else "不足1.5，风险收益不划算，不建议参与"
         lines.append(f"  盈亏比：{rr}（第一目标收益÷止损风险，{note}）")
     lines.append(f"  参考仓位：{plan['position']}成（{'；'.join(plan['position_notes'])}）")
+    if plan.get("breakthrough_note"):
+        lines.append(f"  ⚠️ {plan['breakthrough_note']}")
     lines.append("  ⚠️ 以上价位、仓位与措辞为规则化纪律参考，LLM 不得修改数字，"
                  "不得改写文案用词（如添加原文没有的'复利'等），只可解释依据与风险")
     return "\n".join(lines)

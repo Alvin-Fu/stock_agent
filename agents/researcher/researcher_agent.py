@@ -22,6 +22,40 @@ from tools.weight_adjuster import get_stage_weights
 from utils.logger import logger
 
 
+# 产业链覆盖度 CheckList（针对人形机器人赛道，其他赛道可复用此结构）
+# Key: 环节名, Value: (环节描述, 推荐补充标的列表)
+# 报告候选池必须覆盖 ≥10/12 个环节，否则触发"覆盖度不足"警告并自动补充搜索
+HUMANOID_CHAIN_CHECKLIST: Dict[str, tuple[str, list[str]]] = {
+    "谐波减速器": ("减速器轻负载关节", ["绿的谐波"]),
+    "RV减速器": ("减速器重负载关节", ["双环传动"]),
+    "行星滚柱丝杠": ("线性传动/最大卡脖子环节", ["五洲新春", "双林股份", "恒立液压"]),
+    "无框力矩电机": ("关节驱动电机", []),
+    "空心杯电机": ("灵巧手微型驱动", ["鸣志电器"]),
+    "伺服驱动器": ("伺服控制+编码器", []),
+    "控制器": ("运动控制/轨迹规划芯片", []),
+    "传感器": ("力矩/触觉/视觉传感", []),
+    "灵巧手总成": ("集成手指关节执行器", ["兆威机电"]),
+    "执行器总成": ("关节模组集成", ["三花智控", "拓普集团"]),
+    "本体制造": ("整机集成", []),
+    "系统集成": ("产线/场景部署", []),
+}
+# 别名映射：已知的产业链段名到标准环节名的模糊匹配
+_CHAIN_SEGMENT_ALIASES: Dict[str, str] = {
+    "减速器": "谐波减速器", "谐波减速器": "谐波减速器",
+    "RV减速器": "RV减速器", "RV": "RV减速器",
+    "丝杠": "行星滚柱丝杠", "行星滚柱丝杠": "行星滚柱丝杠", "滚柱丝杠": "行星滚柱丝杠",
+    "电机": "无框力矩电机", "无框力矩电机": "无框力矩电机",
+    "空心杯电机": "空心杯电机", "微型电机": "空心杯电机",
+    "伺服": "伺服驱动器", "伺服驱动": "伺服驱动器", "驱动器": "伺服驱动器",
+    "控制器": "控制器", "控制": "控制器",
+    "传感器": "传感器", "传感": "传感器",
+    "灵巧手": "灵巧手总成", "灵巧手总成": "灵巧手总成",
+    "执行器总成": "执行器总成", "执行器": "执行器总成",
+    "本体": "本体制造", "整机": "本体制造", "本体制造": "本体制造",
+    "系统集成": "系统集成", "集成": "系统集成",
+}
+
+
 # 阶段化评分框架：机会=边际变化，护城河是存量质量——不同行业生命周期两者的权重完全不同。
 # 用成熟行业的护城河框架去筛导入期行业（如商业航天），结论永远是"不参与"，等于对成长机会失明。
 # momentum（边际变化）分项：只认近2个季度/近3个月的增量事实（增速拐点/新订单/产能爬坡/毛利率环比回升）。
@@ -134,11 +168,12 @@ def apply_valuation_adjustment(ranked: List[Dict[str, Any]],
         m = metrics_map.get(item["code"]) or {}
         pct = m.get("pe_percentile")
         item["pe_percentile"] = pct
+        item["pe_ttm"] = m.get("pe_ttm")  # 绝对PE值，供排名表展示+双阈值预警
         item["total_mv"] = m.get("total_mv")
         item["mf_net20"] = m.get("mf_net20")
         adj = 0.0
         if pct is not None:
-            if pct >= 80:
+            if pct >= 80 or (m.get("pe_ttm") and m["pe_ttm"] > 100):
                 adj = -1.0
             elif pct >= 60:
                 adj = -0.5
@@ -146,11 +181,12 @@ def apply_valuation_adjustment(ranked: List[Dict[str, Any]],
                 adj = 0.5
         item["valuation_adj"] = adj
         item["composite_adj"] = round(item["composite"] + adj, 2)
+        pe_abs = m.get("pe_ttm")
         if pct is None:
             item["quadrant"] = "无估值分位数据"
-        elif item["composite"] >= 7 and pct <= 40:
+        elif item["composite"] >= 7 and pct <= 40 and (pe_abs is None or pe_abs <= 50):
             item["quadrant"] = "机会区（高分低估）"
-        elif item["composite"] >= 7 and pct >= 70:
+        elif item["composite"] >= 7 and (pct >= 70 or (pe_abs and pe_abs > 100)):
             item["quadrant"] = "拥挤区（高分高估）"
         elif item["composite"] < 6 and pct >= 70:
             item["quadrant"] = "危险区（低分高估）"
@@ -181,11 +217,22 @@ def format_ranking_table(ranked: List[Dict[str, Any]], name_of=None) -> str:
                 pass
         note = f"（{item['note']}）" if item.get("note") else ""
         extra = []
+        pe_ttm = item.get("pe_ttm")
+        pct = item.get("pe_percentile")
+        if pe_ttm is not None and pct is not None:
+            # 双阈值预警标签
+            if pct >= 80 or pe_ttm > 100:
+                pe_tag = "🔴极高PE"
+            elif pct >= 50 and 50 <= pe_ttm <= 100:
+                pe_tag = "🟡偏高PE"
+            else:
+                pe_tag = "🟢合理PE"
+            extra.append(f"PE{pe_ttm:.1f}({pct:.0f}%分位){pe_tag}")
+        elif pe_ttm is not None:
+            extra.append(f"PE{pe_ttm:.1f}")
         if item.get("composite_adj") is not None:
-            pct = item.get("pe_percentile")
-            # 窗口必须在源头带上：下游 LLM 只会照抄，这里不写"近3年"，报告里就是裸分位
             extra.append(f"调整后{item['composite_adj']}"
-                         + (f"（PE近3年分位{pct}%，{item.get('valuation_adj'):+g}）" if pct is not None else "（无估值分位）"))
+                         + (f"（{item.get('valuation_adj'):+g}）" if item.get('valuation_adj') is not None else ""))
         if item.get("quadrant"):
             extra.append(item["quadrant"])
         if item.get("total_mv") is not None:
@@ -543,9 +590,10 @@ class ResearcherAgent:
       触发条件（具体可验证：指标+阈值或事件，如"单月销量同比转正""毛利率环比回升超1pct"
       "海外反补贴关税落地"）、传导路径（条件→业务→财务指标的方向变化）、
       可能性档位（只用 高/中/低，禁止编造百分比）。情景是推演不是预测，禁止写目标价
-    - **催化事件分级**：在重估触发条件中标注一级/二级：
-      - **一级强催化**（🟢）：直接影响业绩兑现的事件（招标结果/量产里程碑/合同签署/财报超预期）
-      - **二级弱催化**（🔵）：间接影响情绪的事件（政策征求意见/技术试验/行业会议）
+    - **催化事件分级（三级体系）**：在重估触发条件中标注级别：
+      - **一级催化（影响板块β）**🟢：宏观/政策/行业巨头事件，影响全行业景气度
+      - **二级催化（影响环节α）**🔵：环节涨价/头部公司IPO/认证突破，影响特定环节格局
+      - **三级催化（影响个股α）**⚪：个股订单/财报超预期/高管增持，影响单一公司基本面
     - 在输出最末尾附一段纯JSON（不要markdown包裹）：
       {{"company_triggers": [{{"trigger": "重估触发条件（可被公开新闻验证的具体事件）",
         "keywords": "盯梢关键词 空格分隔", "level": "primary/secondary"}}, ...]}}
@@ -745,6 +793,94 @@ class ResearcherAgent:
 
         return all_leaders
 
+    def _validate_chain_coverage(self, industry: str, chain: Dict[str, Any],
+                                 all_leader_codes: set) -> tuple[str, list[Dict], set]:
+        """产业链覆盖度校验：映射当前候选到12标准环节 → 统计覆盖数 → 缺环节自动补充搜索。
+        返回 (coverage_warning, new_leaders, updated_codes)"""
+        # Step 1: 建立候选->环节快照（用链结构中的 segment name 做别名映射）
+        covered_segments = set()
+        segment_to_codes: Dict[str, list[str]] = {}
+        for level in ["upstream", "midstream", "downstream", "niche_innovators"]:
+            for seg_data in chain.get(level, []):
+                seg_name = str(seg_data.get("segment", ""))
+                # 别名映射
+                std_seg = None
+                for alias_k, alias_v in _CHAIN_SEGMENT_ALIASES.items():
+                    if alias_k in seg_name or seg_name in alias_k:
+                        std_seg = alias_v
+                        break
+                if std_seg:
+                    # 该 segment 下的候选股
+                    for leader in seg_data.get("leaders", []):
+                        code = leader.get("code", "")
+                        if code:
+                            covered_segments.add(std_seg)
+                            segment_to_codes.setdefault(std_seg, []).append(code)
+        # 额外：用公司名反向匹配（有些 segment 名太泛，但公司名/主营直接指明了环节）
+        for code in all_leader_codes:
+            if code in covered_segments:
+                continue
+            name = find_company_name(code) or ""
+            for alias_k, alias_v in _CHAIN_SEGMENT_ALIASES.items():
+                if alias_k in name:
+                    covered_segments.add(alias_v)
+                    segment_to_codes.setdefault(alias_v, []).append(code)
+                    break
+
+        n_covered = len(covered_segments)
+        total = len(HUMANOID_CHAIN_CHECKLIST)
+        missing = [seg for seg in HUMANOID_CHAIN_CHECKLIST if seg not in covered_segments]
+
+        warning = f"【产业链覆盖度校验】候选池覆盖 {n_covered}/{total} 个环节"
+        if n_covered >= total:
+            warning += "——完整覆盖。\n"
+            return (warning, [], all_leader_codes)
+        if n_covered == total - 1:
+            warning += f"，仅缺失「{missing[0]}」。\n"
+        elif n_covered >= total - 2:
+            warning += f"，缺失{len(missing)}个：{'、'.join(missing)}。\n"
+        else:
+            warning += f"，⚠️ 覆盖度不足（<{total-2}），缺失{len(missing)}个：{'、'.join(missing)}。\n"
+            warning += "将自动搜索补充缺失环节。\n"
+
+        # Step 2: 补充搜索缺失环节的推荐标的
+        new_leaders = []
+        for seg in missing:
+            _, rec_stocks = HUMANOID_CHAIN_CHECKLIST.get(seg, ("", []))
+            if not rec_stocks:
+                # 无推荐标的时搜索该环节的上市公司
+                query = f"{industry} {seg} 上市公司 A股 股票代码 {date.today().year}"
+                try:
+                    result = web_search.invoke({"query": query})
+                except Exception:
+                    continue
+                # 搜索结果中尝试提取
+                extra = self._extract_leaders_from_text(str(result), seg, "auto_supplement", "")
+                if extra:
+                    for e in extra:
+                        ec = e.get("code", "")
+                        if ec:
+                            new_leaders.append(e)
+                            all_leader_codes.add(ec)
+                            covered_segments.add(seg)
+            else:
+                # 有推荐标的，逐一验证是否已存在，不存在则尝试获取代码
+                for rn in rec_stocks:
+                    try:
+                        rc = find_stock_code(rn)
+                    except Exception:
+                        rc = None
+                    if rc and rc not in all_leader_codes:
+                        new_leaders.append({"name": rn, "code": rc, "segment": seg, "rank": "补充"})
+                        all_leader_codes.add(rc)
+                        covered_segments.add(seg)
+
+        if new_leaders:
+            updated_total = len(covered_segments)
+            warning += f"补充后覆盖 {updated_total}/{total} 个环节，新增 {len(new_leaders)} 只候选。\n"
+            warning += "新增标的：" + "、".join(f'{l.get("name","")}({l.get("code","")})' for l in new_leaders) + "\n"
+        return (warning, new_leaders, all_leader_codes)
+
     def _extract_leaders_from_text(self, text: str, segment: str, level: str,
                                    constituents_text: str = "") -> List[Dict[str, Any]]:
         """从搜索结果+板块成分股清单中提取该细分领域的主要上市公司（最多4家，按地位排序）。
@@ -832,6 +968,10 @@ class ResearcherAgent:
             # 景气拐点与利润迁移：渗透率斜率、涨价传导、瓶颈环节=定价权所在
             f"{industry} 渗透率 行业增速 拐点 订单 排产 {recent_period}",
             f"{industry} 涨价 供需缺口 瓶颈环节 价格传导 利润分配 {recent_period}",
+            # 技术路径博弈：不同技术路线的份额变化决定利润在候选池内部的迁移方向
+            f"{industry} 技术路线 对比 趋势 占比 市场份额 {recent_period}",
+            # 量产进度与业绩兑现：各整机厂量产时间表对应的上游订单节奏
+            f"{industry} 量产 时间表 SOP 交付 订单 供应链 业绩兑现 {today.year}",
         ]
 
         for level in ["upstream", "midstream", "downstream", "niche_innovators"]:
@@ -909,7 +1049,10 @@ class ResearcherAgent:
 - reeval_triggers：1-4 条"若发生XX则值得重新评估该行业"的具体条件（如"某公司砷化镓电池收入占比超20%"
   "可回收火箭完成商业化首飞"），必须可被公开新闻验证，程序会自动盯梢；没有就给空数组。
   **必须是尚未发生的前瞻事件**——已发生的大事写进「行业近况与重大事件」，
-  禁止登记为触发条件（已发生事件落库后监控第一轮扫描就会全部误报命中）
+  禁止登记为触发条件（已发生事件落库后监控第一轮扫描就会全部误报命中）。
+  **触发条件选择原则**：优先选外部不可控事件（如供应链断供/制裁升级/重大政策落地），
+  这类事件一旦发生会根本性改变行业格局。下游整机厂的价格调整（如涨价/降价）本质是成本传导，
+  不是上游供需关系的直接信号，不应作为触发条件
 
 ## 一、产业链公司全景筛选
 - 用表格列出产业链上中下游 + 特精专新共筛选出的所有公司
@@ -930,6 +1073,8 @@ class ResearcherAgent:
 - **出货量/产能**：主要产品的出货量、产能利用率、同比变化
 - **资本开支**：最近年度/季度的资本开支规模，主要用于哪些方向（扩产/研发/并购）
 - **新增订单**：近期新增订单量及同比变化，订单主要来源（国内/海外/大客户/政府）
+- **客户集中度**：前五大客户收入占比，是否存在单一客户依赖（依赖>30%定义为高风险），
+  或是向全行业多客户供货的独立第三方供应商——后者客户分散度高，抗爆雷能力强
 - **技术突破**：近半年是否有重大技术突破、新产品量产、关键工艺突破、在研项目进展
 
 ## 三、逐公司基本面与竞争力评分
@@ -975,16 +1120,31 @@ class ResearcherAgent:
 - **限售解禁**：未来3个月大规模解禁预警（占流通股比>5%时单独列出）
 - **综合判断**：整体资金面偏多/中性/偏空，主力资金、游资、散户各自在增持哪类标的
 
-## 八、催化剂时间轴（未来3-6个月，含分级）
-机会有时间属性。用列表按时间先后列出可能的催化事件：
-- 每条格式：预计时间 | 事件（招标/发射/投产/量产/政策落地/财报窗口）| 影响的环节或公司 | 落地概率 | 弹性强度 | 出处
-- **落地概率**：每条催化标注概率（高/中/低），说明判断依据，禁止默认全部"高概率"
-- **弹性强度**：标注该事件对行业/个股业绩弹性大小，按以下分级标准标注：
-  - **一级强催化**（🟢）：直接影响业绩兑现/订单落地的事件，如招标结果公示、量产里程碑、产品获批上市、重大合同签署、财报业绩超预期——此类事件值得推送主动告警
-  - **二级弱催化**（🔵）：间接影响市场情绪的事件，如政策征求意见稿、技术试验成功、行业会议、机构调研——此类事件仅做日常跟踪，不触发主动推送
+## 八、催化事件分级体系（未来3-6个月）
+机会有时间属性。用列表按以下**三级分级体系**组织催化事件，每条格式：
+  事件 | 级别 | 影响的环节或公司 | 落地概率 | 影响幅度 | 兑现时间窗 | 出处
+
+**三级催化分级标准**：
+- **一级催化（影响整个板块β）**🟢：影响全行业景气度的事件——触发后**自动重估整个候选池**
+  - 示例：特斯拉Optimus单季出货≥5000台、工信部专项补贴落地、美国对华机器人出口管制升级
+  - 来源通常为国家政策、行业巨头公告、宏观事件
+- **二级催化（影响环节α）**🔵：影响特定产业链环节格局的事件——触发后**自动重估对应环节所有标的**
+  - 示例：减速器/丝杠/电机等环节涨价函、头部整机厂（宇树/智元/小米）IPO或新一轮融资、
+    国产核心零部件通过特斯拉/Figure认证
+  - 注意：「哈默纳科/纳博特斯克宣布对华涨价或断供」是真正的国产替代加速催化信号，
+    与下游整机厂提价有本质区别（下游提价≠上游供不应求，切勿混淆）
+- **三级催化（影响个股α）**⚪：影响单一公司基本面的事件——触发后**自动重估对应个股**
+  - 示例：公司公告大额订单/定点函、财报超预期（营收/利润增速>一致预期20%）、高管增持/回购
+
+**输出要求**：
+- **落地概率**：每条标注高/中/低，说明判断依据，禁止默认全部"高概率"
+- **影响幅度**：量化或半量化标注（如"Optimus量产→绿的订单翻倍""补贴落地→全行业毛利率+2-3pct"）
+- **兑现时间窗**：精确到季度（如"2026Q3-Q4"），不确定时标注"待定"
 - 出处必须写具体来源（媒体名/公司公告/政府文件，尽量带日期），禁止笼统写
   「搜索数据」「搜索结果」——无法说出具体来源的事件视为依据不足，不列
 - 只列搜索结果里有明确依据的事件，禁止编造时间；没有就明写「未发现明确催化剂」
+- ⚠️ 特别关注行业内正在推进 IPO（已注册/过会/获批/招股）的重要公司，
+  其上市后的资本开支和产业链带动是独立的二级催化，必须在时间轴中列出并标注弹性
 
 ## 九、行业近况与重大事件（近1-3个月已发生）
 催化剂时间轴看未来，本节看已经发生的行情驱动：
@@ -995,6 +1155,33 @@ class ResearcherAgent:
   指数与候选个股走势背离时必须点破（指数涨个股不涨=个股问题，反之=行业beta拉动）
 - 没有重大事件就明写「近期无重大事件」，禁止拿日常新闻凑数
 
+## 十、3年盈利预测与PE Band（基于下方【一致预期数据】程序数据块）
+如果下方提供了程序拉取的一致预期数据，请基于它生成以下分析（否则基于搜索结果）：
+- 对每只候选股列出2026E/2027E/2028E的一致预期净利润及对应增速
+- 计算营收和利润的复合增速（CAGR 2026-2028）
+- 对应当前总市值的PE Band（例如：绿的谐波即使按最乐观2028E净利润，PE仍有XX倍）
+- 标注共识度：覆盖机构家数、目标价均值/中位数、当前价相对目标价的空间
+- 同步检查机构是否在最近1个月上调/下调了预测（方向比绝对值重要）
+
+## 十一、技术路径博弈分析
+基于搜索结果分析本行业关键技术路线的竞争格局与演变趋势：
+- **各技术路线的定位**（如人形机器人：谐波减速器=轻负载关节、RV减速器=重负载关节、
+  行星滚柱丝杠=线性传动/最大卡脖子环节）
+- **份额变化趋势**：各路线当前市占率、过去12个月的变化方向、未来2年的预期方向
+- **利润迁移含义**：路线占比变化直接决定利润在候选池内部哪个环节/公司受益最多。
+  例如谐波占比扩大利好绿的谐波，行星滚柱丝杠突破利好对应稀缺标的
+- **卡脖子环节**：哪个技术路线国产化率最低、替代难度最大——一旦突破弹性也最大
+
+## 十二、量产进度 → 业绩兑现映射表
+**"催化 → 业绩 → 股价"链条**。用表格列出关键量产里程碑及其对候选池的业绩影响路径：
+
+| 整机厂/事件 | 预计时间 | 量产规模 | 直接影响环节 | 对应公司 | 业绩兑现窗口 | 弹性评估 |
+关键要求：
+- 事件必须对应到具体公司的具体产品线（如"特斯拉Optimus SOP → 绿的谐波谐波减速器订单"）
+- 业绩兑现窗口标注到季度（如Q3-Q4财报验证）
+- 弹性评估区分：直接受益（订单量可测算）vs 间接受益（情绪催化为主）
+- 对于尚未量产但正在进行IPO的公司（如宇树科技），其上市后的资本开支溢出是独立催化
+
 【重要原则】
 - 候选公司清单 JSON 必须是输出的第一部分（输出过长被截断时后面的段落可丢，JSON 不能丢）
 - 最后必须附「行业风险」小节，拆分为两个独立小节：
@@ -1002,10 +1189,177 @@ class ResearcherAgent:
   **二、个股特有风险**：客户集中度、航天业务占比不足、订单波动、产能爬坡不及预期等
   每条高影响力利好须对应检查风险（如国产替代→下游资本开支放缓风险）
 - 所有结论必须基于搜索结果，不足处标注「信息不足」
+- **每只公司分析必须同时列出核心看多逻辑和核心看空风险**，非对称时说明偏重方向和分析师置信度。
+  仅列风险不提弹性、或仅列利好不提风险的分析会被视为片面、降低报告可信度
 - 业务拆解数据是评估公司质量和成长性的核心，请尽可能详细
 - 资金偏好标签必须依据搜索数据中提及的资金类型判断，不可凭空猜测
 - 特精专新企业的不可替代性是其核心竞争力，需重点分析
 - 候选公司清单中的股票代码必须准确"""
+
+    # ========== 一致预期数据拉取 ==========
+
+    def _fetch_consensus_forecasts(
+            self, codes: List[str]) -> Dict[str, Dict[int, dict]]:
+        """拉取一致预期数据，返回 {code: {year: {revenue, profit, eps, n_inst}}}；失败返回空 dict"""
+        import pandas as pd
+        from tools.stock.tushare_fetcher import TushareFetcher
+        result: Dict[str, Dict[int, dict]] = {}
+        try:
+            tf = TushareFetcher()
+        except Exception:
+            return result
+        profit_col, rev_col, eps_col = 'forecast_np', 'forecast_revenue', 'forecast_eps'
+        for code in codes[:6]:
+            try:
+                df = tf.report_rc(code)
+                if df is None or df.empty or profit_col not in df.columns:
+                    continue
+                df = df[df[profit_col].notna()].copy()
+                if df.empty:
+                    continue
+                df['end_date_dt'] = pd.to_datetime(df['end_date'], format='%Y%m%d', errors='coerce')
+                df['year'] = df['end_date_dt'].dt.year
+                df = df[df['year'].between(2026, 2028)].copy()
+                if df.empty:
+                    continue
+                year_data: Dict[int, dict] = {}
+                for yr in sorted(df['year'].unique()):
+                    yr_df = df[df['year'] == yr]
+                    p_med = yr_df[profit_col].median()
+                    r_med = yr_df[rev_col].median() if rev_col in yr_df.columns and yr_df[rev_col].notna().any() else None
+                    e_med = yr_df[eps_col].median() if eps_col in yr_df.columns and yr_df[eps_col].notna().any() else None
+                    if p_med is not None and p_med > 0:
+                        year_data[yr] = {
+                            'profit': round(p_med / 1e8, 2),
+                            'revenue': round(r_med / 1e8, 1) if r_med is not None else None,
+                            'eps': round(e_med, 4) if e_med is not None else None,
+                            'n_inst': len(yr_df),
+                        }
+                if year_data:
+                    result[code] = year_data
+            except Exception:
+                continue
+        return result
+
+    def _format_forecast_table(self, forecasts: Dict[str, Dict[int, dict]],
+                               per_stock_valuation: Optional[List[Dict]] = None) -> str:
+        """将一致预期数据格式化为表格 + 估值敏感性矩阵 + 基本面锚"""
+        if not forecasts:
+            return ""
+        # 建立 code -> valuation 映射
+        val_map: Dict[str, dict] = {}
+        if per_stock_valuation:
+            for s in per_stock_valuation:
+                c = str(s.get("code", ""))
+                if c:
+                    val_map[c] = s
+        lines = ["========== 候选公司一致预期数据（程序拉取，3年盈利预测+PE Band+敏感性矩阵） =========="]
+        for code in sorted(forecasts.keys()):
+            yd = forecasts[code]
+            name = find_company_name(code) or code
+            # 获取当前估值
+            vm = val_map.get(code, {})
+            cur_mv = vm.get("total_mv")  # 总市值(亿)
+            cur_pe = vm.get("pe_ttm")
+            pe_pct = vm.get("pe_percentile")
+            # --- 表格头 ---
+            years = sorted(yd.keys())
+            header_years = " | ".join(f"{y}E" for y in years)
+            lines.append(f"\n◇ {name}({code})  当前PE={cur_pe or 'N/A'} PE分位={pe_pct or 'N/A'}%  总市值={cur_mv or 'N/A'}亿")
+            lines.append(f"  指标    | {header_years}")
+            # 营收行
+            revs = [f"{yd[y].get('revenue','-')}" for y in years]
+            lines.append(f"  营收(亿) | {' | '.join(revs)}")
+            # 净利润行
+            profits = [f"{yd[y]['profit']:.2f}" for y in years]
+            lines.append(f"  净利(亿) | {' | '.join(profits)}")
+            # 营收同比
+            rev_growths = []
+            prev_rev = None
+            for y in years:
+                cur_rev = yd[y].get('revenue')
+                if prev_rev and cur_rev:
+                    g = (cur_rev / prev_rev - 1) * 100
+                    rev_growths.append(f"{g:+.1f}%")
+                else:
+                    rev_growths.append("-")
+                prev_rev = cur_rev or prev_rev
+            lines.append(f"  营收增速 | {' | '.join(rev_growths)}")
+            # 净利润同比
+            growths = []
+            prev = None
+            for y in years:
+                cur = yd[y]['profit']
+                if prev:
+                    g = (cur / prev - 1) * 100
+                    growths.append(f"{g:+.1f}%")
+                else:
+                    growths.append("-")
+                prev = cur
+            lines.append(f"  净利增速 | {' | '.join(growths)}")
+            # Forward PE（以最新价/总市值作为基准）
+            fwd_pe = []
+            for y in years:
+                p = yd[y]['profit']
+                if cur_mv and p > 0:
+                    fwd_pe.append(f"{cur_mv / p:.0f}倍")
+                else:
+                    fwd_pe.append("-")
+            lines.append(f"  ForwardPE | {' | '.join(fwd_pe)}")
+            # 覆盖机构数
+            n_insts = [f"{yd[y]['n_inst']}家" for y in years]
+            lines.append(f"  机构覆盖 | {' | '.join(n_insts)}")
+
+            # --- 估值敏感性矩阵 ---
+            if cur_mv and len(years) >= 1:
+                last_profit = yd[years[-1]]['profit']  # 最远期(2028E)
+                lines.append(f"\n  估值敏感性（基准={last_profit:.2f}亿净利润）：")
+                lines.append(f"  情景          | 远期PE | 隐含市值(亿) | 相对当前空间")
+                # 乐观: Optimus 10万台 → 给激进PE(产能充分释放, 市场赋予高估值)
+                # 中性: 国内整机10万台 → 给行业平均PE
+                # 悲观: 量产推迟 → 给保守PE
+                scenarios = [
+                    ("乐观(量产如期放量)", 80),
+                    ("中性(行业稳步增长)", 60),
+                    ("悲观(量产大幅推迟)", 40),
+                ]
+                for label, pe_assumption in scenarios:
+                    implied_mv = round(last_profit * pe_assumption, 1)
+                    if cur_mv > 0:
+                        room = round((implied_mv / cur_mv - 1) * 100, 1)
+                        room_str = f"+{room}%" if room >= 0 else f"{room}%"
+                    else:
+                        room_str = "N/A"
+                    lines.append(f"  {label} | {pe_assumption}x | {implied_mv} | {room_str}")
+
+        # --- 全局回踩位基本面锚 ---
+        lines.append("\n  基本面锚（回踩观察位校准）：PE历史中位数对应价格——技术位与基本面锚差异>30%时取更保守值")
+        for code in sorted(forecasts.keys()):
+            vm = val_map.get(code, {})
+            cur_pe = vm.get("pe_ttm")
+            pe_pct = vm.get("pe_percentile")
+            name = find_company_name(code) or code
+            # 估算历史中位数PE：用线性反推
+            # 假设历史PE近似均匀分布，中位数PE ≈ 当前PE × 50% / 分位%
+            # 锚定价位 = 现价 × (中位PE / 当前PE)
+            # 现价 ≈ 市值 / 总股本，但更简单：从PE反推，anchor_price = cur_price × median_pe / cur_pe
+            # 先找收盘价
+            cur_price = None
+            if cur_pe:
+                try:
+                    from tools.forecast import _latest_close
+                    cur_price = _latest_close(code)
+                except Exception:
+                    pass
+            if cur_pe and pe_pct is not None and pe_pct > 0 and cur_price and cur_price > 0:
+                median_pe_est = cur_pe * 0.5 / (pe_pct / 100)
+                anchor_price = cur_price * median_pe_est / cur_pe
+                ratio = anchor_price / cur_price
+                lines.append(f"  {name}({code}): 当前PE={cur_pe:.1f}倍(分位{pe_pct:.0f}%), "
+                             f"估算中位PE≈{median_pe_est:.0f}倍, "
+                             f"基本面锚价≈{anchor_price:.2f}(现价×{ratio:.2f})——"
+                             f"技术支撑若低于锚价>30%则以锚价为准, 反之亦然")
+        return "\n".join(lines)
 
     # ========== 通用工具 ==========
 
@@ -1552,6 +1906,11 @@ ETF 名称：{etf_name}
                     if code:
                         all_leader_codes.add(code)
 
+        # Step 2.5：产业链覆盖度校验（映射到12标准环节，缺环节自动补充）
+        coverage_warning, new_leaders, all_leader_codes = self._validate_chain_coverage(
+            industry_name, chain, all_leader_codes)
+        logger.info(f"覆盖度check: {coverage_warning.split(chr(10))[0]}")
+
         # ---- Step 3：全景搜索 + LLM 分析 ----
         logger.info("Step 3/3: 全景搜索 + LLM 产业链分析（基本面/护城河/资金偏好）...")
 
@@ -1568,6 +1927,9 @@ ETF 名称：{etf_name}
                 snippet = seg_data.get("search_snippet", "")[:200]
                 if snippet:
                     chain_summary += f"  搜索摘要: {snippet}\n"
+
+        # 覆盖度校验结果
+        chain_summary += f"\n{coverage_warning}" if coverage_warning else ""
 
         # 行业相关的财联社快讯（结构化信源，含政策面）。
         # 关键词扩展到各环节名：行业大事往往不带行业名（"XX火箭完成回收试验"这类
@@ -1644,7 +2006,7 @@ ETF 名称：{etf_name}
             if batch_val_text:
                 snapshot_blocks.append(batch_val_text)
 
-            for c in sorted(all_leader_codes)[:6]:
+            for c in sorted(all_leader_codes)[:12]:
                 snap_lines = [f"◇ 候选 {c}"]
                 # 利润表（营收/净利/研发费用/销售费用/管理费用分拆）
                 try:
@@ -1705,6 +2067,11 @@ ETF 名称：{etf_name}
         except Exception as e:
             logger.warning(f"资金筹码数据拉取失败（不影响分析）: {e}")
 
+        # 一致预期数据（3年盈利预测+PE Band）
+        forecast_raw = self._fetch_consensus_forecasts(list(all_leader_codes))
+        per_stock_valuation = (industry_valuation or {}).get("per_stock", []) if industry_valuation else []
+        forecast_block = self._format_forecast_table(forecast_raw, per_stock_valuation) if forecast_raw else ""
+
         # 全景搜索（含不可替代性/溢价能力维度）
         all_queries = self._build_chain_queries(industry_name, chain)
         all_results = self._do_search(all_queries)
@@ -1740,12 +2107,56 @@ ETF 名称：{etf_name}
 ========== 全网搜索结果（含经营/竞争力/业务拆解/收入毛利占比/出货量/资本开支/新增订单/技术突破/护城河） ==========
 {search_text[:15000]}
 
-请按结构输出：〇、JSON 候选清单+分项评分+重估触发条件（放最前）→ 一、全景筛选
-→ 二、业务拆解与经营数据（优先引用主营构成数据的占比/毛利率原数）→ 三、基本面评分
-→ 四、护城河分析（重点关注特精专新）→ 五、评分依据说明
-→ 六、环节利润迁移判断 → 七、催化剂时间轴 → 八、行业近况与重大事件。
+{forecast_block if forecast_block else ''}
+
+请按**标准化7节结构**输出（这是固定模板，每期报告必须严格遵循）：
+
+**第1节 结论与操作（放最前面）**
+- 包含：〇、JSON 候选清单+分项评分+重估触发条件（必须是最先输出的部分，防止截断丢失）
+- 方向性判断（偏多/中性/偏空）、综合排名、仓位建议、回踩观察位（双重校验）、触发条件清单
+
+**第2节 产业链全景图**
+- 产业链上中下游结构 + 环节完整度自检（覆盖了12个标准环节中的几个、缺了哪几个、已自动补充）
+- 全景筛选结果：各环节龙头公司及所属环节
+
+**第3节 关键环节深度分析**
+- 环节利润迁移判断（当前瓶颈在哪、利润正在向哪个环节集中、未来2-4季度的迁移方向）
+- 技术路径博弈分析（各路线定位/份额变化/卡脖子环节）
+- 量产进度→业绩兑现映射表
+
+**第4节 候选公司详情（核心差异内容）**
+对每只候选公司，按以下结构输出（每只2-3页级别）：
+- **公司概况与业务拆解**：主营构成数据（各业务收入/利润占比与毛利率）、出货量/产能、客户集中度
+- **基本面与护城河评分**：产业链地位、近期经营表现、不可替代性、溢价能力，含双向依据
+- **财务预测表**：3年一致预期（营收/净利/增速/Forward PE/机构覆盖数），引用下方【一致预期数据】程序块
+- **估值锚**：当前PE+PE分位+双阈值预警（🔴/🟡/🟢）+ 估值敏感性矩阵（乐观/中性/悲观情景）
+- **回踩观察位（双重校验）**：技术位（程序计算）+ 基本面锚（PE历史中位对应价格）+ 校准取保守值
+- **催化跟踪**：针对该标的的三级催化事件（对应第5节的催化时间轴）
+
+**第5节 行业趋势与催化时间轴**
+- 行业近况与重大事件（近1-3个月已发生的行情驱动）
+- 催化事件分级体系（未来3-6个月）：按一级β/二级α/三级个股分级，每条含概率/影响幅度/兑现时间窗
+
+**第6节 风险提示**
+- 个股特有风险：客户集中度、业务占比不足、订单波动、产能爬坡不及预期等
+- 环节风险：该环节的技术替代、竞争加剧、利润率下行
+- 系统性风险：行业周期位置、政策与地缘风险、估值水位
+
+**第7节 数据准确性声明**
+- 信源清单：哪些数据来自 Tushare/Akshare 程序拉取，哪些来自网页搜索
+- 数据交叉验证结果：毛利率/净利率等多信源比对，差异>5%的冲突标记
+- 估值数据时效说明：PE/TTM 数据截止日期
+- 预测数据性质声明：一致预期来自机构汇总，预测≠事实，仅供参考
+
 资金偏好只在搜索结果里有北向/龙虎榜/机构调研等公开证据时标注并写明出处，
-无证据写「无公开数据」，禁止凭板块印象填"主力/游资"。"""),
+无证据写「无公开数据」，禁止凭板块印象填"主力/游资"。
+
+**重要原则**：
+- 候选公司清单 JSON 必须是输出的**第一部分**（输出过长被截断时后面的段落可丢，JSON 不能丢）
+- 所有结论必须基于搜索结果，不足处标注「信息不足」
+- 每只公司分析必须同时列出核心看多逻辑和核心看空风险
+- 特精专新企业的不可替代性是其核心竞争力，需重点分析
+- 候选公司清单中的股票代码必须准确"""),
         ]
 
         logger.info("LLM 产业链分析中...")

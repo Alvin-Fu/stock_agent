@@ -109,19 +109,33 @@ class AnalystAgent:
                         balance_records = balance_df.to_dict("records")
                 except Exception:
                     pass
-                result["trend"] = build_full_trend(income_records, cash_records, balance_records)
+                # 财务指标数据（含毛利率），用于交叉验证 income 表数据
+                fina_records = []
+                try:
+                    fina_df = self.db.get_stock_fina_indicator(stock_code)
+                    if fina_df is not None and not fina_df.empty:
+                        fina_records = fina_df.to_dict("records")
+                except Exception:
+                    pass
+                result["trend"] = build_full_trend(income_records, cash_records, balance_records, fina_records)
         except Exception as e:
             logger.warning(f"构建财报趋势失败（不影响其余分析）: {e}")
 
-        # 同行对比表（横向估值参照系）+ 机构盈利预测（forward 估值锚）
+        # 同行对比表（横向估值参照系）
         try:
             from tools.peer_compare import fetch_peer_table
             result["peer_table"], _ = fetch_peer_table(stock_code)
         except Exception as e:
             logger.warning(f"同行对比生成失败（不影响其余分析）: {e}")
+
+        # 先解析当期财务数据（含 PE(TTM)），供预测块 forward PEG 使用
+        result["parsed"] = self._parse_latest_financial_data()
+
+        # 机构盈利预测（forward 估值锚）
         try:
             from tools.forecast import fetch_profit_forecast_text
-            result["forecast"] = fetch_profit_forecast_text(stock_code)
+            pe_ttm = result["parsed"].get("pe_ttm") if result.get("parsed") else None
+            result["forecast"] = fetch_profit_forecast_text(stock_code, pe_ttm=pe_ttm)
         except Exception as e:
             logger.warning(f"盈利预测获取失败（不影响其余分析）: {e}")
 
@@ -130,8 +144,6 @@ class AnalystAgent:
             result["profit_split"] = self._build_profit_split_text(mb_records, income_records)
         except Exception as e:
             logger.warning(f"分部利润拆分失败（不影响其余分析）: {e}")
-
-        result["parsed"] = self._parse_latest_financial_data()
 
         # 数据源健康上报：财报块拿没拿到一眼可见，静默降级是最危险的失败模式
         try:
@@ -307,7 +319,7 @@ class AnalystAgent:
         return results
 
     def _build_system_prompt(self) -> str:
-        from agents.prompts_common import STYLE_RULES, INTERMEDIATE_PRODUCT_NOTE
+        from agents.prompts_common import STYLE_RULES, INTERMEDIATE_PRODUCT_NOTE, NUMBER_ACCURACY_RULE
         today = date.today().strftime("%Y-%m-%d")
         return f"""你是一位资深财务分析师（CFA），拥有 15 年上市公司财报分析经验。
 今天的日期是 {today}，请以此为时间基准表述"最新/近期"。
@@ -342,13 +354,31 @@ class AnalystAgent:
    财务趋势要与主营构成占比变化、研报中的销量/出货量数据互相印证
 11. 同行对比：估值贵贱、毛利率高低必须放在【同行对比】表里说（"PE 高于 4/5 家同行"
     比"PE 处于历史 89% 分位"更有决策含义，两者都要说）；缺同行数据时明说，
-    禁止凭记忆引用"同行水平"
-12. 分部估值参考（SOTP）：仅当同时提供了【分部利润拆分】和【同行对比】时才做——
+    禁止凭记忆引用"同行水平"；必须直接引用【同行对比】表末尾"程序判读"行中的
+    原始表述（如"目标PE 21.9倍（同行中位数 23.5倍，高于2/5家）"），
+    禁止改写程序判读结论
+12. 剩余季度投射计算（硬性要求）：当机构全年预测数据和Q1实际净利润均可获得时，
+    必须计算"后三季度需达成净利润 = 全年预测 − Q1实际"及其环比倍数。
+    公式：(全年预测 − Q1单季归母) ÷ Q1单季归母 × 100%，
+    Q1单季归母必须从【财报趋势】→单季拆分中取最新一期的"归母净利润"（单位：亿元），
+    禁止使用任何其他数字（如营收、营业利润、全年累计等）代入公式；
+    引用示例："后三季度需达成约XX亿（约Q1的X.X倍，环比+XXX%）"
+13. 分部估值参考（SOTP）：仅当同时提供了【分部利润拆分】和【同行对比】时才做——
     每个分部的估值倍数必须取自同行对比表中可比公司的实际 PE（写明取自哪家），
     给低/高两档得到市值区间，与当前总市值比较，结论只说"当前市值处于/高于/低于
     分部估值区间"；必须标注"极粗略参考，非目标价，未计分部协同与控股折价"；
     亏损分部用 0 或注明无法估值，禁止发明倍数
-13. 避免给出投资建议，仅做客观分析
+14. 避免给出投资建议，仅做客观分析
+15. PB/PE 等估值数据时效性：引用 PE/PB/市值等每日变动数据时，必须注明数据日期
+    （如"PB 4.12（7月23日，股票数据库）"），禁止仅写数值不带时间标签；
+    若研报中提供了券商目标价和评级，必须在"估值分析"节中以矩阵形式汇总：
+    - 列出各券商名称、目标价、评级依据（如"国信证券：36.29元（合理估值）"）
+    - 标注来源为研报，并注明"券商目标价仅供参考，不构成投资建议"
+    - 给出现价相对平均目标价的空间比例
+16. 关键数据点源引用：对创新业务分类/海外业务收入/研发投入等非三表主表数据，必须标注数据来源
+    （如"2025年报披露"、"根据网络研究信息"），禁止仅写数据不标注出处
+
+{NUMBER_ACCURACY_RULE}
 
 {STYLE_RULES}
 
@@ -423,6 +453,15 @@ class AnalystAgent:
 
 ========== 最新一期财务数据(单位：亿元) ==========
 {financial_data}
+
+🔴 关键事实（必须精确引用，禁止修改）：
+- 营收绝对值：{financial_data.get("revenue", "N/A")}亿元
+- 营收同比增速：{financial_data.get("revenue_yoy", "N/A")}%
+- 归母净利润：{financial_data.get("net_income", "N/A")}亿元
+- 归母净利润同比增速：{financial_data.get("profit_yoy", "N/A")}%
+- 毛利率：{financial_data.get("gross_margin", "N/A")}%
+- PE(TTM)：{financial_data.get("pe_ttm", "N/A")}
+- 以上数字由程序从财报精确计算，你在报告中输出的每一个数字必须与此完全一致
 
 ========== 计算出的财务比率 ==========
 {calculated}

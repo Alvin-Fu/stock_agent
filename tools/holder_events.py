@@ -80,7 +80,7 @@ def fetch_holder_events_text(code: str, name: str = "") -> str:
     # 此处不再重复获取，避免LLM输入冗余。
     try:
         block = _df_block("分红送配（留意临近的除权除息日）",
-                          _try_call(["stock_fhps_detail_em"], {"symbol": code}))
+                          _try_call(["stock_fhps_detail_em"], symbol=code))
         if block:
             blocks.append(block)
     except Exception as e:

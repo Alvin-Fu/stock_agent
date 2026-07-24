@@ -190,6 +190,20 @@ def format_etf_report(text: str) -> str:
     return "\n\n".join(output)
 
 
+def _has_financial_data_in_report(text: str) -> bool:
+    """检测全文中是否已包含财务数字（用于判断是否应自动追加财务分析节）"""
+    financial_patterns = [
+        r'营收.*亿', r'净利润.*亿', r'归母.*亿', r'扣非.*亿',
+        r'毛利率.*%', r'净利率.*%', r'经营现金流.*亿',
+        r'同比.*%', r'环比.*%',
+        r'资产负债率.*%', r'流动比率',
+    ]
+    for pattern in financial_patterns:
+        if re.search(pattern, text):
+            return True
+    return False
+
+
 def format_stock_report(text: str) -> str:
     """个股报告后处理：查缺、重排、补占位"""
     if not text or len(text.strip()) < 20:
@@ -210,9 +224,17 @@ def format_stock_report(text: str) -> str:
             if idx not in assignments or len(content) > len(assignments[idx][1]):
                 assignments[idx] = (heading, content)
 
-    # 最后，对"分析局限性说明"增加分类标签
+    # 财务分析节特殊处理：若报告中无独立财务分析标题但其它节已引用财务数字，
+    # 不追加"未覆盖"节，避免与正文矛盾
+    has_financial_data_elsewhere = False
+    if 1 not in assignments:  # 财务分析 是 _STOCK_SECTIONS 的 idx=1
+        has_financial_data_elsewhere = _has_financial_data_in_report(text)
+
     output = []
     for idx, (expected_name, _) in enumerate(_STOCK_SECTIONS):
+        # 跳过财务分析节——财务数字已分散在其它章节中
+        if idx == 1 and has_financial_data_elsewhere:
+            continue
         if idx in assignments:
             _, content = assignments[idx]
             if len(content.strip()) <= _MIN_CONTENT_CHARS:

@@ -34,6 +34,7 @@ from sqlalchemy import (
     text,
     or_,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import (
     declarative_base,
     sessionmaker,
@@ -4957,6 +4958,9 @@ class DatabaseManager:
                     logger.info(f"保存 {code} 利润表数据成功，更新 {len(df)} 条记录")
             except Exception as e:
                 session.rollback()
+                if isinstance(e, IntegrityError) and "UNIQUE constraint" in str(e):
+                    logger.warning(f"[利润表] {code} 并发写入冲突，跳过重复记录")
+                    return saved_count
                 logger.error(f"保存 {code} 利润表数据失败: {e}")
                 raise
 
@@ -5034,6 +5038,9 @@ class DatabaseManager:
                     logger.info(f"保存 {code} 资产负债表数据成功，更新 {len(df)} 条记录")
             except Exception as e:
                 session.rollback()
+                if isinstance(e, IntegrityError) and "UNIQUE constraint" in str(e):
+                    logger.warning(f"[资产负债表] {code} 并发写入冲突，跳过重复记录")
+                    return saved_count
                 logger.error(f"保存 {code} 资产负债表数据失败: {e}")
                 raise
 
@@ -5304,6 +5311,9 @@ class DatabaseManager:
                     logger.info(f"保存 {code} 财务指标数据成功，更新 {len(df)} 条记录")
             except Exception as e:
                 session.rollback()
+                if isinstance(e, IntegrityError) and "UNIQUE constraint" in str(e):
+                    logger.warning(f"[财务指标] {code} 并发写入冲突，跳过重复记录")
+                    return saved_count
                 logger.error(f"保存 {code} 财务指标数据失败: {e}")
                 raise
 
@@ -6067,6 +6077,9 @@ class DatabaseManager:
                 session.commit()
             except Exception as e:
                 session.rollback()
+                if isinstance(e, IntegrityError) and "UNIQUE constraint" in str(e):
+                    logger.warning(f"[限售解禁] {code} 并发写入冲突，跳过重复记录")
+                    return saved_count
                 logger.error(f"保存限售解禁数据失败: {e}")
                 raise
         return saved_count
@@ -6203,6 +6216,11 @@ class DatabaseManager:
                 session.commit()
             except Exception as e:
                 session.rollback()
+                # IntegrityError: 并发下 SELECT 检查后另一请求已 INSERT，忽略即可
+                if "UNIQUE constraint" in str(e) and "stock_block_trade" in str(e):
+                    logger.warning(f"[大宗交易] 并发写入冲突，跳过重复记录: {e}")
+                    saved_count = 0
+                    return saved_count
                 logger.error(f"保存大宗交易数据失败: {e}")
                 raise
         return saved_count
@@ -6743,6 +6761,13 @@ class DatabaseManager:
     # ===== 产业链快照 / 复盘 ================================================
 
     def save_industry_snapshot(self, **kwargs) -> int:
+        """保存产业链快照。candidates/valuation/excluded/watch 为 JSON Text 列，
+        传入 list/dict 时自动序列化，传入 str 原样保存。"""
+        import json
+        _json_cols = {"candidates", "valuation", "excluded", "watch"}
+        for col in _json_cols & kwargs.keys():
+            if not isinstance(kwargs[col], str):
+                kwargs[col] = json.dumps(kwargs[col], ensure_ascii=False)
         with self.get_session() as session:
             try:
                 record = IndustrySnapshot(**kwargs)
@@ -6984,6 +7009,9 @@ class DatabaseManager:
                 logger.info(f"保存 {code} 分红送股数据成功，写入/更新 {saved_count} 条记录")
             except Exception as e:
                 session.rollback()
+                if isinstance(e, IntegrityError) and "UNIQUE constraint" in str(e):
+                    logger.warning(f"[分红送股] {code} 并发写入冲突，跳过重复记录")
+                    return saved_count
                 logger.error(f"保存 {code} 分红送股数据失败: {e}")
                 raise
 
@@ -7406,8 +7434,8 @@ class DatabaseManager:
         with self.get_session() as session:
             try:
                 report_dates = [parse_row_date(d) for d in df['report_date'].tolist()]
-                forecast_orgs = df['forecast_org'].tolist() if 'forecast_org' in df.columns else df.get('org_name', ['']).tolist()
-                forecast_types = df['forecast_type'].tolist() if 'forecast_type' in df.columns else df.get('type', ['']).tolist()
+                forecast_orgs = df['forecast_org'].tolist() if 'forecast_org' in df.columns else (df['org_name'].tolist() if 'org_name' in df.columns else [''])
+                forecast_types = df['forecast_type'].tolist() if 'forecast_type' in df.columns else (df['type'].tolist() if 'type' in df.columns else [''])
                 existing_records = session.execute(
                     select(StockReportRc).where(
                         and_(
