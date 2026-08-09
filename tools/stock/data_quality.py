@@ -5,6 +5,7 @@
 
 import pandas as pd
 import numpy as np
+import threading
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 from enum import Enum
@@ -218,6 +219,7 @@ class DataVersionManager:
 
     def __init__(self):
         self.versions: Dict[str, Dict[str, Dict]] = {}  # {stock_code: {data_type: version_info}}
+        self._lock = threading.Lock()
     
     def record_version(
         self,
@@ -237,23 +239,25 @@ class DataVersionManager:
             record_count: 记录条数
             quality_level: 数据质量等级
         """
-        if stock_code not in self.versions:
-            self.versions[stock_code] = {}
-        
-        self.versions[stock_code][data_type] = {
-            'version': datetime.now().strftime('%Y%m%d%H%M%S'),
-            'timestamp': datetime.now(),
-            'source': source_name,
-            'record_count': record_count,
-            'quality': quality_level.value,
-            'history': self._get_history(stock_code, data_type)
-        }
-        
-        logger.info(f"[版本记录] {stock_code} {data_type} v{self.versions[stock_code][data_type]['version']}")
+        with self._lock:
+            if stock_code not in self.versions:
+                self.versions[stock_code] = {}
+            
+            self.versions[stock_code][data_type] = {
+                'version': datetime.now().strftime('%Y%m%d%H%M%S'),
+                'timestamp': datetime.now(),
+                'source': source_name,
+                'record_count': record_count,
+                'quality': quality_level.value,
+                'history': self._get_history(stock_code, data_type)
+            }
+            
+            logger.info(f"[版本记录] {stock_code} {data_type} v{self.versions[stock_code][data_type]['version']}")
 
     def get_version_info(self, stock_code: str, data_type: str) -> Optional[Dict]:
         """获取版本信息"""
-        return self.versions.get(stock_code, {}).get(data_type)
+        with self._lock:
+            return self.versions.get(stock_code, {}).get(data_type)
 
     def _get_history(self, stock_code: str, data_type: str) -> List[Dict]:
         """获取历史版本记录（保留最近5条）"""
@@ -269,14 +273,15 @@ class DataVersionManager:
     def get_stock_version_summary(self, stock_code: str) -> Dict[str, Dict]:
         """获取股票的所有数据类型版本摘要"""
         summary = {}
-        if stock_code in self.versions:
-            for data_type, version_info in self.versions[stock_code].items():
-                summary[data_type] = {
-                    'version': version_info['version'],
-                    'updated_at': version_info['timestamp'].strftime('%Y-%m-%d %H:%M'),
-                    'source': version_info['source'],
-                    'quality': version_info['quality']
-                }
+        with self._lock:
+            if stock_code in self.versions:
+                for data_type, version_info in self.versions[stock_code].items():
+                    summary[data_type] = {
+                        'version': version_info['version'],
+                        'updated_at': version_info['timestamp'].strftime('%Y-%m-%d %H:%M'),
+                        'source': version_info['source'],
+                        'quality': version_info['quality']
+                    }
         return summary
 
 
@@ -293,28 +298,34 @@ class DataCleaner:
     @classmethod
     def fill_missing_values(cls, df: pd.DataFrame) -> pd.DataFrame:
         """
-        填充缺失值
-        
+        处理缺失值（停牌日/数据源空缺）
+
         策略：
-        - 价格类数据：使用前后值插值
-        - 成交量：使用0或均值填充
+        - 价格类数据：前值填充（ffill）而非线性插值，避免创造假价格
+        - 成交量：填 0（停牌日确实无成交）
+        - 涨跌幅：填 0（停牌日无涨跌）
+        - 标注 is_synthetic 列，让下游知道哪些行是填充的
         """
         df = df.copy()
-        
-        # 价格列使用线性插值
+
+        # 标注哪些行原本就有缺失（供下游技术指标计算跳过/降权）
         price_cols = ['open', 'high', 'low', 'close']
-        for col in price_cols:
-            if col in df.columns:
-                df[col] = df[col].interpolate(method='linear')
-        
-        # 成交量使用0填充
+        existing_price_cols = [c for c in price_cols if c in df.columns]
+        if existing_price_cols:
+            df['_is_synthetic'] = df[existing_price_cols].isna().any(axis=1)
+
+        # 价格列：前值填充（不用线性插值——插值会创造不存在的价格，污染 MA/MACD 等指标）
+        for col in existing_price_cols:
+            df[col] = df[col].ffill().bfill()  # 先前值后后值，首行缺失用后值兜底
+
+        # 成交量：停牌日确实无成交，填 0
         if 'volume' in df.columns:
             df['volume'] = df['volume'].fillna(0)
-        
-        # 百分比变化使用0填充
+
+        # 涨跌幅：停牌日无涨跌，填 0
         if 'pct_chg' in df.columns:
             df['pct_chg'] = df['pct_chg'].fillna(0)
-        
+
         return df
 
     @classmethod

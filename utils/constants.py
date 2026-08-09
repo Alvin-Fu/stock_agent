@@ -11,6 +11,7 @@ class IntentType:
     COMPLIANCE_CHECK = "compliance_check"  # 合规性审查
     TECHNICAL_ANALYSIS = "technical_analysis"  # 技术分析（均线、MACD等）
     INDUSTRY_ANALYSIS = "industry_analysis"  # 行业分析（产业、产业链、龙头）
+    MACRO = "macro_analysis"  # 宏观分析（降息/加息/MLF/LPR/CPI/PMI/M2/社融/美债/汇率等宏观事件对市场/行业的影响）
     GENERAL_CHAT = "general_chat"  # 闲聊/问候
     UNKNOWN = "unknown"  # 无法识别
 

@@ -526,16 +526,22 @@ def _search_zhihu_global(query: str) -> str:
 
 
 # 引擎链：按顺序尝试，先出结果者胜（存函数名运行时查表，便于测试替换单个引擎）
-# 知乎最稳定放首位；Tavily 限流时快速失败；SearXNG 本地无限制兜底；DuckDuckGo 最后防线。
-# 已移除以下长超时/不可用引擎以加速降级：
-#   Brave（30s 超时）、SerpAPI（无额度）、TheNewsAPI（不稳定）、
-#   Google 免费（未安装）、Chrome（headless 浏览器的 20s+ 启动/超时）
+# 知乎最稳定放首位；Tavily 限流时快速失败；SearXNG 本地无限制兜底；DuckDuckGo 之后
+# 再追加 6 个已实现引擎作为最后兜底——未配 key / 依赖缺失时函数内部静默返回空串，
+# 自动跳到下一个引擎，不会报错中断。
 _PROVIDERS = (
     ("Zhihu(全网)", "_search_zhihu_global"),
     ("Tavily", "_search_tavily"),
     ("SearXNG(本地)", "_search_searxng"),
     ("DuckDuckGo", "_search_ddg"),
     ("DuckDuckGo(SSL备用)", "_search_ddg_fallback"),
+    # —— 以下为最后兜底引擎（未配 key / 依赖缺失时返回空串，自动跳过）——
+    ("Brave", "_search_brave"),
+    ("SerpAPI", "_search_serpapi"),
+    ("TheNewsAPI", "_search_thenewsapi"),
+    ("Google免费", "_search_google_free"),
+    ("Google API", "_search_google_api"),
+    ("Chrome", "_search_chrome"),
 )
 
 # ────────────────────────────── 搜索日志持久化 ──────────────────────────────

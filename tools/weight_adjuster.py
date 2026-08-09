@@ -45,9 +45,12 @@ DEFAULT_TECH_WEIGHTS: Dict[str, float] = {
 }
 
 DEFAULT_PE_ADJUSTMENTS: Dict[str, float] = {
-    "pct_ge_80": -1.0,
-    "pct_ge_60": -0.5,
-    "pct_le_30": 0.5,
+    "pe_gt_200": -1.5,   # 绝对PE > 200（极端泡沫）
+    "pe_gt_100": -1.0,   # 绝对PE > 100（高PE）
+    "pct_ge_80": -1.0,   # PE分位 >= 80
+    "pct_ge_60": -0.5,   # PE分位 >= 60
+    "pct_le_30": 0.5,    # PE分位 <= 30（低估）
+    "dual_high": -1.5,   # 分位>=80 且 绝对PE>100（双高叠加扣分）
 }
 
 # 单次最大调整幅度
@@ -103,21 +106,35 @@ def _load_weights_from_config() -> Dict[str, Any]:
 
 
 def _save_weights_to_config(weights_section: Dict[str, Any]) -> bool:
-    """将 weights 段写回 local.yaml（只改 weights，不动其他段）"""
+    """将 weights 段写回 local.yaml（只改 weights，不动其他段）
+
+    使用 fcntl 文件锁防止复盘调权和阈值校准并发写入时相互覆盖。
+    """
     try:
+        import fcntl
         from utils.config import PROJECT_ROOT
         path = os.path.join(PROJECT_ROOT, "local.yaml")
         if not os.path.exists(path):
             logger.warning(f"[weight_adjuster] local.yaml 不存在，跳过写入: {path}")
             return False
 
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-
-        cfg["weights"] = weights_section
-
-        with open(path, "w", encoding="utf-8") as f:
-            yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        # 加排他锁：读-改-写整个流程原子化，防止并发进程相互覆盖
+        with open(path, "r+", encoding="utf-8") as f:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except (IOError, OSError):
+                pass  # 锁失败不阻断写入（非关键路径），但记录警告
+            try:
+                cfg = yaml.safe_load(f) or {}
+                cfg["weights"] = weights_section
+                f.seek(0)
+                f.truncate()
+                yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            finally:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except (IOError, OSError):
+                    pass
 
         logger.info("[weight_adjuster] 权重已写回 %s", path)
         return True
@@ -142,9 +159,17 @@ def get_stage_weights() -> Dict[str, Dict[str, float]]:
     return copy.deepcopy(DEFAULT_STAGE_WEIGHTS)
 
 
-def get_tech_weights() -> Dict[str, float]:
-    """获取技术多周期权重（daily/weekly/monthly）"""
+def get_tech_weights(code: str = None) -> Dict[str, float]:
+    """获取技术多周期权重（daily/weekly/monthly）。
+
+    支持按标的隔离：传 code 时优先读该标的专属权重（tech_weights_by_code[code]），
+    无专属配置则回退全局 tech_weights，再回退默认值。
+    """
     cfg = _load_weights_from_config()
+    if code:
+        by_code = cfg.get("tech_weights_by_code") or {}
+        if isinstance(by_code, dict) and code in by_code and isinstance(by_code[code], dict):
+            return copy.deepcopy(by_code[code])
     stored = cfg.get("tech_weights")
     if stored and isinstance(stored, dict):
         return copy.deepcopy(stored)
@@ -152,12 +177,20 @@ def get_tech_weights() -> Dict[str, float]:
 
 
 def get_pe_adjustments() -> Dict[str, float]:
-    """获取 PE 预期差调整阈值"""
+    """获取 PE 预期差调整阈值。
+
+    以默认值为基准，叠加 config 中已配置的键：老 config 只存了 3 个分位键，
+    新默认里的绝对 PE / 双高键（pe_gt_200/pe_gt_100/dual_high）自动补默认值，
+    避免旧配置覆盖掉新增的键。
+    """
     cfg = _load_weights_from_config()
+    merged = copy.deepcopy(DEFAULT_PE_ADJUSTMENTS)
     stored = cfg.get("pe_adjustments")
     if stored and isinstance(stored, dict):
-        return copy.deepcopy(stored)
-    return copy.deepcopy(DEFAULT_PE_ADJUSTMENTS)
+        for k, v in stored.items():
+            if isinstance(v, (int, float)):
+                merged[k] = float(v)
+    return merged
 
 
 # ======================================================================
@@ -167,10 +200,15 @@ def get_pe_adjustments() -> Dict[str, float]:
 def apply_review_adjustment(
     error_pattern: str,
     source_info: str = "",
+    code: str = None,
 ) -> bool:
     """
     复盘入口：根据误判类别自动微调权重，写回 config。
     返回 True=已调整, False=无需调整或调整失败。
+
+    技术类误判支持按标的隔离：传 code 时只调整该股票的技术权重
+    （存 tech_weights_by_code[code]，不影响其他股票），不传则调全局。
+    阶段类误判仍调全局（产业链综合评分本就是全局口径）。
 
     外部只需调这一个函数，内部自动处理：
     读取当前权重 → 叠加 delta → 钳制边界 → 归一化 → 写回 + 记日志
@@ -185,10 +223,11 @@ def apply_review_adjustment(
     clamp = rule.get("clamp", {})
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    log_entry = f"[{now_str}] {source_info} → {error_pattern} → {changes}"
+    scope = f"{source_info}（code={code}）" if code else source_info
+    log_entry = f"[{now_str}] {scope} → {error_pattern} → {changes}"
 
     if wtype == "tech":
-        return _adjust_tech_weights(changes, clamp, log_entry)
+        return _adjust_tech_weights(changes, clamp, log_entry, code=code)
     elif wtype == "stage":
         return _adjust_stage_weights(changes, clamp, log_entry)
 
@@ -199,9 +238,15 @@ def _adjust_tech_weights(
     changes: Dict[str, float],
     clamp: Dict[str, tuple],
     log_entry: str,
+    code: str = None,
 ) -> bool:
-    """调整技术权重（daily/weekly/monthly）"""
-    current = get_tech_weights()
+    """调整技术权重（daily/weekly/monthly）。
+
+    code 传入时只调整该标的专属权重（tech_weights_by_code[code]），
+    不传则调整全局 tech_weights。初始状态从 get_tech_weights(code) 取，
+    保证 per-code 配置缺省时继承全局默认值再叠加 delta。
+    """
+    current = get_tech_weights(code=code)
 
     for key, delta in changes.items():
         if key in current:
@@ -219,9 +264,17 @@ def _adjust_tech_weights(
             current[key] = new_val
             logger.info(f"[weight_adjuster] tech.{key}: {old} → {new_val}")
 
-    # 加载完整 weights 段，合并写入
+    # 加载完整 weights 段，按作用域写入（per-code 或全局）
     cfg = _load_weights_from_config()
-    cfg["tech_weights"] = current
+    if code:
+        by_code = cfg.get("tech_weights_by_code") or {}
+        if not isinstance(by_code, dict):
+            by_code = {}
+        by_code[code] = current
+        cfg["tech_weights_by_code"] = by_code
+        logger.info(f"[weight_adjuster] 技术权重按标的隔离写入 tech_weights_by_code[{code}]")
+    else:
+        cfg["tech_weights"] = current
     # 调权日志
     log = cfg.get("adjustment_log") or []
     log.append(log_entry)

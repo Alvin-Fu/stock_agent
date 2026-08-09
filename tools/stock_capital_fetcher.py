@@ -136,8 +136,10 @@ def fetch_north_bound_holdings(codes: List[str]) -> Dict[str, Dict[str, Any]]:
             result = {}
             for code in codes:
                 try:
-                    df = tf.hk_hold(f"{code}.SZ" if code.startswith(("0", "3"))
-                                    else f"{code}.SH", start, end)
+                    ts_code = (f"{code}.SZ" if code.startswith(("0", "3"))
+                               else (f"{code}.BJ" if code.startswith(("8", "4", "92"))
+                                     else f"{code}.SH"))
+                    df = tf.hk_hold(ts_code, start, end)
                     if df is not None and not df.empty:
                         latest = df.iloc[-1]
                         vol = _safe_float(latest.get("vol"), 0)
@@ -348,7 +350,9 @@ def fetch_shareholder_count(codes: List[str]) -> Dict[str, Dict[str, Any]]:
             result = {}
             for code in codes:
                 try:
-                    ts_code = f"{code}.SZ" if code.startswith(("0", "3")) else f"{code}.SH"
+                    ts_code = (f"{code}.SZ" if code.startswith(("0", "3"))
+                               else (f"{code}.BJ" if code.startswith(("8", "4", "92"))
+                                     else f"{code}.SH"))
                     df = tf.holdernumber(ts_code, start, end)
                     if df is not None and not df.empty:
                         # 按 end_date 降序排列，最新的在前

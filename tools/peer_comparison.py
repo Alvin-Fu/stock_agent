@@ -253,133 +253,40 @@ def _try_board_cons_cached(stock_code: str, industry: str) -> Optional[pd.DataFr
 
 def fetch_peer_comparison(stock_code: str, industry: str = "汽车整车") -> str:
     """
-    拉取行业板块成分股，逐只获取估值与财务指标，返回格式化 markdown 对标表格。
-    含 3 层降级：akshare(3次重试) → Tushare → DB缓存(24h) → 返回空
+    拉取同行对比对标表格。
+
+    说明：本函数已统一委托至 `tools.peer_compare.fetch_peer_table` 实现，
+    后者通过 DB 的 stock_basic 表获取同行（tushare 口径行业），具备线程安全的
+    当日快照缓存与 MAX_PEERS 限制，与 `agents/financial_analyst/analyst.py`
+    调用的同一实现保持一致，消除项目中两套重复的同行对比逻辑。
+    `industry` 参数仅为接口兼容保留，统一实现从 DB 获取行业信息，不再使用。
 
     Parameters
     ----------
     stock_code : str
         目标个股代码（6 位数字字符串）
     industry : str
-        东财行业板块名称，默认为"汽车整车"
+        历史遗留参数（东财行业板块名称，默认"汽车整车"）；统一实现从 DB
+        stock_basic 表读取行业，此处保留仅为接口兼容，不再参与逻辑。
 
     Returns
     -------
     str
-        格式化的 markdown 对标表格字符串。
+        格式化的 markdown 对标表格字符串；任一环节失败返回空字符串。
     """
-
-    # ---- Step 1: 获取行业板块成分股（含3层降级） ----
-    cons_df = None
-
-    # 第1层：akshare（3次重试 + 指数退避）
-    cons_df = _try_board_cons_akshare(industry)
-
-    # 第2层：Tushare fallback
-    if cons_df is None:
-        cons_df = _try_board_cons_tushare(industry)
-
-    # 第3层：DB缓存
-    if cons_df is None:
-        cons_df = _try_board_cons_cached(stock_code, industry)
-
-    # 如果 akshare 或 Tushare 获取成功，写入DB缓存供下次加速使用
-    if cons_df is not None and not cons_df.empty:
-        try:
-            from storage.sqlite.stock_storage import get_db
-            db = get_db()
-            db.set_cached_peer_cons(industry, cons_df)
-        except Exception as e:
-            logger.debug(f"[同业对标] 写入DB缓存失败（不影响本次分析）: {e}")
-
-    if cons_df is None:
-        logger.warning(f"[同业对标] 3层降级均失败，板块「{industry}」成分股获取失败")
-        return ""
-
-    # ---- Step 2: 获取全市场快照匹配 PE/PB/市值 ----
-    spot_map = _build_spot_map()
-
-    # ---- Step 3: 逐只组装数据 ----
-    peers = []
-    target_row = None
-
-    for _, row in cons_df.iterrows():
-        code = str(row.get("代码", "")).strip().zfill(6)
-        name = str(row.get("名称", "")).strip()
-        if not code or not name:
-            continue
-
-        # 从快照获取 PE/PB/市值
-        spot = spot_map.get(code, {})
-        pe = spot.get("pe")
-        pb = spot.get("pb")
-        mv = spot.get("mv")
-
-        # 尝试从板块成分股数据直接获取市值（如果快照没有的话）
-        if mv is None:
-            mv_raw = _safe_float(row.get("总市值"))
-            if mv_raw:
-                mv = round(mv_raw / 1e8, 2)
-
-        # 获取财务指标
-        fin = _fetch_financial_indicators(code)
-        gross_margin = fin.get("gross_margin")
-        rev_growth = fin.get("rev_growth")
-        np_growth = fin.get("np_growth")
-
-        entry = {
-            "code": code,
-            "name": name,
-            "mv": mv,
-            "pe": pe,
-            "pb": pb,
-            "gross_margin": gross_margin,
-            "rev_growth": rev_growth,
-            "np_growth": np_growth,
-        }
-
-        if code == stock_code:
-            target_row = entry
-        else:
-            peers.append(entry)
-
-    # ---- Step 4: 按市值降序排列同行 ----
-    peers.sort(key=lambda x: x["mv"] if x["mv"] is not None else 0, reverse=True)
-
-    # ---- Step 5: 组装表格 ----
-    lines = []
-    if target_row:
-        lines.append(f"### 同业横向对标：{target_row['name']}（{stock_code}）vs {industry}板块\n")
-    else:
-        lines.append(f"### 同业横向对标：{stock_code} vs {industry}板块\n")
-        logger.info(f"[同业对标] 目标代码 {stock_code} 未在板块成分股中找到，仅展示同业数据")
-
-    # 表头
-    header = "| 公司 | 代码 | 总市值(亿) | PE(TTM) | PB | 毛利率(%) | 营收增速(%) | 净利润增速(%) |"
-    sep = "|------|------|-----------|---------|-----|-----------|-------------|---------------|"
-    lines.append(header)
-    lines.append(sep)
-
-    # 目标公司行（优先展示）
-    if target_row:
-        lines.append(_format_table_row(target_row, is_target=True))
-
-    # 同业公司行
-    for peer in peers:
-        lines.append(_format_table_row(peer, is_target=False))
-
-    result = "\n".join(lines)
-    logger.info(f"[同业对标] 表格生成完成，共 {1 + len(peers)} 行（含目标公司）")
-
-    # ---- 成功时写入 DB 缓存 ----
+    # 统一实现：委托至 peer_compare.fetch_peer_table，取返回元组的文本部分
     try:
-        from storage.sqlite.stock_storage import get_db
-        db = get_db()
-        db.save_peer_cons_cache(industry, cons_df)
+        from tools.peer_compare import fetch_peer_table
+        text, _rows = fetch_peer_table(stock_code)
+        if text:
+            return text
+        # fetch_peer_table 返回空字符串（无行业信息/无同行/快照失败等），
+        # 保持原有降级行为：返回空字符串
+        logger.info(f"[同业对标] fetch_peer_table 未返回内容，{stock_code} 同行对比为空")
+        return ""
     except Exception as e:
-        logger.debug(f"[同业对标] 缓存写入失败（不影响返回）: {e}")
-
-    return result
+        logger.warning(f"[同业对标] 委托 fetch_peer_table 失败 {stock_code}: {e}")
+        return ""
 
 
 def _format_table_row(entry: dict, is_target: bool = False) -> str:

@@ -8,6 +8,7 @@ from utils.common import TASK_NAME_DAILY_TASK, parse_row_date
 from datetime import date
 from .stock.tushare_fetcher import TushareFetcher
 from .stock.akshare_fetcher import AkshareFetcher
+from .stock.cache_manager import cache_manager
 from langchain_core.tools import StructuredTool
 import traceback
 from pydantic import BaseModel, Field
@@ -129,6 +130,8 @@ class StockTools:
                 return old_daily_data
             # 重拉成功后再删除旧数据，避免拉取失败导致本地数据丢失
             self.db.delete_daily_data(stock_code)
+            # 漂移重拉：同步失效 L1 内存 / L2 文件缓存，避免下游读到旧基准数据
+            cache_manager.invalidate_by_stock(stock_code, 'daily')
         save_count = self.db.save_daily_data(daily_datas, stock_code, start_date, fetcher_name)
         logger.info(f"保存的数据为[{save_count}]")
         return daily_datas
@@ -181,6 +184,8 @@ class StockTools:
                 return old_monthly_data
             # 重拉成功后再删除旧数据，避免拉取失败导致本地数据丢失
             self.db.delete_month_data(stock_code)
+            # 漂移重拉：同步失效 L1 内存 / L2 文件缓存，避免下游读到旧基准数据
+            cache_manager.invalidate_by_stock(stock_code, 'month')
         save_count = self.db.save_month_data(monthly_datas, stock_code, start_date, fetcher_name)
         logger.info(f"保存的数据为[{save_count}]")
         return monthly_datas
@@ -234,6 +239,8 @@ class StockTools:
                 return old_weekly_data
             # 重拉成功后再删除旧数据，避免拉取失败导致本地数据丢失
             self.db.delete_week_data(stock_code)
+            # 漂移重拉：同步失效 L1 内存 / L2 文件缓存，避免下游读到旧基准数据
+            cache_manager.invalidate_by_stock(stock_code, 'week')
         save_count = self.db.save_week_data(weekly_datas, stock_code, start_date, fetcher_name)
         logger.info(f"保存的数据为[{save_count}]")
         return weekly_datas
@@ -690,11 +697,11 @@ class StockTools:
             sml_col = _match_col("小单净流入-净额")
 
             def _parse_ak_val(v):
-                """AkShare 资金净额已是 float（元），直接返回；None 返回 0.0"""
+                """AkShare 资金净额单位为元，转换为万元（与 Tushare/下游代码一致）"""
                 if v is None:
                     return 0.0
                 try:
-                    return float(v)
+                    return float(v) / 1e4
                 except (ValueError, TypeError):
                     return 0.0
 
@@ -720,6 +727,24 @@ class StockTools:
             logger.warning(f"[AkShare资金流] 获取失败: {e}")
             return None
 
+    @staticmethod
+    def _normalize_moneyflow(df: pd.DataFrame) -> pd.DataFrame:
+        """统一修正资金流数据：用 大单+超大单净买入 重算主力净流入。
+
+        Tushare 的 net_mf_amount 字段值与 buy/sell 列对不上（差约12倍），
+        统一按 主力=大单+超大单 的标准定义重新计算，单位：万元。
+        """
+        if df is None or df.empty:
+            return df
+        df = df.copy()
+        has_lg = all(c in df.columns for c in ['buy_lg_amount', 'sell_lg_amount'])
+        has_elg = all(c in df.columns for c in ['buy_elg_amount', 'sell_elg_amount'])
+        if has_lg or has_elg:
+            lg_net = pd.to_numeric(df['buy_lg_amount'], errors='coerce').fillna(0) - pd.to_numeric(df['sell_lg_amount'], errors='coerce').fillna(0) if has_lg else 0
+            elg_net = pd.to_numeric(df['buy_elg_amount'], errors='coerce').fillna(0) - pd.to_numeric(df['sell_elg_amount'], errors='coerce').fillna(0) if has_elg else 0
+            df['net_mf_amount'] = lg_net + elg_net
+        return df
+
     def fetch_and_save_stock_moneyflow(self, stock_code: str) -> Union[pd.DataFrame, None]:
         """获取并保存个股资金流向数据（按日增量更新，DB缓存 + AkShare兜底）
 
@@ -734,6 +759,8 @@ class StockTools:
         try:
             old = self.db.get_stock_moneyflow(stock_code, 1)
             if old is not None and not old.empty:
+                # 旧缓存可能是错误的 net_mf_amount，先修正再判断
+                old = self._normalize_moneyflow(old)
                 latest_date = old.iloc[0].get('trade_date')
                 if latest_date is not None:
                     try:
@@ -742,7 +769,7 @@ class StockTools:
                         days_gap = (today - latest).days
                         if days_gap == 0:
                             latest_mf = pd.to_numeric(old.iloc[0].get('net_mf_amount', 0), errors='coerce') or 0
-                            if abs(latest_mf) >= 500:  # 500万元（文档单位：万元）
+                            if abs(latest_mf) >= 500:  # 500万元
                                 logger.info(f"个股资金流向[{stock_code}]最新数据为{latest_date}，缓存有效")
                                 return old
                             else:
@@ -766,12 +793,14 @@ class StockTools:
 
             # 1. 先尝试 Tushare
             df = self.tushare.moneyflow(stock_code, trade_date='', start_date=start, end_date=end)
-            # 2. 校验 Tushare 数据是否合理：最新一天的 net_mf_amount 若绝对值 < 500万元，可能数据异常
-            df_valid = False
             if df is not None and not df.empty:
                 df = df.sort_values('trade_date', ascending=False).reset_index(drop=True)
+                df = self._normalize_moneyflow(df)
+            # 2. 校验 Tushare 数据是否合理：最新一天的主力净流若绝对值 < 500万元，可能数据异常
+            df_valid = False
+            if df is not None and not df.empty:
                 latest_mf = pd.to_numeric(df.iloc[0].get('net_mf_amount', 0), errors='coerce') or 0
-                if abs(latest_mf) >= 500:  # 500万元（文档单位：万元）
+                if abs(latest_mf) >= 500:  # 500万元
                     df_valid = True
                 else:
                     logger.warning(f"[资金流向] Tushare 数据异常: 最新日主力净流={latest_mf:.0f}万元，尝试 AkShare 兜底")
@@ -791,12 +820,12 @@ class StockTools:
                     ak_df['trade_date'] = ak_df['trade_date'].astype(str)
                     save_count = self.db.save_stock_moneyflow(ak_df, stock_code)
                     logger.info(f"保存股票[{stock_code}]个股资金流向成功（AkShare兜底），新增[{save_count}]条记录")
-                    df = self.db.get_stock_moneyflow(stock_code)
+                    df = self._normalize_moneyflow(self.db.get_stock_moneyflow(stock_code))
                 elif df is not None and not df.empty:
                     # AkShare 也失败，但 Tushare 有数据（虽然异常），仍保存并返回
                     save_count = self.db.save_stock_moneyflow(df, stock_code)
                     logger.info(f"保存股票[{stock_code}]个股资金流向成功（Tushare原样），新增[{save_count}]条记录")
-                    df = self.db.get_stock_moneyflow(stock_code)
+                    df = self._normalize_moneyflow(self.db.get_stock_moneyflow(stock_code))
                 else:
                     if old is not None and not old.empty:
                         logger.warning(f"[资金流向] 双源皆失败，返回缓存（最新{latest_date}）")
@@ -805,7 +834,7 @@ class StockTools:
             else:
                 save_count = self.db.save_stock_moneyflow(df, stock_code)
                 logger.info(f"保存股票[{stock_code}]个股资金流向成功，新增[{save_count}]条记录")
-                df = self.db.get_stock_moneyflow(stock_code)
+                df = self._normalize_moneyflow(self.db.get_stock_moneyflow(stock_code))
 
             return df
         except Exception as e:
@@ -3181,18 +3210,58 @@ def _format_fina_indicator(df: pd.DataFrame, stock_code: str) -> str:
             return "N/A"
         return f"{v:.2f}"
 
+    def _period_type(rd):
+        """判断报告期类型：年报/半年报/一季报/三季报"""
+        if rd.month == 12:
+            return "年报"
+        elif rd.month == 6:
+            return "半年报"
+        elif rd.month == 3:
+            return "一季报"
+        elif rd.month == 9:
+            return "三季报"
+        else:
+            return f"{rd.month}月报"
+
     latest = df.iloc[0]
     latest_rd = latest['report_date']
+    latest_period = _period_type(latest_rd)
 
     lines = [f"✅ 【{stock_code} 财务指标】共 {len(df)} 个报告期"]
-    lines.append(f"📅 最新报告期: {latest_rd.strftime('%Y-%m-%d')}")
+    lines.append(f"📅 最新报告期: {latest_rd.strftime('%Y-%m-%d')}（{latest_period}）")
 
-    lines.append("\n💰 盈利能力:")
+    total_revenue = None
+    net_profit = None
+    try:
+        from storage.sqlite.stock_storage import get_db
+        db = get_db()
+        inc_df = db.get_stock_income(stock_code)
+        if inc_df is not None and not inc_df.empty:
+            inc_df = inc_df.copy()
+            inc_df['_rd'] = pd.to_datetime(inc_df['report_date'], errors='coerce')
+            inc_df = inc_df.sort_values('_rd', ascending=False)
+            latest_inc = inc_df.iloc[0]
+            total_revenue = latest_inc.get('total_revenue')
+            net_profit = latest_inc.get('net_profit')
+            if total_revenue is not None:
+                total_revenue = float(total_revenue) / 1e8
+            if net_profit is not None:
+                net_profit = float(net_profit) / 1e8
+    except Exception:
+        pass
+
+    lines.append("\n💰 核心财务数据:")
+    if total_revenue is not None:
+        lines.append(f"  - 营业收入: {total_revenue:.2f}亿元")
+    if net_profit is not None:
+        lines.append(f"  - 归母净利润: {net_profit:.2f}亿元")
+    lines.append(f"  - 每股收益 EPS: {_ratio(latest.get('eps'))}元")
+
+    lines.append("\n📊 盈利能力:")
     lines.append(f"  - ROE（净资产收益率）: {_pct(latest.get('roe'))}")
     lines.append(f"  - ROA（总资产收益率）: {_pct(latest.get('roa'))}")
     lines.append(f"  - 销售毛利率: {_pct(latest.get('gross_margin'))}")
     lines.append(f"  - 销售净利率: {_pct(latest.get('netprofit_margin'))}")
-    lines.append(f"  - 每股收益 EPS: {_ratio(latest.get('eps'))}元")
 
     lines.append("\n⚙️ 运营能力:")
     inv_turn = _num(latest.get('inv_turn'))
@@ -3786,15 +3855,95 @@ def _format_share_float(df: pd.DataFrame, stock_code: str) -> str:
 
 
 def _format_broker_recommend(df: pd.DataFrame, stock_code: str) -> str:
-    """格式化分析师评级"""
+    """格式化分析师评级（含目标价矩阵：区间/中位数/机构明细/上行空间）"""
     if df is None or df.empty:
         return f"❌ 近3个月暂无 {stock_code} 的分析师评级"
     df = df.copy()
-    broker_counts = df.groupby('broker').size().sort_values(ascending=False)
 
-    lines = [f"✅ 【{stock_code} 分析师评级】近3个月共 {len(df)} 家券商覆盖"]
-    lines.append(f"覆盖券商 (Top5): {', '.join(broker_counts.head(5).index.tolist())}")
-    lines.append(f"\n💡 解读: 券商覆盖数量多通常意味着市场关注度高、信息透明度好。")
+    # 去重：同一机构取最新一条
+    if 'month' in df.columns:
+        df = df.sort_values('month', ascending=False)
+    df = df.drop_duplicates(subset=['broker'], keep='first')
+
+    broker_counts_orig = df.groupby('broker').size().sort_values(ascending=False)
+    total_recs = len(df)
+
+    lines = [f"✅ 【{stock_code} 分析师评级】近3个月共 {total_recs} 家券商覆盖"]
+    lines.append(f"覆盖券商 (Top5): {', '.join(broker_counts_orig.head(5).index.tolist())}")
+
+    # 评级分布
+    rating_col = None
+    for col in df.columns:
+        if str(col).lower() in ('rating', '评级', 'rating_3y'):
+            rating_col = col
+            break
+    if rating_col and rating_col in df.columns:
+        ratings = df[rating_col].dropna()
+        if not ratings.empty:
+            rating_dist = ratings.value_counts()
+            lines.append(f"评级分布: {', '.join(f'{k}({v}家)' for k, v in rating_dist.items())}")
+
+    # 目标价矩阵
+    target_col = None
+    for col in df.columns:
+        cl = str(col).lower()
+        if 'target' in cl and 'price' in cl:
+            target_col = col
+            break
+        if cl in ('target_price', '目标价', 'target'):
+            target_col = col
+            break
+
+    if target_col and target_col in df.columns:
+        tp_series = pd.to_numeric(df[target_col], errors='coerce').dropna()
+        tp_series = tp_series[tp_series > 0]
+        if not tp_series.empty:
+            tp_min = tp_series.min()
+            tp_max = tp_series.max()
+            tp_mean = tp_series.mean()
+            tp_median = tp_series.median()
+
+            # 获取现价
+            current_price = None
+            try:
+                from storage.sqlite.stock_storage import get_db
+                daily_df = get_db().get_all_daily_data(stock_code)
+                if daily_df is not None and not daily_df.empty:
+                    current_price = float(daily_df.iloc[0].get("close") or 0)
+            except Exception:
+                pass
+
+            lines.append(f"\n【目标价矩阵（{len(tp_series)}家机构给出目标价）】")
+            lines.append(f"  区间: {tp_min:.2f} ~ {tp_max:.2f} 元")
+            lines.append(f"  均值: {tp_mean:.2f} 元 | 中位数: {tp_median:.2f} 元")
+            if current_price and current_price > 0:
+                upside_mean = (tp_mean - current_price) / current_price * 100
+                upside_median = (tp_median - current_price) / current_price * 100
+                lines.append(f"  现价: {current_price:.2f} 元")
+                lines.append(f"  上行空间（均值）: {upside_mean:+.1f}% | （中位数）: {upside_median:+.1f}%")
+
+            # 机构目标价明细（按目标价降序）
+            lines.append(f"\n  机构目标价明细:")
+            detail_df = df[[target_col, 'broker']].copy()
+            if rating_col and rating_col in df.columns:
+                detail_df[rating_col] = df[rating_col]
+            detail_df[target_col] = pd.to_numeric(detail_df[target_col], errors='coerce')
+            detail_df = detail_df.dropna(subset=[target_col])
+            detail_df = detail_df[detail_df[target_col] > 0]
+            detail_df = detail_df.sort_values(target_col, ascending=False)
+            for _, row in detail_df.head(15).iterrows():
+                tp = row[target_col]
+                broker = row['broker']
+                rating_str = f" [{row[rating_col]}]" if rating_col and pd.notna(row.get(rating_col)) else ""
+                if current_price and current_price > 0:
+                    upside = (tp - current_price) / current_price * 100
+                    lines.append(f"    {broker}{rating_str}: {tp:.2f} 元（{upside:+.1f}%）")
+                else:
+                    lines.append(f"    {broker}{rating_str}: {tp:.2f} 元")
+
+    lines.append(f"\n💡 解读: 券商覆盖数量多通常意味着市场关注度高、信息透明度好。"
+                 "目标价中枢高于现价表示机构看好，但需结合评级和研报逻辑综合判断。"
+                 "目标价区间较窄表示机构分歧小，区间较宽需关注分歧原因。")
     return "\n".join(lines)
 
 
@@ -3944,10 +4093,50 @@ def _format_macro_data(df: pd.DataFrame, indicator_name: str) -> str:
 
 
 def _format_margin(df: pd.DataFrame, stock_code: str) -> str:
-    """格式化融资融券汇总数据"""
+    """格式化融资融券汇总数据（含占流通市值比例+近一年分位）"""
     if df is None or df.empty:
         return ""
+    df = df.copy()
+    # 获取流通市值用于计算融资余额占比
+    circ_mv = None
+    try:
+        from storage.sqlite.stock_storage import get_db
+        from tools.stock.tushare_fetcher import TushareFetcher
+        fetcher = TushareFetcher()
+        if fetcher._api is not None:
+            from datetime import date, timedelta
+            end_date = date.today().strftime("%Y-%m-%d")
+            start_date = (date.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+            basic_df = fetcher.daily_basic(stock_code, start_date=start_date, end_date=end_date)
+            if basic_df is not None and not basic_df.empty:
+                circ_mv = float(basic_df.iloc[0].get("circ_mv") or 0) / 10000  # 万元→亿元
+    except Exception:
+        pass
+
+    # 计算近一年融资余额分位
+    rzye_history = []
+    for _, row in df.iterrows():
+        try:
+            val = float(row.get('rzye', 0) or 0)
+            if val > 0:
+                rzye_history.append(val)
+        except (TypeError, ValueError):
+            pass
+    rzye_quantile = None
+    if rzye_history:
+        latest_rzye = rzye_history[0]
+        sorted_vals = sorted(rzye_history)
+        rank = sum(1 for v in sorted_vals if v <= latest_rzye)
+        rzye_quantile = round(rank / len(sorted_vals) * 100, 1)
+
     lines = [f"【融资融券汇总（来源：Tushare）】"]
+    if circ_mv and rzye_history:
+        latest_rzye = rzye_history[0]
+        ratio = latest_rzye / circ_mv * 100 if circ_mv > 0 else None
+        lines.append(f"  ▶ 汇总：融资余额占流通市值 {ratio:.2f}%（流通市值{circ_mv:.1f}亿）"
+                     + (f"，近一年分位 {rzye_quantile}%"
+                        + ("（超过50%分位，杠杆资金看多情绪占主导）" if rzye_quantile > 50 else "（低于50%分位）")
+                        if rzye_quantile is not None else ""))
     for _, row in df.head(10).iterrows():
         trade_date = str(row.get('trade_date', ''))[:10]
         exchange_id = row.get('exchange_id', '')
@@ -3962,16 +4151,56 @@ def _format_margin(df: pd.DataFrame, stock_code: str) -> str:
         if rzye: items.append(f"融资余额:{rzye}")
         if rqmcl: items.append(f"融券卖出量:{rqmcl}")
         if rqye: items.append(f"融券余额:{rqye}")
-        if rzrqye: items.append(f"融券融券余额:{rzrqye}")
+        if rzrqye: items.append(f"融资融券余额:{rzrqye}")
         lines.append("  " + " | ".join(items))
     return "\n".join(lines)
 
 
 def _format_margin_detail(df: pd.DataFrame, stock_code: str) -> str:
-    """格式化融资融券明细数据"""
+    """格式化融资融券明细数据（含占流通市值比例+近一年分位）"""
     if df is None or df.empty:
         return ""
+    df = df.copy()
+    # 获取流通市值用于计算融资余额占比
+    circ_mv = None
+    try:
+        from storage.sqlite.stock_storage import get_db
+        from tools.stock.tushare_fetcher import TushareFetcher
+        fetcher = TushareFetcher()
+        if fetcher._api is not None:
+            from datetime import date, timedelta
+            end_date = date.today().strftime("%Y-%m-%d")
+            start_date = (date.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+            basic_df = fetcher.daily_basic(stock_code, start_date=start_date, end_date=end_date)
+            if basic_df is not None and not basic_df.empty:
+                circ_mv = float(basic_df.iloc[0].get("circ_mv") or 0) / 10000  # 万元→亿元
+    except Exception:
+        pass
+
+    # 计算近一年融资余额分位
+    rzye_history = []
+    for _, row in df.iterrows():
+        try:
+            val = float(row.get('rzye', 0) or 0)
+            if val > 0:
+                rzye_history.append(val)
+        except (TypeError, ValueError):
+            pass
+    rzye_quantile = None
+    if rzye_history:
+        latest_rzye = rzye_history[0]
+        sorted_vals = sorted(rzye_history)
+        rank = sum(1 for v in sorted_vals if v <= latest_rzye)
+        rzye_quantile = round(rank / len(sorted_vals) * 100, 1)
+
     lines = [f"【融资融券明细（来源：Tushare）】"]
+    if circ_mv and rzye_history:
+        latest_rzye = rzye_history[0]
+        ratio = latest_rzye / circ_mv * 100 if circ_mv > 0 else None
+        lines.append(f"  ▶ 汇总：融资余额占流通市值 {ratio:.2f}%（流通市值{circ_mv:.1f}亿）"
+                     + (f"，近一年分位 {rzye_quantile}%"
+                        + ("（超过50%分位，杠杆资金看多情绪占主导）" if rzye_quantile > 50 else "（低于50%分位）")
+                        if rzye_quantile is not None else ""))
     for _, row in df.head(10).iterrows():
         trade_date = str(row.get('trade_date', ''))[:10]
         name = row.get('name', '')
@@ -3986,7 +4215,7 @@ def _format_margin_detail(df: pd.DataFrame, stock_code: str) -> str:
         if rzye: items.append(f"融资余额:{rzye}")
         if rqmcl: items.append(f"融券卖出量:{rqmcl}")
         if rqye: items.append(f"融券余额:{rqye}")
-        if rzrqye: items.append(f"融券融券余额:{rzrqye}")
+        if rzrqye: items.append(f"融资融券余额:{rzrqye}")
         lines.append("  " + " | ".join(items))
     return "\n".join(lines)
 
@@ -4017,7 +4246,7 @@ def _format_moneyflow(df: pd.DataFrame, stock_code: str) -> str:
     lines.append("【逐日明细】")
     for _, row in df.head(10).iterrows():
         trade_date = str(row.get('trade_date', ''))[:10]
-        # 主力净流入（数据库 net_mf_amount = 大单+特大单净额）
+        # 主力净流入（已由 _normalize_moneyflow 修正：大单+超大单净额，单位：万元）
         main_force_net = row.get('net_mf_amount', 0) or 0
         # 游资（中单净额 = 中单买入 - 中单卖出）
         md_net = (row.get('buy_md_amount', 0) or 0) - (row.get('sell_md_amount', 0) or 0)
@@ -4904,7 +5133,10 @@ def call_fetch_sotp_valuation(stock_code: str) -> str:
         if not total_shares:
             try:
                 import tushare as ts
-                ts_df = ts.pro_api().stock_basic(ts_code=f'{stock_code}.SZ' if stock_code < '600000' else f'{stock_code}.SH',
+                ts_code = (f'{stock_code}.SZ' if stock_code.startswith(('0', '3'))
+                           else (f'{stock_code}.BJ' if stock_code.startswith(('8', '4', '92'))
+                                 else f'{stock_code}.SH'))
+                ts_df = ts.pro_api().stock_basic(ts_code=ts_code,
                                                   fields='ts_code,total_share')
                 if ts_df is not None and not ts_df.empty:
                     raw = _num(ts_df.iloc[0].get('total_share'))
@@ -4914,7 +5146,10 @@ def call_fetch_sotp_valuation(stock_code: str) -> str:
                 pass
         if not total_shares:
             try:
-                ts_df2 = ts.pro_api().daily_basic(ts_code=f'{stock_code}.SZ' if stock_code < '600000' else f'{stock_code}.SH',
+                ts_code2 = (f'{stock_code}.SZ' if stock_code.startswith(('0', '3'))
+                            else (f'{stock_code}.BJ' if stock_code.startswith(('8', '4', '92'))
+                                  else f'{stock_code}.SH'))
+                ts_df2 = ts.pro_api().daily_basic(ts_code=ts_code2,
                                                    start_date='20260701', end_date='20260714',
                                                    fields='ts_code,total_share')
                 if ts_df2 is not None and not ts_df2.empty:
@@ -6594,7 +6829,9 @@ def call_fetch_value_discovery(industry_codes: str = "") -> str:
 
                 def _get_daily_basic(c):
                     try:
-                        ts_c = f"{c}.SZ" if c.startswith("0") or c.startswith("3") else f"{c}.SH"
+                        ts_c = (f"{c}.SZ" if c.startswith("0") or c.startswith("3")
+                                else (f"{c}.BJ" if c.startswith(("8", "4", "92"))
+                                      else f"{c}.SH"))
                         df_db = pro.daily_basic(ts_code=ts_c,
                                                 start_date=start_60, end_date=today_str,
                                                 fields="ts_code,trade_date,pe_ttm,pb,total_mv")

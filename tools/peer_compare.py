@@ -95,8 +95,11 @@ def _income_metrics(db, code: str, allow_fetch: bool) -> Dict[str, Optional[floa
     return out
 
 
-def build_peer_table(target: Dict, peers: List[Dict], industry: str) -> str:
-    """纯格式化：rows 含 code/name/pe/pb/mv/rev_yoy/np_yoy/gm"""
+def build_peer_table(target: Dict, peers: List[Dict], industry: str,
+                     industry_pe_median: Optional[float] = None,
+                     industry_pe_deducted: Optional[float] = None) -> str:
+    """纯格式化：rows 含 code/name/pe/pb/mv/rev_yoy/np_yoy/gm
+    增强参数：industry_pe_median(行业指数PE中位数), industry_pe_deducted(行业扣除后PE中位数)"""
     if not peers:
         return ""
 
@@ -120,6 +123,11 @@ def build_peer_table(target: Dict, peers: List[Dict], industry: str) -> str:
         below = sum(1 for p in peer_pes if p < tpe)
         median_pe = peer_pes[len(peer_pes) // 2]
         verdicts.append(f"目标PE {tpe:.1f}倍（同行中位数 {median_pe:.1f}倍，高于{below}/{len(peer_pes)}家）")
+    # 行业指数 PE 中位数（全行业口径，比市值前6家样本更具代表性）
+    if industry_pe_median is not None and industry_pe_median > 0 and tpe is not None and tpe > 0:
+        verdicts.append(f"行业指数PE中位数 {industry_pe_median:.1f}倍"
+                        + (f"（扣除后 {industry_pe_deducted:.1f}倍）" if industry_pe_deducted else "")
+                        + f"，目标PE {'显著高于' if tpe > industry_pe_median * 1.3 else '高于' if tpe > industry_pe_median else '低于' if tpe < industry_pe_median * 0.9 else '接近'}行业中位")
     # PB 同行相对位置
     tpb = target.get("pb")
     peer_pbs = [p["pb"] for p in peers if p.get("pb") is not None and p["pb"] > 0]
@@ -142,6 +150,45 @@ def build_peer_table(target: Dict, peers: List[Dict], industry: str) -> str:
     if verdicts:
         lines.append("程序判读：" + "；".join(verdicts))
     return "\n".join(lines)
+
+
+def _fetch_industry_pe_median(industry: str) -> Tuple[Optional[float], Optional[float]]:
+    """从 AkShare 获取申万行业指数 PE 中位数和扣除后 PE 中位数。
+    返回 (pe_median, pe_deducted_median)；失败返回 (None, None)。"""
+    if not industry:
+        return None, None
+    try:
+        import akshare as ak
+        # 申万行业指数实时行情（含PE字段）
+        fn = getattr(ak, "sw_index_spot", None) or getattr(ak, "index_value_hist_funddb", None)
+        if fn is None:
+            return None, None
+        df = fn()
+        if df is None or getattr(df, "empty", True):
+            return None, None
+        # 尝试匹配行业名称
+        for col in df.columns:
+            if "行业" in str(col) or "名称" in str(col) or "name" in str(col).lower():
+                matched = df[df[col].astype(str).str.contains(industry[:4], na=False)]
+                if not matched.empty:
+                    row = matched.iloc[0]
+                    pe = None
+                    pe_deducted = None
+                    for pc in df.columns:
+                        cl = str(pc).lower()
+                        if "pe" in cl and "中位" in cl:
+                            pe = _num(row.get(pc))
+                        elif "pe" in cl and "扣除" in cl:
+                            pe_deducted = _num(row.get(pc))
+                        elif cl == "pe" and pe is None:
+                            pe = _num(row.get(pc))
+                    if pe is not None:
+                        return pe, pe_deducted
+                    break
+        return None, None
+    except Exception as e:
+        logger.debug(f"[同行对比] 行业PE中位数获取失败: {e}")
+        return None, None
 
 
 def fetch_peer_table(code: str) -> Tuple[str, List[Dict]]:
@@ -179,7 +226,12 @@ def fetch_peer_table(code: str) -> Tuple[str, List[Dict]]:
                   "pe": ts.get("pe"), "pb": ts.get("pb"), "mv": ts.get("mv")}
         target.update(_income_metrics(db, code, allow_fetch=True))
 
-        return build_peer_table(target, rows, industry), rows
+        # 获取行业指数 PE 中位数（全行业口径）
+        ind_pe_median, ind_pe_deducted = _fetch_industry_pe_median(industry)
+
+        return build_peer_table(target, rows, industry,
+                                industry_pe_median=ind_pe_median,
+                                industry_pe_deducted=ind_pe_deducted), rows
     except Exception as e:
         logger.warning(f"[同行对比] 生成失败 {code}: {e}")
         return "", []

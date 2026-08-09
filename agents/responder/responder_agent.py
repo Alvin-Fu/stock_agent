@@ -4,7 +4,9 @@
 （免责声明与合规修订由其后的 compliance 节点负责）
 """
 
+import json
 import traceback
+import concurrent.futures
 from datetime import date
 from typing import Dict, Any, Optional
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -317,18 +319,23 @@ class ResponderAgent:
     @staticmethod
     def _build_title(stock_code: str, stock_type: str,
                      industry_name: str, raw_answer: str,
-                     research_result: dict) -> str:
-        """构建报告标题行：标的身份标识"""
+                     research_result: dict,
+                     stock_attr: Optional[dict] = None) -> str:
+        """构建报告标题行：标的身份标识
+
+        stock_attr: 由 router 统一判定的标的属性分类（周期股/成长股/防御股/价值股），
+                    传入时直接复用避免重复调用 classify_stock_attribute；为 None 时 fallback 重新调用。
+        """
         import re
         # ETF：优先从行情数据取名称，再试研究摘要，最后从 LLM 输出解析
         if stock_type == "etf":
             # 方法1：从行情数据查名称（最可靠）
             try:
                 from tools.etf_tools import fetch_etf_spot
-                spot = fetch_etf_spot(code)
+                spot = fetch_etf_spot(stock_code)
                 spot_name = spot.get("名称", "").strip() if spot else ""
                 if spot_name:
-                    return f"{spot_name}({code})"
+                    return f"{spot_name}({stock_code})"
             except Exception:
                 pass
 
@@ -341,7 +348,7 @@ class ResponderAgent:
                         # 去掉括号里的代码
                         clean = re.sub(r'[（(].*?[）)]', '', line).strip()
                         if clean:
-                            return f"{clean}({code})"
+                            return f"{clean}({stock_code})"
             except Exception:
                 pass
 
@@ -356,8 +363,8 @@ class ResponderAgent:
                 # 去掉含代码的行尾
                 clean = re.sub(r'[（(].*?[）)]', '', name).strip()
                 if clean:
-                    return f"{clean}({code})"
-            return f"ETF {code}"
+                    return f"{clean}({stock_code})"
+            return f"ETF {stock_code}"
 
         # 行业/产业链：用 industry_name
         if industry_name or ("," in stock_code):
@@ -383,12 +390,27 @@ class ResponderAgent:
         if not code:
             return ""
 
+        # 标的属性后缀（周期股/成长股/防御股/价值股）
+        # 优先从 state 传入的 stock_attr 读取（由 router 统一判定），为空时 fallback 重新调用
+        attr_suffix = ""
+        attr_info = stock_attr
+        if not attr_info:
+            try:
+                from tools.stock_classifier import classify_stock_attribute
+                attr_info = classify_stock_attribute(code)
+            except Exception:
+                attr_info = None
+        if attr_info:
+            attr_label = attr_info.get("label", "")
+            if attr_label and attr_label != "未分类":
+                attr_suffix = f" | {attr_label}"
+
         # 方法1（优先）：从数据库/代码映射查公司名（最可靠）
         try:
             from tools.company_code_validator import find_company_name
             looked_up = find_company_name(code)
             if looked_up:
-                return f"{looked_up}({code})"
+                return f"{looked_up}({code}){attr_suffix}"
         except Exception:
             pass
 
@@ -414,9 +436,9 @@ class ResponderAgent:
                 break
 
         if company_name:
-            return f"{company_name}({code})"
+            return f"{company_name}({code}){attr_suffix}"
 
-        return f"代码 {code}"
+        return f"代码 {code}{attr_suffix}"
 
     def generate_node(self, state: AgentState) -> Dict[str, Any]:
         try:
@@ -426,13 +448,44 @@ class ResponderAgent:
             research = state.get("research_result", {})
             technical = state.get("technical_result", {})
 
+            # 模块执行状态检测：失败时告知用户，避免静默缺失章节
+            module_status = []
+            if not analysis or "error" in analysis:
+                _err = analysis.get("error", "结果为空") if analysis else "结果为空"
+                module_status.append(f"⚠️ 财务分析模块执行失败（{_err}），报告缺少财务分析章节")
+            if not technical or "error" in technical:
+                _err = technical.get("error", "结果为空") if technical else "结果为空"
+                module_status.append(f"⚠️ 技术分析模块执行失败（{_err}），报告缺少技术分析章节")
+
             logger.info("开始生成最终回答")
 
             context = self._format_context(documents, analysis, research, technical)
 
-            # 分析连续性：单只个股时注入上次分析快照与复盘结论（ETF 跳过）
+            # 将模块失败状态注入 context，提醒 LLM 在报告中标注缺失章节
+            if module_status:
+                context += "\n\n========== 模块执行状态 ==========\n" + "\n".join(module_status)
+
+            # 产业链模式：在生成最终报告前，调用 scenario_engine 生成情景推演并注入材料
+            industry_name = state.get("industry_name") or ""
+            if industry_name and research:
+                try:
+                    from tools.scenario_engine import has_scenarios, generate_scenarios
+                    # 用 has_scenarios 检查已有材料中是否已包含情景推演，避免重复生成
+                    if not has_scenarios(context):
+                        research_text = research.get("summary", "") or ""
+                        if research_text:
+                            scenario_text = generate_scenarios(industry_name, research_text)
+                            if scenario_text:
+                                context += f"\n\n【情景推演（程序生成）】\n{scenario_text}"
+                                logger.info(f"产业链情景推演已生成并注入材料：{industry_name}")
+                except Exception as e:
+                    # scenario_engine 调用失败不阻断主流程
+                    logger.warning(f"情景推演生成失败（不阻断主流程）: {e}")
+
+            # 分析连续性：个股按代码、产业链按行业名注入上次分析快照与复盘结论
             history = self._format_history(state.get("stock_code") or "",
-                                           state.get("stock_type") or "")
+                                           state.get("stock_type") or "",
+                                           state.get("industry_name") or "")
             if history:
                 context += f"\n\n{history}"
 
@@ -462,23 +515,52 @@ class ResponderAgent:
             expected = _MODE_SECTION_COUNT.get(formatter_mode, 10)
             MAX_RETRIES = 2
 
+            # 产业链模式：从 researcher 结果中取排名数据（直接传给 formatter，不依赖 LLM 输出格式）
+            ranked_data = None
+            if formatter_mode == "industry" and research:
+                ranked_data = research.get("ranked_candidates")
+
             for attempt in range(MAX_RETRIES + 1):
-                response = self.llm.invoke(messages)
+                # LLM 调用超时保护（报告生成给5分钟）
+                try:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(self.llm.invoke, messages)
+                        response = future.result(timeout=300)
+                except concurrent.futures.TimeoutError:
+                    logger.error("报告生成LLM调用超时（300s）")
+                    if attempt < MAX_RETRIES:
+                        logger.warning("超时后重试...")
+                        continue
+                    return {"final_answer": "报告生成超时，请稍后重试。",
+                            "intermediate_steps": [("responder", "LLM timeout 300s")]}
+
                 raw_answer = response.content
+
+                # 检测 LLM 输出截断（finish_reason=length）
+                finish_reason = (getattr(response, 'response_metadata', {}).get('finish_reason', '')
+                                 or getattr(response, 'additional_kwargs', {}).get('finish_reason', ''))
+                if finish_reason == "length":
+                    logger.warning(f"LLM输出被截断（finish_reason=length），attempt={attempt}")
+                    if attempt < MAX_RETRIES:
+                        # 截断时重试，但不追加 retry_hint（避免 prompt 更长更易截断）
+                        messages = messages.copy()
+                        messages.append(HumanMessage(content="上一次输出被截断，请精简表达，确保完整输出所有章节。"))
+                        continue
 
                 # 格式后处理：内容重排、维度补缺
                 if formatter_mode:
-                    final_answer = format_report(raw_answer, formatter_mode)
+                    final_answer = format_report(raw_answer, formatter_mode, ranked_data=ranked_data)
                 else:
                     final_answer = raw_answer
 
-                # 标题行
+                # 标题行：优先从 state 取 router 统一判定的标的属性，避免重复调用 classify_stock_attribute
                 title = self._build_title(
                     state.get("stock_code", ""),
                     state.get("stock_type", ""),
                     state.get("industry_name", ""),
                     raw_answer,
                     state.get("research_result") or {},
+                    stock_attr=state.get("stock_attribute"),
                 )
                 if title:
                     final_answer = f"**{title}**\n\n{final_answer}"
@@ -556,13 +638,46 @@ class ResponderAgent:
             logger.warning(f"读取用户纠错记录失败（不影响本次回答）: {e}")
             return ""
 
-    def _format_history(self, stock_code: str, stock_type: str = "") -> str:
-        """取上次分析快照与最近复盘，形成「较上次分析…」的连续性素材"""
-        if not stock_code or "," in stock_code or stock_type == "etf":
+    def _format_history(self, stock_code: str, stock_type: str = "",
+                        industry_name: str = "") -> str:
+        """取上次分析快照与最近复盘，形成「较上次分析…」的连续性素材
+        个股模式按代码；产业链模式按行业名（含快照 + 产业链复盘 + 通用改进规则）"""
+        is_industry = bool(industry_name)
+        if (not stock_code or "," in stock_code or stock_type == "etf") and not is_industry:
             return ""
         try:
             from storage.sqlite.stock_storage import get_db
             db = get_db()
+            if is_industry:
+                snap = db.get_latest_industry_snapshot(industry_name)
+                if not snap:
+                    return ""
+                parts = ["【上次产业链分析记录（供连续性对比，如有变化请点明）】"]
+                created = str(snap.get("created_at"))[:10]
+                parts.append(f"时间：{created}，行业判断：{snap.get('industry_view') or '未明确'}，"
+                             f"技术面首选：{snap.get('top_pick') or '未记录'}，"
+                             f"候选数：{len(json.loads(snap.get('candidates') or '[]'))}")
+                review = db.get_last_industry_review(industry_name)
+                if review:
+                    parts.append(f"最近一次产业链复盘结论（{str(review.get('created_at'))[:10]}，"
+                                 f"组合对账{review.get('portfolio_verdict')}）：\n{(review.get('review_content') or '')[:600]}")
+                # 通用改进规则（产业链复盘的规则存为通用规则）
+                try:
+                    rules = db.get_active_rules(limit=8)
+                    if rules:
+                        rule_lines = ["【历史复盘改进规则（硬性要求：本次分析必须遵循以下规则，避免重复犯同类错误）】"]
+                        for r in rules:
+                            source = f"（来自{r.get('source_stock_name') or '通用'}）" if r.get("source_stock_name") else ""
+                            rule_lines.append(f"· [{r.get('error_pattern', '通用')}] {r['rule_text']}{source}")
+                            db.increment_rule_hit(r["id"])
+                        if review and review.get("error_pattern") and review.get("direction_verdict") == "错误":
+                            rule_lines.append(f"【⚠️ 最近一次产业链复盘误判类别：{review['error_pattern']}】"
+                                              f"本次必须特别避免同类型误判")
+                        parts.append("\n".join(rule_lines))
+                except Exception:
+                    pass
+                return "\n".join(parts)
+
             snap = db.get_latest_snapshot(stock_code)
             if not snap:
                 return ""
@@ -609,6 +724,10 @@ class ResponderAgent:
                     if review and review.get("error_pattern") and review.get("direction_verdict") == "错误":
                         rule_lines.append(f"【⚠️ 该标的最近一次复盘误判类别：{review['error_pattern']}】"
                                           f"本次必须特别避免同类型误判，如方向不同的判断需提供更充分的证据支撑")
+                    # 用户纠错复发警示（复盘程序化落库后注入，避免同一问题第三次犯错）
+                    if review and review.get("feedback_recurrence") == "复发":
+                        rule_lines.append(f"【⚠️ 上次复盘确认用户纠错的问题仍复发】"
+                                          f"本次相关结论必须给出可验证的程序数字/来源支撑，并在报告中明确标注")
                     parts.append("\n".join(rule_lines))
             except Exception:
                 pass

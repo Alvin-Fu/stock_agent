@@ -68,3 +68,4 @@ local/
 run.sh
 
 verify_*.py
+eval/runs/

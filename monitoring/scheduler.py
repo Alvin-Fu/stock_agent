@@ -7,6 +7,7 @@
 
 import threading
 import time
+import traceback
 from datetime import date, datetime
 
 import schedule
@@ -52,6 +53,10 @@ class MonitorScheduler:
         self.scout_day = str(cfg.get("scout_day", "saturday")).lower()
         self.scout_time = str(cfg.get("scout_time", "08:00"))
         self._scout_running = False
+
+        # 阈值校准：每周指定日指定时间运行（不依赖交易数据，周末也可运行）
+        self.calibrate_day = str(cfg.get("calibrate_day", "sunday")).lower()
+        self.calibrate_time = str(cfg.get("calibrate_time", "06:00"))
 
         self._running = False
         self._thread = None
@@ -99,9 +104,7 @@ class MonitorScheduler:
                 lines = result.strip().split("\n")
                 summary_lines = [l for l in lines if l.startswith("|")]
                 summary = "\n".join(summary_lines[:15]) if summary_lines else result[:500]
-                from monitoring.notifier import FeishuNotifier
-                notifier = FeishuNotifier()
-                notifier.send_card_text(summary[:2000], "低位价值发现扫描")
+                self.notifier.send_card_text(summary[:2000], "低位价值发现扫描", task_id="value_discovery")
                 logger.info("低位价值发现扫描完成")
         except Exception as e:
             logger.error(f"低位价值发现扫描失败: {e}")
@@ -109,7 +112,7 @@ class MonitorScheduler:
         try:
             val_text = self._fetch_market_valuation()
             if val_text:
-                self.notifier.send_card_text(val_text, "大盘估值快照")
+                self.notifier.send_card_text(val_text, "大盘估值快照", task_id="market_valuation")
         except Exception as e:
             logger.debug(f"大盘估值快照跳过: {e}")
 
@@ -138,7 +141,8 @@ class MonitorScheduler:
         try:
             from .macro_watcher import fetch_macro_snapshot
             text = fetch_macro_snapshot(session=session)
-            self.notifier.send_card_text(text[:6000], f"大盘宏观数据快照（{label}）")
+            task_id = "macro_pre" if session == "pre" else "macro_post"
+            self.notifier.send_card_text(text[:6000], f"大盘宏观数据快照（{label}）", task_id=task_id)
             logger.info(f"[宏观] {label}宏观分析推送完成")
         except Exception as e:
             logger.error(f"[宏观] {label}宏观分析异常: {e}")
@@ -190,7 +194,7 @@ class MonitorScheduler:
                 logger.info("[Golden] 周度回归开始（预计数十分钟到数小时）")
                 from eval.golden_run import run as golden_run
                 summary = golden_run()
-                self.notifier.send_card_text(summary[:3500], "Golden 周回归")
+                self.notifier.send_card_text(summary[:3500], "Golden 周回归", task_id="golden_weekly")
             except Exception as e:
                 logger.error(f"[Golden] 周度回归失败: {e}")
                 self.notifier.send(f"【Golden 周回归】运行失败: {e}")
@@ -225,6 +229,18 @@ class MonitorScheduler:
         except Exception as e:
             logger.error(f"[备份] 数据库备份失败: {e}")
 
+    def _run_calibrate(self):
+        """每周阈值校准：用复盘积累的事后收益检验系统阈值（阶段门槛/盈亏比/排名权重），
+        自动微调并写回 local.yaml。不依赖交易数据，周末也可运行。
+        异常只记录日志不中断调度循环。"""
+        try:
+            from eval.calibrate_thresholds import main as calibrate_main
+            logger.info("[校准] 阈值校准开始（用复盘事后收益检验系统阈值）")
+            calibrate_main()
+            logger.info("[校准] 阈值校准完成")
+        except Exception as e:
+            logger.error(f"[校准] 阈值校准异常: {e}\n{traceback.format_exc()}")
+
     # ---------- 生命周期 ----------
 
     def start(self):
@@ -253,13 +269,21 @@ class MonitorScheduler:
                 day_job = self._schedule.every().saturday
             day_job.at(self.scout_time).do(self._run_early_scout)
 
+        # 阈值校准：每周指定日指定时间运行（不依赖交易数据，周末也可运行，不检查 _is_weekday）
+        calibrate_day_job = getattr(self._schedule.every(), self.calibrate_day, None)
+        if calibrate_day_job is None:
+            logger.warning(f"[校准] calibrate_day 配置无效（{self.calibrate_day}），回退 sunday")
+            calibrate_day_job = self._schedule.every().sunday
+        calibrate_day_job.at(self.calibrate_time).do(self._run_calibrate)
+
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="monitor-scheduler", daemon=True)
         self._thread.start()
         logger.info(f"[监控] 调度已启动：盘后信号 {self.signal_scan_time}，新闻每 {self.news_interval} 分钟，"
                     f"复盘 {self.review_time}（分析满 {self.review_after_days} 天）"
                     + (f"，golden 回归每周 {self.golden_day} {self.golden_time}" if self.golden_enabled else "")
-                    + (f"，早期信号巡逻每周 {self.scout_day} {self.scout_time}" if self.scout_enabled else ""))
+                    + (f"，早期信号巡逻每周 {self.scout_day} {self.scout_time}" if self.scout_enabled else "")
+                    + f"，阈值校准每周 {self.calibrate_day} {self.calibrate_time}")
 
     def _loop(self):
         while self._running:

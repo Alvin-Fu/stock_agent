@@ -165,8 +165,17 @@ class BaseFetcher(ABC):
             needs_update, reason = incremental_updater.needs_update(stock_code, 'daily')
             if not needs_update:
                 logger.info(f"[{self.name}] {stock_code} {reason}")
-                # 如果不需要更新但缓存也没有，继续获取
-                pass
+                # 不需要更新时，优先使用本地DB缓存（df_db），跳过远程获取
+                if df_db is not None and not df_db.empty:
+                    logger.info(f"[{self.name}] {stock_code} {reason}，使用本地DB缓存")
+                    # 本地DB数据仍需清洗与计算指标，保证与远程获取结果一致
+                    cached_df = data_cleaner.fill_missing_values(df_db)
+                    cached_df = data_cleaner.remove_outliers(cached_df)
+                    cached_df = data_cleaner.standardize_data(cached_df)
+                    cached_df = self._calculate_indicators(cached_df, freq="daily")
+                    performance_logger.end_timer(f"get_daily_data_{stock_code}", perf_start)
+                    return cached_df
+                logger.info(f"[{self.name}] {stock_code} {reason}但本地无缓存，继续远程获取")
 
             # Step 1: 获取原始数据
             raw_df = self._fetch_raw_data("daily", stock_code, start_date, end_date)
@@ -192,7 +201,13 @@ class BaseFetcher(ABC):
             # Step 3: 数据质量检查
             is_valid, errors = data_validator.validate_kline_data(df)
             if not is_valid:
-                logger.warning(f"[{self.name}] {stock_code} 数据质量问题: {errors}")
+                # 计算质量等级：INVALID 级别阻断坏数据流入下游指标计算
+                quality_level = data_validator.calculate_quality_score(df, 'kline')
+                if quality_level == DataQualityLevel.INVALID:
+                    logger.error(f"[{self.name}] {stock_code} 数据质量校验失败（INVALID），阻断: {errors}")
+                    raise DataFetchError(f"[{self.name}] {stock_code} 数据质量不合格: {errors}")
+                # BAD/POOR/FAIR 级别仅警告，不阻断
+                logger.warning(f"[{self.name}] {stock_code} 数据质量问题（{quality_level.value}）: {errors}")
 
             # Step 4: 数据清洗（增强版）
             df = data_cleaner.fill_missing_values(df)
@@ -468,15 +483,23 @@ class BaseFetcher(ABC):
 
     @staticmethod
     def _calculate_rsi(df: pd.DataFrame, periods=(6, 12, 24)) -> pd.DataFrame:
-        """RSI（Wilder 平滑，与国内行情软件口径一致）"""
+        """RSI（Wilder 平滑，与国内行情软件口径一致）
+
+        零波动处理：当 avg_gain 和 avg_loss 同时为 0（价格完全没有变化）时，
+        RSI 应为 50（中性）而非 100。avg_loss=0 且 avg_gain>0 时 RSI=100 才正确。
+        """
         diff = df['close'].diff()
         gain = diff.clip(lower=0)
         loss = -diff.clip(upper=0)
         for p in periods:
             avg_gain = gain.ewm(alpha=1 / p, adjust=False).mean()
             avg_loss = loss.ewm(alpha=1 / p, adjust=False).mean()
+            # avg_loss=0 且 avg_gain>0 → RSI=100（合理）；两者都=0 → RSI=50（零波动中性）
             rs = avg_gain / avg_loss.replace(0, np.nan)
-            df[f'rsi{p}'] = (100 - 100 / (1 + rs)).fillna(100.0).round(2)
+            rsi = 100 - 100 / (1 + rs)
+            # 零波动行（avg_gain=0 且 avg_loss=0）填 50，其余 NaN（数据不足）也填 50
+            zero_vol = (avg_gain == 0) & (avg_loss == 0)
+            df[f'rsi{p}'] = rsi.where(~zero_vol, 50.0).fillna(50.0).round(2)
         return df
 
     @staticmethod
@@ -539,9 +562,14 @@ class BaseFetcher(ABC):
 
     @staticmethod
     def _calculate_pos_52w(df: pd.DataFrame, window: int) -> pd.DataFrame:
-        """收盘价在近一年（按周期折算窗口）高低区间中的位置，0=年内最低 100=年内最高"""
-        high_w = df['high'].rolling(window=window, min_periods=1).max()
-        low_w = df['low'].rolling(window=window, min_periods=1).min()
+        """收盘价在近一年（按周期折算窗口）高低区间中的位置，0=年内最低 100=年内最高
+
+        min_periods=window//2：数据不足半窗时返回 NaN（后续填 50 中性），
+        避免 3 天数据就算出 0% 或 100% 的极端假信号。
+        """
+        min_periods = max(window // 2, 10)
+        high_w = df['high'].rolling(window=window, min_periods=min_periods).max()
+        low_w = df['low'].rolling(window=window, min_periods=min_periods).min()
         span = (high_w - low_w).replace(0, np.nan)
         df['pos_52w'] = ((df['close'] - low_w) / span * 100).fillna(50.0).round(1)
         return df

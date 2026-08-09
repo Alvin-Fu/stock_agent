@@ -1066,6 +1066,25 @@ class MonitorEvent(Base):
         }
 
 
+class TaskSubscriber(Base):
+    """
+    定时任务订阅表：task_id → open_id 映射。
+    定时任务根据此表推送消息，不配置时退回到 config push_open_id。
+    """
+    __tablename__ = 'task_subscriber'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(50), nullable=False, index=True)
+    open_id = Column(String(100), nullable=False)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    __table_args__ = (
+        UniqueConstraint('task_id', 'open_id', name='uix_task_subscriber'),
+    )
+
+    def to_dict(self) -> Dict[str, str]:
+        return {'task_id': self.task_id, 'open_id': self.open_id}
+
+
 class AnnouncementText(Base):
     """
     公告正文缓存：产销快报等公告 PDF 抽出的文本，按 (code, title) 唯一。
@@ -2005,6 +2024,7 @@ class AnalysisReview(Base):
     direction_verdict = Column(String(10))  # 方向对账：正确/错误/未验证
     review_content = Column(Text)  # LLM 生成的复盘卡片全文
     created_at = Column(DateTime, default=datetime.now, index=True)
+    feedback_recurrence = Column(String(10))  # 用户纠错复发对账：复发/已避免/无法判断（可空）
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -2016,6 +2036,7 @@ class AnalysisReview(Base):
             'error_pattern': self.error_pattern,
             'direction_verdict': self.direction_verdict,
             'review_content': self.review_content,
+            'feedback_recurrence': self.feedback_recurrence,
             'created_at': self.created_at,
         }
 
@@ -2110,6 +2131,7 @@ class IndustryReview(Base):
     direction_verdict = Column(String(10))  # 行业方向：正确/错误/未验证
     excluded_avg_return = Column(Float)  # 门槛剔除组等权收益 %（与 portfolio_return 对照验证门槛有效性）
     review_content = Column(Text)
+    error_pattern = Column(String(30))  # 产业链误判主要类别（同个股枚举，可空）
     created_at = Column(DateTime, default=datetime.now, index=True)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -2126,6 +2148,7 @@ class IndustryReview(Base):
             'direction_verdict': self.direction_verdict,
             'excluded_avg_return': self.excluded_avg_return,
             'review_content': self.review_content,
+            'error_pattern': self.error_pattern,
             'created_at': self.created_at,
         }
 
@@ -2586,6 +2609,11 @@ class DatabaseManager:
                         conn.execute(text('ALTER TABLE industry_review ADD COLUMN excluded_avg_return FLOAT'))
                         conn.commit()
                         logger.info("industry_review 表补充 excluded_avg_return 列（剔除组平均收益）")
+                    # error_pattern：产业链误判类别（复盘教训闭环用）
+                    if 'error_pattern' not in rev_cols:
+                        conn.execute(text('ALTER TABLE industry_review ADD COLUMN error_pattern VARCHAR(30)'))
+                        conn.commit()
+                        logger.info("industry_review 表补充 error_pattern 列（产业链误判类别）")
 
                 # stock_balance_sheet：旧表缺应收/存货列时补齐（营运资本趋势用）
                 if 'stock_balance_sheet' in table_names:
@@ -2628,12 +2656,13 @@ class DatabaseManager:
                             conn.commit()
                             logger.info(f"stock_income 表补充费用列 {col_name}（{col_desc}，单位：元）")
 
-                # analysis_review：旧表缺 error_pattern / direction_verdict 列时补齐
+                # analysis_review：旧表缺 error_pattern / direction_verdict / feedback_recurrence 列时补齐
                 if 'analysis_review' in table_names:
                     review_cols = [c['name'] for c in inspector.get_columns('analysis_review')]
                     for col_name, col_type, col_desc in (
                             ('error_pattern', 'VARCHAR(30)', '误判主要类别'),
-                            ('direction_verdict', 'VARCHAR(10)', '方向对账结果')):
+                            ('direction_verdict', 'VARCHAR(10)', '方向对账结果'),
+                            ('feedback_recurrence', 'VARCHAR(10)', '用户纠错复发对账结果')):
                         if col_name not in review_cols:
                             conn.execute(text(f'ALTER TABLE analysis_review ADD COLUMN {col_name} {col_type}'))
                             conn.commit()
@@ -6475,6 +6504,51 @@ class DatabaseManager:
             ).scalars().all()
             return len(results)
 
+    # ===== 定时任务订阅 =======================================================
+
+    def get_task_subscribers(self, task_id: str) -> List[str]:
+        """获取指定任务的所有订阅者 open_id 列表"""
+        with self.get_session() as session:
+            rows = session.execute(
+                select(TaskSubscriber.open_id).where(TaskSubscriber.task_id == task_id)
+            ).scalars().all()
+            return list(rows)
+
+    def get_all_subscriptions(self, open_id: str) -> List[str]:
+        """获取某个 open_id 订阅的所有 task_id"""
+        with self.get_session() as session:
+            rows = session.execute(
+                select(TaskSubscriber.task_id).where(TaskSubscriber.open_id == open_id)
+            ).scalars().all()
+            return list(rows)
+
+    def subscribe_task(self, task_id: str, open_id: str) -> bool:
+        """订阅任务；已存在返回 False"""
+        with self.get_session() as session:
+            try:
+                sub = TaskSubscriber(task_id=task_id, open_id=open_id)
+                session.add(sub)
+                session.commit()
+                return True
+            except Exception:
+                session.rollback()
+                return False
+
+    def unsubscribe_task(self, task_id: str, open_id: str) -> bool:
+        """取消订阅；不存在返回 False"""
+        with self.get_session() as session:
+            deleted = session.execute(
+                select(TaskSubscriber).where(
+                    and_(TaskSubscriber.task_id == task_id,
+                         TaskSubscriber.open_id == open_id)
+                )
+            ).scalar_one_or_none()
+            if not deleted:
+                return False
+            session.delete(deleted)
+            session.commit()
+            return True
+
     # ===== 公告正文缓存 =====================================================
 
     def get_announcement_text(self, code: str, title: str) -> Optional[str]:
@@ -6749,12 +6823,47 @@ class DatabaseManager:
             except Exception:
                 session.rollback()
 
+    def update_improvement_rule_effectiveness(self, rule_id: int, effectiveness: float) -> None:
+        """更新改进规则的有效性评分（0-1：按此规则操作后方向正确的比例）"""
+        with self.get_session() as session:
+            try:
+                rule = session.execute(
+                    select(ImprovementRule).where(ImprovementRule.id == rule_id)
+                ).scalar_one_or_none()
+                if rule:
+                    rule.effectiveness = effectiveness
+                    session.commit()
+            except Exception:
+                session.rollback()
+
+    def deactivate_improvement_rule(self, rule_id: int) -> None:
+        """停用改进规则（软删除，is_active=0）"""
+        with self.get_session() as session:
+            try:
+                rule = session.execute(
+                    select(ImprovementRule).where(ImprovementRule.id == rule_id)
+                ).scalar_one_or_none()
+                if rule:
+                    rule.is_active = 0
+                    session.commit()
+            except Exception:
+                session.rollback()
+
     def get_last_review_for_code(self, code: str) -> Optional[Dict[str, Any]]:
         """获取某股票最近一次复盘记录（供下次分析注入）"""
         with self.get_session() as session:
             result = session.execute(
                 select(AnalysisReview).where(AnalysisReview.code == code)
                 .order_by(desc(AnalysisReview.created_at)).limit(1)
+            ).scalar_one_or_none()
+            return result.to_dict() if result else None
+
+    def get_last_industry_review(self, industry_name: str) -> Optional[Dict[str, Any]]:
+        """获取某产业链最近一次复盘记录（供下次产业链分析注入）"""
+        with self.get_session() as session:
+            result = session.execute(
+                select(IndustryReview).where(IndustryReview.industry_name == industry_name)
+                .order_by(desc(IndustryReview.created_at)).limit(1)
             ).scalar_one_or_none()
             return result.to_dict() if result else None
 

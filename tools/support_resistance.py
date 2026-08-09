@@ -81,8 +81,8 @@ def _volume_nodes(closes: List[Optional[float]], volumes: List[Optional[float]],
     return [lo + (i + 0.5) * width for i in ranked]
 
 
-def compute_sr_levels(df, lookback: int = 120, swing_k: int = 2,
-                      cluster_tol_pct: float = 1.5, volume_bins: int = 24) -> Optional[Dict]:
+def compute_sr_levels(df, lookback: int = 250, swing_k: int = 2,
+                      cluster_tol_pct: float = 1.5, volume_bins: int = 30) -> Optional[Dict]:
     """
     输入日线 DataFrame（项目约定：降序，最新在前，含 high/low/close/volume 列）。
     返回 {"close", "supports": [...], "resistances": [...]}；数据不足返回 None。
@@ -115,19 +115,54 @@ def compute_sr_levels(df, lookback: int = 120, swing_k: int = 2,
             if not matched:
                 clusters.append({"price": node, "touches": 0, "vol_node": True})
 
+        # 近20日高点 / 近60日高点 / 52周高点：作为重要压力位锚点
+        valid_highs = [h for h in highs if h is not None]
+        valid_lows = [l for l in lows if l is not None]
+        if valid_highs:
+            hi_20 = max(valid_highs[-20:]) if len(valid_highs) >= 20 else max(valid_highs)
+            hi_60 = max(valid_highs[-60:]) if len(valid_highs) >= 60 else max(valid_highs)
+            hi_250 = max(valid_highs[-250:]) if len(valid_highs) >= 250 else max(valid_highs)
+            for p, label in [(hi_20, "近20日高"), (hi_60, "近60日高"), (hi_250, "52周高")]:
+                if p and p > close * 1.005:
+                    matched = False
+                    for c in clusters:
+                        if abs(p - c["price"]) / c["price"] * 100 <= cluster_tol_pct:
+                            c["touches"] = max(c["touches"], 2)
+                            c.setdefault("labels", []).append(label)
+                            matched = True
+                            break
+                    if not matched:
+                        clusters.append({"price": round(p, 2), "touches": 2, "vol_node": False, "labels": [label]})
+        if valid_lows:
+            lo_20 = min(valid_lows[-20:]) if len(valid_lows) >= 20 else min(valid_lows)
+            lo_60 = min(valid_lows[-60:]) if len(valid_lows) >= 60 else min(valid_lows)
+            lo_250 = min(valid_lows[-250:]) if len(valid_lows) >= 250 else min(valid_lows)
+            for p, label in [(lo_20, "近20日低"), (lo_60, "近60日低"), (lo_250, "52周低")]:
+                if p and p < close * 0.995:
+                    matched = False
+                    for c in clusters:
+                        if abs(p - c["price"]) / c["price"] * 100 <= cluster_tol_pct:
+                            c["touches"] = max(c["touches"], 2)
+                            c.setdefault("labels", []).append(label)
+                            matched = True
+                            break
+                    if not matched:
+                        clusters.append({"price": round(p, 2), "touches": 2, "vol_node": False, "labels": [label]})
+
         for c in clusters:
             c.setdefault("vol_node", False)
+            c.setdefault("labels", [])
             c["strength"] = c["touches"] + (2 if c["vol_node"] else 0)
             c["price"] = round(c["price"], 2)
 
         # 距现价 0.5% 以内的位当作"就在脚下"，不作为支撑/压力输出
         supports = sorted([c for c in clusters if c["price"] < close * 0.995],
-                          key=lambda c: -c["price"])[:4]
+                          key=lambda c: -c["price"])[:5]
         resistances = sorted([c for c in clusters if c["price"] > close * 1.005],
-                             key=lambda c: c["price"])[:4]
-        # 各保留强度>=1 的前3个（纯噪音位丢弃）
-        supports = [c for c in supports if c["strength"] >= 1][:3]
-        resistances = [c for c in resistances if c["strength"] >= 1][:3]
+                             key=lambda c: c["price"])[:5]
+        # 各保留强度>=1 的前4个（纯噪音位丢弃）
+        supports = [c for c in supports if c["strength"] >= 1][:4]
+        resistances = [c for c in resistances if c["strength"] >= 1][:4]
         if not supports and not resistances:
             return None
         return {"close": round(close, 2), "supports": supports, "resistances": resistances}
@@ -138,13 +173,15 @@ def compute_sr_levels(df, lookback: int = 120, swing_k: int = 2,
 
 def _fmt_level(c: Dict, close: float) -> str:
     tags = []
+    labels = c.get("labels", [])
+    if labels:
+        tags.append("·".join(labels))
     if c["touches"]:
         tags.append(f"触碰{c['touches']}次")
-    if c["vol_node"]:
+    if c.get("vol_node"):
         tags.append("成交密集")
     dist_pct = (c["price"] / close - 1) * 100
     tags.append(f"距现价{dist_pct:+.1f}%")
-    # 距离≤2%的位标注经受考验状态——读者能直接判断"这些位正在被市场测试"
     marker = ""
     if c["price"] < close and abs(dist_pct) <= 2:
         marker = " ⚠️正接受考验"
@@ -196,7 +233,7 @@ def format_sr_levels(sr: Optional[Dict], fundamental_anchor: Optional[float] = N
     if not sr:
         return ""
     close = sr.get("close")
-    lines = ["【程序计算关键位（近120根K线：摆动点聚类+成交密集区，历史博弈价位）】"]
+    lines = ["【程序计算关键位（近250根K线≈1年：摆动点聚类+成交密集区+阶段高低点，历史博弈价位）】"]
     supports = sr.get("supports", [])
     resistances = sr.get("resistances", [])
 
@@ -214,5 +251,7 @@ def format_sr_levels(sr: Optional[Dict], fundamental_anchor: Optional[float] = N
     if anchor_note:
         lines.append(anchor_note)
     lines.append("  说明：距现价≤2%的位标注⚠️，表示正在被市场测试或突破中；触碰次数越多、"
-                 "带成交密集标记的价位越硬；与均线/BOLL位互补使用；大盘环境变化会导致技术位重算")
+                 "带成交密集标记的价位越硬；与均线/BOLL位互补使用——"
+                 "指标位看当前趋势支撑/压力，聚类位看历史筹码博弈位；"
+                 "大盘环境变化会导致技术位重算")
     return "\n".join(lines)

@@ -64,8 +64,11 @@ class TushareFetcher(BaseFetcher):
             db: 数据库实例（可选，用于优先读取缓存的换手率等字段）
         """
         self.rate_limit_per_minute = rate_limit_per_minute
+        self.rate_limit_per_day = 500  # Tushare 免费用户日配额（次/天）
         self._call_count = 0  # 当前分钟内的调用次数
         self._minute_start: Optional[float] = None  # 当前计数周期开始时间
+        self._daily_count = 0  # 当天累计调用次数
+        self._daily_count_date = date.today().isoformat()  # 当前计数日期
         self._api: Optional[object] = None  # Tushare API 实例
         self.db = db  # 数据库实例（缓存查询）
 
@@ -101,14 +104,23 @@ class TushareFetcher(BaseFetcher):
     def _check_rate_limit(self) -> None:
         """
         检查并执行速率限制
-        
+
         流控策略：
-        1. 检查是否进入新的一分钟
-        2. 如果是，重置计数器
-        3. 如果当前分钟调用次数超过限制，强制休眠
+        1. 日配额：跨天重置；当日累计达 500 次直接抛 DataFetchError（重试无意义）
+        2. 分钟级限流：进入新的一分钟则重置计数器；超 80 次/分则休眠到下一分钟
         """
         current_time = time.time()
-        
+        today = date.today().isoformat()
+
+        # ── 日配额检查（500 次/天）──
+        if self._daily_count_date != today:
+            self._daily_count_date = today
+            self._daily_count = 0
+            logger.debug("Tushare 日配额计数器已重置")
+        if self._daily_count >= self.rate_limit_per_day:
+            raise DataFetchError(f"Tushare 日配额({self.rate_limit_per_day}次)已耗尽")
+
+        # ── 分钟级限流 ──
         # 检查是否需要重置计数器（新的一分钟）
         if self._minute_start is None:
             self._minute_start = current_time
@@ -136,9 +148,12 @@ class TushareFetcher(BaseFetcher):
             self._minute_start = time.time()
             self._call_count = 0
         
-        # 增加调用计数
+        # 增加调用计数（分钟级 + 日级）
+        # _check_rate_limit 是每次 API 调用前的统一闸口，故在此一并递增日配额计数
         self._call_count += 1
-        logger.debug(f"Tushare 当前分钟调用次数: {self._call_count}/{self.rate_limit_per_minute}")
+        self._daily_count += 1
+        logger.debug(f"Tushare 限流: 分钟 {self._call_count}/{self.rate_limit_per_minute}, "
+                     f"日 {self._daily_count}/{self.rate_limit_per_day}")
     
     def _convert_stock_code(self, stock_code: str) -> str:
         """
@@ -162,12 +177,15 @@ class TushareFetcher(BaseFetcher):
             return code.upper()
         
         # 根据代码前缀判断市场
-        # 沪市：600xxx, 601xxx, 603xxx, 688xxx (科创板)
-        # 深市：000xxx, 002xxx, 300xxx (创业板)
-        if code.startswith(('600', '601', '603', '688')):
+        # 沪市：600xxx, 601xxx, 603xxx, 605xxx (主板), 688xxx (科创板)
+        # 深市：000xxx (主板), 001xxx (主板), 002xxx (中小板/主板), 300xxx (创业板)
+        # 北交所：920xxx, 8xxxxx, 4xxxxx
+        if code.startswith(('600', '601', '603', '605', '688')):
             return f"{code}.SH"
-        elif code.startswith(('000', '002', '300')):
+        elif code.startswith(('000', '001', '002', '300')):
             return f"{code}.SZ"
+        elif code.startswith(('920', '8', '4')):
+            return f"{code}.BJ"
         else:
             # 默认尝试深市
             logger.warning(f"无法确定股票 {code} 的市场，默认使用深市")
@@ -655,6 +673,86 @@ class TushareFetcher(BaseFetcher):
 
             raise DataFetchError(f"Tushare moneyflow err: {e}") from e
 
+    # ---------- AkShare 财务报表降级 ----------
+    # Sina 财务报表列名 → Tushare 列名映射（三种报表各一套）
+    _AKSHARE_INCOME_MAP = {
+        '报告日': 'ann_date', '截止日期': 'end_date',
+        '营业总收入': 'total_revenue', '营业利润': 'operate_profit',
+        '净利润': 'n_income', '归属于母公司股东的净利润': 'n_income_attr_p',
+        '基本每股收益': 'basic_eps', '营业成本': 'oper_cost',
+        '销售费用': 'sell_exp', '管理费用': 'admin_exp',
+        '研发费用': 'rd_exp', '财务费用': 'fin_exp',
+    }
+    _AKSHARE_BALANCE_MAP = {
+        '报告日': 'ann_date', '截止日期': 'end_date',
+        '资产总计': 'total_assets', '流动资产合计': 'total_cur_assets',
+        '非流动资产合计': 'total_nca', '负债合计': 'total_liab',
+        '流动负债合计': 'total_cur_liab', '非流动负债合计': 'total_ncl',
+        '所有者权益(或股东权益)合计': 'total_hldr_eqy_exc_min_int',
+        '应收账款': 'accounts_receiv', '存货': 'inventories',
+        '固定资产': 'fix_assets', '在建工程': 'cip',
+    }
+    _AKSHARE_CASHFLOW_MAP = {
+        '报告日': 'ann_date', '截止日期': 'end_date',
+        '经营活动产生的现金流量净额': 'n_cashflow_act',
+        '投资活动产生的现金流量净额': 'n_cashflow_inv_act',
+        '筹资活动产生的现金流量净额': 'n_cash_flows_fnc_act',
+        '购建固定资产、无形资产和其他长期资产支付的现金': 'c_pay_acq_const_fiolta',
+    }
+
+    @staticmethod
+    def _sina_symbol(stock_code: str) -> str:
+        """将纯数字代码转为 Sina 格式（sh600519 / sz000001）"""
+        code = stock_code.strip().lower().replace('.sh', '').replace('.sz', '')
+        if code.startswith(('600', '601', '603', '605', '688')):
+            return f"sh{code}"
+        elif code.startswith(('000', '001', '002', '300')):
+            return f"sz{code}"
+        else:
+            return f"sz{code}"
+
+    def _fallback_akshare_financial(self, stock_code: str, report_type: str,
+                                    col_map: dict) -> pd.DataFrame:
+        """Tushare 财务报表失败时的 AkShare 降级方案。
+        通过 ak.stock_financial_report_sina 获取新浪财务报表，映射列名到 Tushare 格式。
+        report_type: '利润表' / '资产负债表' / '现金流量表'
+        成功返回映射后的 DataFrame；失败返回空 DataFrame。"""
+        try:
+            import akshare as ak
+        except ImportError:
+            logger.warning("[AkShare降级] akshare 未安装，无法降级获取财务报表")
+            return pd.DataFrame()
+
+        sina_sym = self._sina_symbol(stock_code)
+        logger.info(f"[AkShare降级] ak.stock_financial_report_sina(stock={sina_sym}, symbol={report_type})")
+        try:
+            raw_df = ak.stock_financial_report_sina(stock=sina_sym, symbol=report_type)
+            if raw_df is None or raw_df.empty:
+                logger.warning(f"[AkShare降级] stock_financial_report_sina 返回空数据 ({report_type})")
+                return pd.DataFrame()
+
+            # 映射列名（只保留能匹配的列）
+            rename_map = {}
+            for cn_col, en_col in col_map.items():
+                if cn_col in raw_df.columns:
+                    rename_map[cn_col] = en_col
+            df = raw_df.rename(columns=rename_map)
+
+            # 补 ts_code 列（下游 normalizer 需要）
+            ts_code = self._convert_stock_code(stock_code)
+            df['ts_code'] = ts_code
+
+            # 日期格式统一为 YYYYMMDD（Tushare 格式，下游 normalizer 用 format='%Y%m%d' 解析）
+            for date_col in ('ann_date', 'end_date'):
+                if date_col in df.columns:
+                    df[date_col] = df[date_col].astype(str).str.replace('-', '')
+
+            logger.info(f"[AkShare降级] {report_type} 获取成功: {len(df)} 行, 列: {list(df.columns)}")
+            return df
+        except Exception as e:
+            logger.warning(f"[AkShare降级] stock_financial_report_sina({report_type}) 失败: {e}")
+            return pd.DataFrame()
+
     def income(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
         获取利润表数据
@@ -664,7 +762,8 @@ class TushareFetcher(BaseFetcher):
             end_date: 结束日期
         """
         if self._api is None:
-            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+            logger.warning("Tushare API 未初始化，尝试 AkShare 降级获取利润表")
+            return self._fallback_akshare_financial(stock_code, "利润表", self._AKSHARE_INCOME_MAP)
         
         ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
         logger.info(f"stk income({ts_code}, {ts_start}, {ts_end})")
@@ -689,8 +788,11 @@ class TushareFetcher(BaseFetcher):
             error_msg = str(e).lower()
             if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
                 logger.warning(f"Tushare 配额可能超限: {e}")
-                raise RateLimitError(f"Tushare 配额超限: {e}") from e
-            raise DataFetchError(f"Tushare income err: {e}") from e
+            logger.warning(f"Tushare income 失败，尝试 AkShare 降级: {e}")
+            df = self._fallback_akshare_financial(stock_code, "利润表", self._AKSHARE_INCOME_MAP)
+            if df is not None and not df.empty:
+                return df
+            return pd.DataFrame()
 
     def stock_cashflow(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
@@ -701,7 +803,8 @@ class TushareFetcher(BaseFetcher):
             end_date: 结束日期
         """
         if self._api is None:
-            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+            logger.warning("Tushare API 未初始化，尝试 AkShare 降级获取现金流量表")
+            return self._fallback_akshare_financial(stock_code, "现金流量表", self._AKSHARE_CASHFLOW_MAP)
 
         ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
         logger.info(f"stk cashflow({ts_code}, {ts_start}, {ts_end})")
@@ -727,9 +830,12 @@ class TushareFetcher(BaseFetcher):
             # 检测配额超限
             if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
                 logger.warning(f"Tushare 配额可能超限: {e}")
-                raise RateLimitError(f"Tushare 配额超限: {e}") from e
 
-            raise DataFetchError(f"Tushare cashflow err: {e}") from e
+            logger.warning(f"Tushare cashflow 失败，尝试 AkShare 降级: {e}")
+            df = self._fallback_akshare_financial(stock_code, "现金流量表", self._AKSHARE_CASHFLOW_MAP)
+            if df is not None and not df.empty:
+                return df
+            return pd.DataFrame()
 
     def balancesheet(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
@@ -740,7 +846,8 @@ class TushareFetcher(BaseFetcher):
             end_date: 结束日期
         """
         if self._api is None:
-            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+            logger.warning("Tushare API 未初始化，尝试 AkShare 降级获取资产负债表")
+            return self._fallback_akshare_financial(stock_code, "资产负债表", self._AKSHARE_BALANCE_MAP)
         
         ts_code, ts_start, ts_end = self.fetch_common(stock_code, start_date, end_date)
         logger.info(f"stk balancesheet({ts_code}, {ts_start}, {ts_end})")
@@ -758,8 +865,11 @@ class TushareFetcher(BaseFetcher):
             error_msg = str(e).lower()
             if any(keyword in error_msg for keyword in ['quota', '配额', 'limit', '权限']):
                 logger.warning(f"Tushare 配额可能超限: {e}")
-                raise RateLimitError(f"Tushare 配额超限: {e}") from e
-            raise DataFetchError(f"Tushare balancesheet err: {e}") from e
+            logger.warning(f"Tushare balancesheet 失败，尝试 AkShare 降级: {e}")
+            df = self._fallback_akshare_financial(stock_code, "资产负债表", self._AKSHARE_BALANCE_MAP)
+            if df is not None and not df.empty:
+                return df
+            return pd.DataFrame()
 
     def moneyflow_hsgt(self, trade_date, start_date, end_date: str) -> pd.DataFrame:
         """

@@ -9,6 +9,7 @@
 
 import json
 import threading
+import re
 
 import requests
 
@@ -21,7 +22,10 @@ class FeishuNotifier:
         cfg = load_config().get(config_section, {}) or {}
         self.app_id = (cfg.get("app_id") or "").strip()
         self.app_secret = (cfg.get("app_secret") or "").strip()
-        self.push_open_id = (cfg.get("push_open_id") or "").strip()
+        raw = (cfg.get("push_open_id") or "").strip()
+        # 支持多人：逗号/分号分隔，单个也兼容
+        self.push_open_ids = [x.strip() for x in raw.replace("\n", ",").split(",") if x.strip()]
+        self.push_open_id = self.push_open_ids[0] if self.push_open_ids else ""
         self.webhook_url = (cfg.get("webhook_url") or "").strip()
         self._lark_client = None
         self._lock = threading.Lock()
@@ -32,7 +36,7 @@ class FeishuNotifier:
                            "监控事件只写日志不推送")
 
     def _app_ready(self) -> bool:
-        return bool(self.app_id and self.app_secret and self.push_open_id)
+        return bool(self.app_id and self.app_secret and self.push_open_ids)
 
     def _get_lark_client(self):
         """延迟创建 lark 客户端（未安装 lark-oapi 时优雅降级到 webhook）"""
@@ -45,53 +49,34 @@ class FeishuNotifier:
                     .app_id(self.app_id).app_secret(self.app_secret).build()
         return self._lark_client
 
-    def send(self, text: str) -> bool:
-        """发送一条文本消息，按配置选择通道；失败返回 False"""
-        if self._app_ready():
-            try:
-                return self._send_via_app(self.push_open_id, text)
-            except Exception as e:
-                logger.error(f"飞书应用推送失败，尝试 webhook 兜底: {e}")
-        if self.webhook_url:
-            try:
-                return self._send_via_webhook(text)
-            except Exception as e:
-                logger.error(f"飞书 webhook 推送失败: {e}")
-                return False
-        logger.info(f"[未配置飞书推送] {text[:200]}")
-        return False
-
-    def _build_post_content(self, text: str) -> dict:
-        """将文本内容转换为飞书 post 格式（支持 Markdown 表格、加粗等）"""
-        return {
-            "post": {
-                "zh_cn": {
-                    "title": "报告",
-                    "content": [[{"tag": "text", "text": text}]]
-                }
-            }
-        }
+    # ========== 通用发送 ==========
 
     def send(self, text: str, msg_type: str = "auto") -> bool:
         """
-        发送一条消息，按配置选择通道。
-        msg_type: "auto"=根据内容长度判断, "text"=纯文本, "post"=富文本
+        发送一条消息到默认订阅者（push_open_ids）。
+        msg_type: "auto"=根据内容判断, "text"=纯文本, "post"=富文本
         """
         if msg_type == "auto":
             has_table = "|" in text and "---" in text
             msg_type = "post" if (len(text) > 100 or has_table) else "text"
         if self._app_ready():
-            for try_type in (msg_type, "text" if msg_type == "post" else None):
-                if try_type is None:
-                    break
-                try:
-                    if self._send_via_app(self.push_open_id, text, msg_type=try_type):
-                        return True
-                except Exception as e:
-                    logger.error(f"飞书应用推送失败 ({try_type}): {e}")
-                if try_type == "post":
-                    logger.warning("post 格式失败，尝试 webhook 兜底")
-                    break  # 走 webhook 兜底
+            ok = False
+            for oid in self.push_open_ids:
+                oid_ok = False
+                for try_type in (msg_type, "text" if msg_type == "post" else None):
+                    if try_type is None:
+                        break
+                    try:
+                        if self._send_via_app(oid, text, msg_type=try_type):
+                            oid_ok = True
+                            break
+                    except Exception as e:
+                        logger.error(f"飞书推送失败({oid[:16]}..., {try_type}): {e}")
+                if oid_ok:
+                    ok = True
+            if ok:
+                return True
+            logger.warning(f"全部 {len(self.push_open_ids)} 个 open_id 推送失败，尝试 webhook 兜底")
         if self.webhook_url:
             try:
                 return self._send_via_webhook(text, msg_type=msg_type)
@@ -124,80 +109,154 @@ class FeishuNotifier:
 
     def send_card(self, receive_id: str, card_content: dict,
                   receive_id_type: str = "open_id") -> bool:
-        """
-        发送交互式卡片消息（interactive）。
-        card_content 为卡片完整 JSON dict（含 config/header/elements）。
-        仅支持应用 API 通道（webhook 不支持 interactive）。
-        """
+        """发送交互式卡片消息。"""
         if not (self.app_id and self.app_secret):
             logger.error("未配置 feishu.app_id/app_secret，无法发送卡片消息")
             return False
         import lark_oapi as lark
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        import time as _time
         client = self._get_lark_client()
         content = json.dumps(card_content, ensure_ascii=False)
-        req = CreateMessageRequest.builder() \
-            .receive_id_type(receive_id_type) \
-            .request_body(
-                CreateMessageRequestBody.builder()
-                .receive_id(receive_id)
-                .msg_type("interactive")
-                .content(content)
-                .build()
-            ).build()
-        resp = client.im.v1.message.create(req)
-        if not resp.success():
-            logger.error(f"飞书卡片发送失败: code={resp.code}, msg={resp.msg}")
-            return False
-        return True
+        for retry in range(3):
+            try:
+                req = CreateMessageRequest.builder() \
+                    .receive_id_type(receive_id_type) \
+                    .request_body(
+                        CreateMessageRequestBody.builder()
+                        .receive_id(receive_id)
+                        .msg_type("interactive")
+                        .content(content)
+                        .build()
+                    ).build()
+                resp = client.im.v1.message.create(req)
+                if not resp.success():
+                    raise RuntimeError(f"飞书卡片发送失败: code={resp.code}, msg={resp.msg}")
+                return True
+            except Exception as e:
+                if retry < 2:
+                    wait = 2 ** (retry + 1)
+                    logger.warning(f"卡片推送失败（第{retry+1}次），{wait}秒后重试: {e}")
+                    _time.sleep(wait)
+                else:
+                    logger.error(f"卡片推送3次重试均失败: {e}")
+                    raise
+        return False  # 不可达，保持类型安全
 
     def send_card_text(self, text: str, title: str = "定时报告",
-                       receive_id: str = "", receive_id_type: str = "open_id") -> bool:
+                       receive_id: str = "", receive_id_type: str = "open_id",
+                       task_id: str = "") -> bool:
         """
         将 markdown 文本转换为交互式卡片发送。
-        转换失败时降级为普通文本 `send()`。
-        receive_id 为空时使用 push_open_id（默认推送目标）。"""
+        receive_id 为空时使用 task_id 查 DB 获取订阅者，
+        task_id 也为空时使用 push_open_id（默认推送目标）。
+        """
         if not text or not text.strip():
             return False
         import lark_oapi as lark
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
-        rid = receive_id or self.push_open_id
-        if not rid or not (self.app_id and self.app_secret):
-            return self.send(text)
+        # 确定接收者
+        if receive_id:
+            target_ids = [receive_id]
+            target_type = receive_id_type
+        elif task_id:
+            from storage.sqlite.stock_storage import get_db
+            db = get_db()
+            target_ids = db.get_task_subscribers(task_id)
+            target_type = "open_id"
+            if not target_ids:
+                logger.info(f"[任务订阅] task_id={task_id} 无订阅者，退回到 push_open_ids")
+                target_ids = self.push_open_ids
+                target_type = "open_id"
+        else:
+            target_ids = self.push_open_ids
+            target_type = "open_id"
 
-        # 延迟导入避免循环引用
-        try:
-            from feishu_bot import _report_to_cards
-            cards = _report_to_cards(text, title)
-            if cards:
-                return self.send_card_chunked(cards, rid, receive_id_type)
-        except Exception as e:
-            logger.debug(f"[卡片] send_card_text 转卡失败，降级文本: {e}")
-
-        return self.send(text)
+        ok = True
+        for rid in target_ids:
+            if not rid:
+                continue
+            if not (self.app_id and self.app_secret):
+                if not self.send(text):
+                    ok = False
+                continue
+            try:
+                from feishu_bot import _report_to_cards
+                cards = _report_to_cards(text, title)
+                if cards:
+                    self.send_card_chunked(cards, rid, target_type)
+                else:
+                    self.send_to(rid, text, target_type)
+            except Exception as e:
+                logger.debug(f"[卡片] send_card_text 转卡/发送失败({rid[:16]}...): {e}")
+                try:
+                    self.send_to(rid, text, target_type)
+                except Exception as e2:
+                    logger.error(f"[卡片] 降级文本也失败({rid[:16]}...): {e2}")
+                    ok = False
+        return ok
 
     def send_card_chunked(self, cards: list, receive_id: str,
                           receive_id_type: str = "open_id") -> bool:
-        """
-        发送多张卡片（适用于超长报告分多卡）。cards 为 list[card_dict]。
-        每张卡独立发送，如某张失败继续下一张。
-        """
+        """发送多张卡片（适用于超长报告分多卡）。"""
+        import time as _time
         ok = True
+        failed_cards = []
         for i, card in enumerate(cards):
-            try:
-                self.send_card(receive_id, card, receive_id_type)
-            except Exception as e:
-                logger.error(f"[卡片] 第{i+1}/{len(cards)}张发送失败: {e}")
+            sent = False
+            for retry in range(2):
+                try:
+                    self.send_card(receive_id, card, receive_id_type)
+                    sent = True
+                    break
+                except Exception as e:
+                    if retry < 1:
+                        logger.warning(f"第{i+1}张卡片发送失败，重试: {e}")
+                        _time.sleep(3)
+                    else:
+                        logger.error(f"第{i+1}张卡片2次重试均失败，跳过: {e}")
+            if not sent:
+                failed_cards.append(i + 1)
                 ok = False
+        if failed_cards:
+            logger.error(f"[卡片] 以下卡片发送失败: {failed_cards}")
         return ok
 
+    # ========== 定时任务订阅管理 ==========
+
+    def send_to_task(self, task_id: str, text: str, title: str = "定时报告") -> bool:
+        """向指定定时任务的所有订阅者推送消息"""
+        return self.send_card_text(text, title=title, task_id=task_id)
+
+    def subscribe(self, task_id: str, open_id: str) -> bool:
+        """订阅定时任务"""
+        from storage.sqlite.stock_storage import get_db
+        db = get_db()
+        return db.subscribe_task(task_id, open_id)
+
+    def unsubscribe(self, task_id: str, open_id: str) -> bool:
+        """取消订阅定时任务"""
+        from storage.sqlite.stock_storage import get_db
+        db = get_db()
+        return db.unsubscribe_task(task_id, open_id)
+
+    def get_subscriptions(self, open_id: str) -> list:
+        """查询某个用户订阅了哪些任务"""
+        from storage.sqlite.stock_storage import get_db
+        db = get_db()
+        return db.get_all_subscriptions(open_id)
+
+    def get_task_subscribers(self, task_id: str) -> list:
+        """查询某个任务的订阅者列表"""
+        from storage.sqlite.stock_storage import get_db
+        db = get_db()
+        return db.get_task_subscribers(task_id)
+
+    # ========== 飞书文档 ==========
+
     def create_feishu_doc(self, title: str, markdown_text: str) -> str:
-        """
-        创建飞书文档并写入内容。
-        返回文档 URL；失败返回空字符串。
-        需要飞书应用已开通 docx:document:write_only 权限。
-        """
+        """创建飞书文档并写入内容；返回文档 URL；失败返回空串。"""
         if not (self.app_id and self.app_secret):
             logger.error("未配置 feishu.app_id/app_secret，无法创建文档")
             return ""
@@ -205,7 +264,6 @@ class FeishuNotifier:
         import lark_oapi as lark
         client = self._get_lark_client()
 
-        # 1. 创建文档
         try:
             doc_req = lark.api.docx.v1.model.CreateDocumentRequest.builder() \
                 .request_body(
@@ -227,9 +285,8 @@ class FeishuNotifier:
         try:
             if self.push_open_id:
                 from lark_oapi.core.token.manager import TokenManager
-                import requests as http_req
                 lark_token = TokenManager.get_self_tenant_token(client.config)
-                perm_resp = http_req.post(
+                perm_resp = requests.post(
                     f"https://open.feishu.cn/open-apis/drive/v1/permissions/{document_id}/members?type=docx&need_notification=false",
                     headers={"Authorization": f"Bearer {lark_token}",
                              "Content-Type": "application/json; charset=utf-8"},
@@ -247,10 +304,12 @@ class FeishuNotifier:
         except Exception as e:
             logger.warning(f"[飞书文档] 权限授予异常（不影响写入）: {e}")
 
-        # 2. 解析 markdown 为有序内容项列表
         content_items = self._md_to_docx_items(markdown_text)
-
-        # 3. 有序写入：普通块 batch 提交，表格逐表创建
+        logger.info(f"[飞书文档] 解析得到 {len(content_items)} 个内容项（{sum(1 for x in content_items if x['type']=='block')} 普通块 + {sum(1 for x in content_items if x['type']=='table')} 表格）")
+        if len(markdown_text) < 200:
+            logger.info(f"[飞书文档] 内容预览（全文）: {markdown_text[:200]}")
+        else:
+            logger.info(f"[飞书文档] 内容前200字: {markdown_text[:200]}")
         import requests as http_req
         from lark_oapi.core.token.manager import TokenManager
         lark_token = TokenManager.get_self_tenant_token(client.config)
@@ -279,6 +338,8 @@ class FeishuNotifier:
                     resp = client.docx.v1.document_block_children.create(req)
                     if resp.success():
                         flat_ok += len(batch)
+                    else:
+                        logger.error(f"[飞书文档] 普通块写入失败: code={resp.code}, msg={resp.msg}")
                 except Exception as e:
                     logger.error(f"[飞书文档] 普通块写入异常: {e}")
             flat_buffer.clear()
@@ -331,23 +392,21 @@ class FeishuNotifier:
 
         _flush_flat()
         logger.info(f"[飞书文档] 写入完成: {flat_ok} 普通块 + {table_ok} 表格")
-
         return f"https://www.feishu.cn/docx/{document_id}"
+
+    # ========== Markdown 解析 ==========
 
     @staticmethod
     def _parse_inline_elements(text: str) -> list:
-        """将行内文本中的 **加粗** 和 <font color='...'>...</font> 解析为飞书 text_run 元素列表。"""
-        import re
+        """将行内文本中的 **加粗** 和 <font color='...'>...</font> 解析为飞书元素列表。"""
         _COLOR_MAP = {
             "red": {"red": 230, "green": 50, "blue": 50},
             "green": {"red": 0, "green": 170, "blue": 0},
         }
-
         pattern = re.compile(
             r'\*\*([^*]+)\*\*'
             r'|<font color=\'([^\']+)\'>([^<]+)</font>'
         )
-
         elements = []
         pos = 0
         for m in pattern.finditer(text):
@@ -373,14 +432,7 @@ class FeishuNotifier:
 
     @staticmethod
     def _md_to_docx_items(markdown_text: str) -> list:
-        """
-        将 markdown 文本解析为有序的内容项列表。
-        每个 item 为 {"type": "block"|"table", "data": ...}。
-        - type="block": data 为飞书 block dict
-        - type="table": data 为 {"n_rows": int, "n_cols": int, "rows": [[cell, ...], ...]}
-        行内格式：**加粗**、<font color='...'>...</font>。
-        """
-        import re
+        """将 markdown 文本解析为有序内容项列表（block/table）。"""
         parse = FeishuNotifier._parse_inline_elements
         items = []
         lines = markdown_text.strip().split("\n")
@@ -390,23 +442,24 @@ class FeishuNotifier:
             if not line:
                 i += 1
                 continue
-
-            # ## 标题 → heading2
-            if line.startswith("## "):
+            if line.startswith("## ") and not line.startswith("### "):
                 items.append({"type": "block", "data": {
                     "block_type": 4,
                     "heading2": {"elements": parse(line[3:].strip())}
                 }})
                 i += 1
                 continue
-
-            # --- 分隔线
+            if line.startswith("### "):
+                items.append({"type": "block", "data": {
+                    "block_type": 5,
+                    "heading3": {"elements": parse(line[4:].strip())}
+                }})
+                i += 1
+                continue
             if re.match(r"^---+\s*$", line):
                 items.append({"type": "block", "data": {"block_type": 22, "divider": {}}})
                 i += 1
                 continue
-
-            # 表格（支持 | 和 │）
             sep = '│' if '│' in line else None
             is_pipe_table = line.startswith("|")
             if sep or is_pipe_table:
@@ -441,8 +494,6 @@ class FeishuNotifier:
                             "text": {"elements": parse(" │ ".join(row))}
                         }})
                 continue
-
-            # - 或 • 列表 → bullet
             if line.startswith("- ") or line.startswith("• "):
                 bline = line[2:].strip() if line.startswith("- ") else line[1:].strip()
                 raw_line = lines[i]
@@ -453,13 +504,12 @@ class FeishuNotifier:
                 }})
                 i += 1
                 continue
-
-            # 普通文本段落
             paragraph = line
             i += 1
             while i < len(lines):
                 next_line = lines[i].strip()
                 if not next_line or next_line.startswith("## ") \
+                        or next_line.startswith("### ") \
                         or next_line.startswith("- ") or next_line.startswith("• ") \
                         or next_line.startswith("|") or '│' in next_line \
                         or re.match(r"^---+", next_line):
@@ -472,6 +522,8 @@ class FeishuNotifier:
                     "text": {"elements": parse(paragraph)}
                 }})
         return items
+
+    # ========== 底层 API 调用 ==========
 
     def _send_via_webhook(self, text: str, msg_type: str = "text") -> bool:
         payload = {"msg_type": msg_type}

@@ -28,6 +28,102 @@ from utils.logger import logger
 from storage.sqlite.stock_storage import get_db
 
 
+def calc_quality_metrics(code: str, db) -> Dict[str, Any]:
+    """计算个股质量否决权指标：ROE/扣非占比/商誉占比，任一触发则打折。
+
+    参考 tools/industry_metrics.py 中刚修复的数据采集逻辑。
+    - ROE < 5% → quality_discount *= 0.85
+    - 扣非/归母 < 30%（用 dt_eps/eps 近似）→ quality_discount *= 0.7
+    - 商誉/净资产 > 25%（通过 TushareFetcher.balancesheet 获取）→ quality_discount *= 0.85
+    """
+    import pandas as pd
+    from datetime import date as _date, timedelta as _td
+
+    result: Dict[str, Any] = {
+        "quality_discount": 1.0,
+        "triggers": [],
+        "roe": None,
+        "deduct_net_ratio": None,
+        "goodwill_ratio": None,
+        "data_complete": True,
+    }
+
+    # ROE + 扣非占比（来自财务指标，最新年报）
+    try:
+        fina_df = db.get_stock_fina_indicator(code)
+        if fina_df is not None and not fina_df.empty:
+            fina_df = fina_df.copy()
+            fina_df['_rd'] = pd.to_datetime(fina_df['report_date'], errors='coerce')
+            ann_fina = fina_df[fina_df['_rd'].dt.month == 12].sort_values('_rd', ascending=False)
+            if not ann_fina.empty:
+                latest = ann_fina.iloc[0]
+                roe_val = latest.get('roe')
+                if roe_val is not None and pd.notna(roe_val):
+                    roe_float = float(roe_val)
+                    # 统一为百分数（如0.15 → 15%）
+                    roe_pct = roe_float * 100 if roe_float <= 1.0 else roe_float
+                    result["roe"] = round(roe_pct, 2)
+                    if roe_pct < 5.0:
+                        result["quality_discount"] *= 0.85
+                        result["triggers"].append(f"ROE {roe_pct:.2f}% < 5%（质量折扣×0.85）")
+                # 扣非净利润/归母净利润（<30%触发否决权）
+                # 用 dt_eps/eps 近似扣非占比（两者在同一报告期的比率≈扣非/归母）
+                dt_eps = latest.get('dt_eps')
+                eps_val = latest.get('eps')
+                if dt_eps is not None and eps_val is not None and pd.notna(dt_eps) and pd.notna(eps_val):
+                    eps_f = float(eps_val)
+                    if abs(eps_f) > 1e-6:
+                        deduct_ratio = float(dt_eps) / eps_f * 100
+                        result["deduct_net_ratio"] = round(deduct_ratio, 1)
+                        if deduct_ratio < 30.0:
+                            result["quality_discount"] *= 0.7
+                            result["triggers"].append(f"扣非/归母 {deduct_ratio:.1f}% < 30%（质量折扣×0.7）")
+    except Exception as e:
+        logger.warning(f"质量否决权 ROE/扣非获取失败 {code}: {e}")
+
+    # ROE/扣非数据缺失检测：数据不可用时质量否决权未执行，需显式提示
+    if result["roe"] is None:
+        result["data_complete"] = False
+        result["triggers"].append("⚠️ 质量数据缺失（ROE/扣非数据不可用），质量否决权未执行，请标注'质量未验证'")
+
+    # 商誉/净资产（>25%触发否决权）
+    try:
+        from tools.stock.tushare_fetcher import TushareFetcher
+        tf = TushareFetcher()
+        if tf._api is not None:
+            end_d = _date.today().strftime("%Y-%m-%d")
+            start_d = (_date.today() - _td(days=400)).strftime("%Y-%m-%d")
+            bs_df = tf.balancesheet(code, start_date=start_d, end_date=end_d)
+            if bs_df is not None and not bs_df.empty:
+                bs_df = bs_df.copy()
+                if 'end_date' in bs_df.columns:
+                    bs_df['_rd'] = pd.to_datetime(bs_df['end_date'], errors='coerce')
+                    ann_bs = bs_df[bs_df['_rd'].dt.month == 12].sort_values('_rd', ascending=False)
+                else:
+                    ann_bs = bs_df
+                if not ann_bs.empty:
+                    gw = ann_bs.iloc[0].get('goodwill')
+                    equity = ann_bs.iloc[0].get('total_hldr_eqy_inc_min_int')
+                    if gw is not None and equity is not None and pd.notna(gw) and pd.notna(equity):
+                        eq_float = float(equity)
+                        if abs(eq_float) > 1e-6:
+                            gw_ratio = float(gw) / eq_float * 100
+                            result["goodwill_ratio"] = round(gw_ratio, 1)
+                            if gw_ratio > 25.0:
+                                result["quality_discount"] *= 0.85
+                                result["triggers"].append(f"商誉/净资产 {gw_ratio:.1f}% > 25%（质量折扣×0.85）")
+    except Exception as e:
+        logger.debug(f"质量否决权 商誉获取失败 {code}: {e}")
+
+    # 商誉数据缺失检测：数据不可用时质量否决权未执行，需显式提示
+    if result["goodwill_ratio"] is None:
+        result["data_complete"] = False
+        result["triggers"].append("⚠️ 质量数据缺失（商誉数据不可用），质量否决权未执行，请标注'质量未验证'")
+
+    result["quality_discount"] = round(result["quality_discount"], 4)
+    return result
+
+
 class AnalystAgent:
     """财务分析 Agent：基于真实财务报表数据进行分析"""
 
@@ -51,6 +147,12 @@ class AnalystAgent:
             logger.error(f"调研报失败 {stock_code}: {e}")
             return ""
 
+    @staticmethod
+    def _format_review_lesson(stock_code: str) -> str:
+        """注入该标的最近一次复盘的误判模式和相关改进规则（公共函数代理）"""
+        from agents.prompts_common import format_review_lesson
+        return format_review_lesson(stock_code)
+
     def _fetch_real_financial_data(self, stock_code: str) -> Dict[str, Any]:
         """从数据库/Tushare 拉取真实财务报表数据"""
         result = {"income": "", "balance_sheet": "", "cashflow": "", "main_business": "",
@@ -63,31 +165,61 @@ class AnalystAgent:
         except Exception as e:
             logger.warning(f"更新每日指标失败（不影响其余分析）: {e}")
 
-        try:
-            income_text = call_fetch_income_data(stock_code)
-            if income_text and "未获取到" not in income_text:
-                result["income"] = income_text
-        except Exception as e:
-            logger.error(f"获取利润表失败 {stock_code}: {e}")
-
-        try:
-            balance_text = call_fetch_balance_sheet_data(stock_code)
-            if balance_text and "未获取到" not in balance_text:
-                result["balance_sheet"] = balance_text
-        except Exception as e:
-            logger.error(f"获取资产负债表失败 {stock_code}: {e}")
-
-        try:
-            cashflow_text = call_fetch_cashflow_data(stock_code)
-            if cashflow_text and "未获取到" not in cashflow_text:
-                result["cashflow"] = cashflow_text
-        except Exception as e:
-            logger.error(f"获取现金流量表失败 {stock_code}: {e}")
-
-        # 主营业务构成：利润驱动分析的数字底座（内部已容错，失败返回空串/空列表）
+        # 并行拉取三张报表 + 主营构成（四者相互独立、无依赖，并行节省网络等待）
+        # 后续 trend/peer_table/forecast 等步骤有依赖关系，保持串行
+        import concurrent.futures
         from tools.main_business import fetch_main_business_records, build_main_business_text
-        mb_records = fetch_main_business_records(stock_code)
-        result["main_business"] = build_main_business_text(mb_records)
+
+        def _fetch_income() -> str:
+            try:
+                income_text = call_fetch_income_data(stock_code)
+                if income_text and "未获取到" not in income_text:
+                    return income_text
+                return ""
+            except Exception as e:
+                logger.error(f"获取利润表失败 {stock_code}: {e}")
+                return ""
+
+        def _fetch_balance() -> str:
+            try:
+                balance_text = call_fetch_balance_sheet_data(stock_code)
+                if balance_text and "未获取到" not in balance_text:
+                    return balance_text
+                return ""
+            except Exception as e:
+                logger.error(f"获取资产负债表失败 {stock_code}: {e}")
+                return ""
+
+        def _fetch_cashflow() -> str:
+            try:
+                cashflow_text = call_fetch_cashflow_data(stock_code)
+                if cashflow_text and "未获取到" not in cashflow_text:
+                    return cashflow_text
+                return ""
+            except Exception as e:
+                logger.error(f"获取现金流量表失败 {stock_code}: {e}")
+                return ""
+
+        def _fetch_main_business() -> tuple:
+            # 主营业务构成：利润驱动分析的数字底座（内部已容错，失败返回空串/空列表）
+            # 返回 (text, records)，records 供后续 profit_split 使用
+            try:
+                mb_records = fetch_main_business_records(stock_code)
+                return build_main_business_text(mb_records), mb_records
+            except Exception as e:
+                logger.error(f"获取主营构成失败 {stock_code}: {e}")
+                return "", []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            fut_income = executor.submit(_fetch_income)
+            fut_balance = executor.submit(_fetch_balance)
+            fut_cashflow = executor.submit(_fetch_cashflow)
+            fut_mb = executor.submit(_fetch_main_business)
+            result["income"] = fut_income.result()
+            result["balance_sheet"] = fut_balance.result()
+            result["cashflow"] = fut_cashflow.result()
+            mb_text, mb_records = fut_mb.result()
+            result["main_business"] = mb_text
 
         # 财报趋势：利润同比/利润率/单季拆分 + 费用率 + 现金流净现比 + 营运资本
         income_records = []
@@ -226,12 +358,14 @@ class AnalystAgent:
                             continue
                         parsed[name] = round(float(cur), 2)
                         hist = pd.to_numeric(basic_df[col], errors="coerce").dropna()
+                        # 排除当前值自身（basic_df 按 trade_date DESC，iloc[0] 是最新一行=当前值）
+                        hist_excl = hist.iloc[1:] if len(hist) > 1 else hist
                         # 多窗口分位
                         # 注意：basic_df 按 trade_date DESC（最新在前），用 head() 取最近 N 条
                         windows = {"近3年": 750, "近5年": 1250, "近10年": 2500}
                         pct_parts = []
                         for win_label, win_days in windows.items():
-                            sub = hist.head(min(len(hist), win_days))
+                            sub = hist_excl.head(min(len(hist_excl), win_days))
                             if len(sub) >= 60:
                                 pct = float((sub < float(cur)).mean() * 100)
                                 pct_parts.append(f"{win_label} {pct:.0f}%分位")
@@ -243,11 +377,18 @@ class AnalystAgent:
                                 src_str += f"，截至{src_date}"
                             pct_parts.append(src_str)
                             parsed[f"{name}_分位"] = "；".join(pct_parts)
-                        # PE/PB 背离判断（用近3年数据）
-                        pe_pct = float((hist.head(750) < float(parsed.get("pe_ttm", 0))).mean() * 100) if len(hist) >= 750 and "pe_ttm" in parsed else None
-                        pb_pct = float((hist.head(750) < float(parsed.get("pb", 0))).mean() * 100) if len(hist) >= 750 and "pb" in parsed else None
-                        if pe_pct and pb_pct and pe_pct > 70 and pb_pct < 30:
-                            parsed["估值背离"] = "PE悬顶、PB托底——盈利下滑被动抬高PE，但资产端已处历史底部"
+                        # PE/PB 背离判断（在循环内，确保用对应col的hist_excl）
+                        if col == "pe_ttm" and "pe_ttm" in parsed:
+                            _pe_hist = hist_excl.head(750)
+                            _pe_pct = float((_pe_hist < float(cur)).mean() * 100) if len(_pe_hist) >= 750 else None
+                            # 存储供 pb 判断时使用
+                            parsed["_temp_pe_pct"] = _pe_pct
+                        if col == "pb" and "pb" in parsed:
+                            _pb_hist = hist_excl.head(750)
+                            _pb_pct = float((_pb_hist < float(cur)).mean() * 100) if len(_pb_hist) >= 750 else None
+                            _pe_pct = parsed.pop("_temp_pe_pct", None) if "_temp_pe_pct" in parsed else None
+                            if _pe_pct and _pb_pct and _pe_pct > 70 and _pb_pct < 30:
+                                parsed["估值背离"] = "PE悬顶、PB托底——盈利下滑被动抬高PE，但资产端已处历史底部"
 
                     # PEG = PE(TTM) ÷ 净利同比增速（trailing 口径，非预期增速；增速≤0 时不适用）
                     pe = parsed.get("pe_ttm")
@@ -267,7 +408,8 @@ class AnalystAgent:
 
     @staticmethod
     def _build_profit_split_text(mb_records, income_records) -> str:
-        """分部利润拆分（程序计算）：最新年报净利 × 主营构成的分部利润占比"""
+        """分部利润拆分（程序计算）：最新年报净利 × 主营构成的分部利润占比
+        增强展示：分部营收/毛利率/同比增速（硬数据）"""
         from tools.main_business import latest_profit_split
         split = latest_profit_split(mb_records)
         if not split:
@@ -290,8 +432,39 @@ class AnalystAgent:
                   f"（利润占比{s['profit_share_pct']}%"
             if s.get("rev_share_pct") is not None:
                 seg += f"，收入占比{s['rev_share_pct']}%"
+            # 增强硬数据：营收绝对值 + 毛利率 + 同比增速
+            rev = s.get("revenue")
+            if rev and rev > 0:
+                seg += f"，营收{rev / 1e8:.2f}亿"
+            gm = s.get("gross_margin")
+            if gm is not None:
+                seg += f"，毛利率{gm}%"
+            rev_yoy = s.get("rev_yoy")
+            if rev_yoy is not None:
+                seg += f"，营收同比{rev_yoy:+.1f}%"
             lines.append(seg + "）")
         lines.append("  （分部间未剔除内部抵消；供分部估值参考用，不是精确分部净利）")
+        # 添加分部趋势判读
+        declining = [s for s in split if s.get("rev_yoy") is not None and s["rev_yoy"] < 0]
+        growing = [s for s in split if s.get("rev_yoy") is not None and s["rev_yoy"] > 0]
+        if declining or growing:
+            lines.append("  ※ 分部趋势判读：")
+            if growing:
+                parts = [f"{s['name']}({s['rev_yoy']:+.1f}%)" for s in growing]
+                lines.append(f"    增长分部: {', '.join(parts)}")
+            if declining:
+                parts = [f"{s['name']}({s['rev_yoy']:+.1f}%)" for s in declining]
+                lines.append(f"    下滑分部: {', '.join(parts)}")
+            # 毛利率变化方向提示
+            gm_changes = []
+            for s in split:
+                gm = s.get("gross_margin")
+                if gm is not None:
+                    gm_changes.append((s['name'], gm))
+            if gm_changes:
+                high_gm = max(gm_changes, key=lambda x: x[1])
+                low_gm = min(gm_changes, key=lambda x: x[1])
+                lines.append(f"    毛利率最高: {high_gm[0]}({high_gm[1]}%)，最低: {low_gm[0]}({low_gm[1]}%)")
         return "\n".join(lines)
 
     def _call_financial_tools(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -395,6 +568,12 @@ class AnalystAgent:
         try:
             stock_code = state.get("stock_code", "")
             question = state.get("question", "")
+            # 产业链模式：stock_code 为逗号分隔多代码，analyst 取排名第一的候选做财务分析
+            if "," in stock_code:
+                codes = [c.strip() for c in stock_code.split(",") if c.strip()]
+                original_code = stock_code
+                stock_code = codes[0] if codes else ""
+                logger.info(f"产业链模式：analyst 取第一个候选代码 {stock_code} 做财务分析（原始: {original_code}）")
             self._current_stock_code = stock_code
             logger.info(f"财务分析开始，股票: {stock_code}，问题: {question[:50]}...")
 
@@ -410,6 +589,28 @@ class AnalystAgent:
             forecast_text = real_data["forecast"]
             profit_split_text = real_data["profit_split"]
 
+            # 质量否决权计算（ROE/扣非占比/商誉占比）
+            quality_metrics = calc_quality_metrics(stock_code, self.db)
+            if quality_metrics["triggers"]:
+                logger.info(f"质量否决权触发: {quality_metrics['triggers']}，"
+                            f"折扣系数 {quality_metrics['quality_discount']}")
+
+            # 标的属性分类（周期股/成长股/防御股/价值股）→ 差异化估值方法
+            # 优先从 state 读取 router 统一判定的结果，避免重复调用 classify_stock_attribute
+            stock_attr = state.get("stock_attribute") or {}
+            if not stock_attr:
+                from tools.stock_classifier import classify_stock_attribute
+                stock_attr = classify_stock_attribute(stock_code)
+            attr_label = stock_attr.get("label", "未分类")
+            logger.info(f"标的属性分类: {stock_code} → {stock_attr.get('type', 'unknown')}({attr_label})")
+            attr_block = f"""
+========== 标的属性分类（程序判定） ==========
+属性：{attr_label}（行业：{stock_attr.get('industry', '未知')}）
+估值方法指导：{stock_attr.get('valuation_method', '')}
+关键关注指标：{stock_attr.get('key_metrics', '')}
+{stock_attr.get('valuation_warning', '')}
+""" if stock_attr.get("type") != "unknown" else ""
+
             logger.info("获取研报作为定性补充...")
             report_text = self._fetch_report(stock_code)
             if not report_text or "未获取到" in report_text:
@@ -421,11 +622,36 @@ class AnalystAgent:
 
             calculated = self._call_financial_tools(financial_data)
 
+            # 构建质量否决权提示块（仅在触发时注入）
+            quality_block = ""
+            if quality_metrics.get("triggers"):
+                quality_block = f"""
+========== 质量否决权（程序计算） ==========
+ROE：{quality_metrics.get('roe', 'N/A')}%
+扣非/归母（dt_eps/eps 近似）：{quality_metrics.get('deduct_net_ratio', 'N/A')}%
+商誉/净资产：{quality_metrics.get('goodwill_ratio', 'N/A')}%
+质量折扣系数：{quality_metrics['quality_discount']}
+触发项：{'；'.join(quality_metrics['triggers'])}
+
+⚠️ 质量否决权提示：以上质量指标触发了否决权，请在分析中明确标注质量折扣及触发原因，
+对盈利质量、利润可持续性给出审慎评价；不得回避或隐藏质量风险。
+"""
+            elif not quality_metrics.get("data_complete", True):
+                quality_block = """
+========== 质量否决权（程序计算） ==========
+⚠️ 质量数据缺失：ROE/扣非/商誉数据均不可用，质量否决权未执行。
+请在报告中明确标注“本标的质量指标未经程序验证”，盈利质量评价需格外审慎。
+"""
+
             system_prompt = self._build_system_prompt()
+            # 注入历史复盘教训（误判模式 + 改进规则），避免重复同类错误
+            review_lesson = self._format_review_lesson(stock_code)
+            review_block = (f"\n========== 历史复盘教训 ==========\n{review_lesson}\n"
+                            if review_lesson else "")
             user_message = f"""请分析股票 {stock_code} 的财务状况。
 
 【用户问题】
-{question}
+{question}{review_block}
 
 ========== 真实利润表数据 ==========
 {income_text if income_text else '未获取到利润表数据'}
@@ -465,7 +691,7 @@ class AnalystAgent:
 
 ========== 计算出的财务比率 ==========
 {calculated}
-
+{quality_block}{attr_block}
 ========== 研报观点（定性补充）==========
 {str(report_text)[:3000]}
 
@@ -477,16 +703,37 @@ class AnalystAgent:
             ]
 
             logger.info("LLM 财务分析中...")
-            response = self.llm.invoke(messages)
+            import concurrent.futures
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(self.llm.invoke, messages)
+                    response = future.result(timeout=180)
+            except concurrent.futures.TimeoutError:
+                logger.error("财务分析LLM调用超时（180s）")
+                return {"messages": [], "error": "LLM调用超时", "intermediate_steps": [("analyze", {"error": "LLM timeout 180s"})]}
             summary = response.content if hasattr(response, 'content') else str(response)
             logger.info(f"财务分析完成，长度: {len(summary)}")
 
-            self._save_analysis_to_db(state, summary, calculated)
+            # 根据数据完整度判定 confidence（4块齐全=high，2块以上=medium，否则 low）
+            data_blocks = [real_data.get("income"), real_data.get("balance_sheet"),
+                           real_data.get("cashflow"), real_data.get("main_business")]
+            filled_count = sum(1 for d in data_blocks if d and "未获取到" not in str(d))
+            if filled_count >= 4:
+                confidence = "high"
+            elif filled_count >= 2:
+                confidence = "medium"
+            else:
+                confidence = "low"
+            logger.info(f"数据完整度: {filled_count}/4 块 → confidence={confidence}")
+
+            self._save_analysis_to_db(state, summary, calculated, confidence=confidence)
 
             return {
                 "messages": [response],
                 "financial_data": financial_data,
                 "analysis_result": {"summary": summary, "ratios": calculated, "data_source": "real_financial_statements"},
+                "quality_metrics": quality_metrics,
+                "stock_attribute": stock_attr,
                 "intermediate_steps": [("analyze", {"stock_code": stock_code, "content": summary[:200]})],
             }
 
@@ -498,7 +745,8 @@ class AnalystAgent:
                 "intermediate_steps": [("analyze", {"error": str(e)})],
             }
 
-    def _save_analysis_to_db(self, state: AgentState, analysis_content: str, ratios: Dict[str, Any]):
+    def _save_analysis_to_db(self, state: AgentState, analysis_content: str, ratios: Dict[str, Any],
+                             confidence: str = "high"):
         try:
             question = state.get("question", "") or ""
             stock_code = state.get("stock_code", "")
@@ -514,7 +762,7 @@ class AnalystAgent:
                     report_type="机构研报",
                     analyze_content=analysis_content,
                     ratios=ratios,
-                    confidence="high",
+                    confidence=confidence,
                 )
                 logger.info(f"分析结果已保存: {stock_code}")
         except Exception as e:

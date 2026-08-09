@@ -122,14 +122,38 @@ def collect_industry_valuation(codes: List[str]) -> Optional[Dict[str, Any]]:
 
         try:
             stock_tool_instance.fetch_and_save_stock_basic_daily(code)
-            basic = db.get_latest_daily_basic_data(code, 750)
+            # 拉取10年数据（约2400个交易日），计算多窗口分位
+            basic = db.get_latest_daily_basic_data(code, 2500)
             if basic is not None and not basic.empty:
                 cur = _num(basic.iloc[0].get("pe_ttm"))
                 if cur and cur > 0:
                     row["pe_ttm"] = round(cur, 1)
-                    hist = pd.to_numeric(basic["pe_ttm"], errors="coerce").dropna()
-                    if len(hist) >= 60:
-                        row["pe_percentile"] = round(float((hist < cur).mean() * 100), 1)
+                    # hist_all 包含当前值，分位计算需排除自身（iloc[1:] 跳过最新一行）
+                    hist_all = pd.to_numeric(basic["pe_ttm"], errors="coerce").dropna()
+                    hist_excl = hist_all.iloc[1:]  # 排除当前值
+                    if len(hist_excl) >= 60:
+                        # 主分位：排除当前值后计算（ hist_excl < cur 的比例）
+                        row["pe_percentile"] = round(float((hist_excl < cur).mean() * 100), 1)
+                        # 多窗口分位（供报告展示，避免口径混乱）
+                        # 3年≈750交易日，5年≈1250交易日
+                        for label, days in [("pe_pct_3y", 750), ("pe_pct_5y", 1250)]:
+                            if len(hist_excl) >= days:
+                                hist_window = hist_excl[:days]
+                                row[label] = round(float((hist_window < cur).mean() * 100), 1)
+                            else:
+                                row[label] = round(float((hist_excl < cur).mean() * 100), 1)
+                        # 口径标签：标注实际数据长度对应的近似年份
+                        actual_len = len(hist_excl)
+                        if actual_len >= 2200:
+                            row["pe_pct_window"] = "10年"
+                        elif actual_len >= 1100:
+                            row["pe_pct_window"] = "5年"
+                        elif actual_len >= 600:
+                            row["pe_pct_window"] = "3年"
+                        else:
+                            # 数据不足3年，标注实际月数
+                            months = actual_len // 21
+                            row["pe_pct_window"] = f"{months}个月"
                 # 市值（total_mv 单位万元→亿元）：弹性/资金偏好判断都要它
                 mv = _num(basic.iloc[0].get("total_mv"))
                 if mv:
@@ -137,12 +161,65 @@ def collect_industry_valuation(codes: List[str]) -> Optional[Dict[str, Any]]:
         except Exception as e:
             logger.warning(f"[行业估值] {code} 每日指标获取失败: {e}")
 
-        # 近20日主力净流入（tushare moneyflow，千元→亿元）：
+        # 近20日主力净流入（单位：亿元，由大单+超大单净计算，万元→亿元）：
         # 用程序数字替代"搜索文本猜主力/游资"；无 token/失败时静默缺失
         try:
             row["mf_net20"] = _moneyflow_net20(code)
         except Exception as e:
             logger.debug(f"[行业估值] {code} 资金流获取失败: {e}")
+
+        # 质量指标：ROE + 扣非占比（来自财务指标，最新年报）
+        try:
+            fina_df = db.get_stock_fina_indicator(code)
+            if fina_df is not None and not fina_df.empty:
+                fina_df = fina_df.copy()
+                fina_df['_rd'] = pd.to_datetime(fina_df['report_date'], errors='coerce')
+                # 找最新年报期的ROE
+                ann_fina = fina_df[fina_df['_rd'].dt.month == 12].sort_values('_rd', ascending=False)
+                if not ann_fina.empty:
+                    latest = ann_fina.iloc[0]
+                    roe_val = latest.get('roe')
+                    if roe_val is not None and pd.notna(roe_val):
+                        roe_float = float(roe_val)
+                        # 统一为百分数（如0.15 → 15%）
+                        row["roe"] = round(roe_float * 100, 2) if roe_float <= 1.0 else round(roe_float, 2)
+                    # 质量指标：扣非净利润/归母净利润（<30%触发否决权）
+                    # 用 dt_eps/eps 近似扣非占比（两者在同一报告期的比率≈扣非/归母）
+                    dt_eps = latest.get('dt_eps')
+                    eps_val = latest.get('eps')
+                    if dt_eps is not None and eps_val is not None and pd.notna(dt_eps) and pd.notna(eps_val):
+                        eps_f = float(eps_val)
+                        if abs(eps_f) > 1e-6:
+                            row["deduct_net_ratio"] = round(float(dt_eps) / eps_f * 100, 1)
+        except Exception as e:
+            logger.debug(f"[行业估值] {code} ROE/扣非获取失败: {e}")
+
+        # 质量指标：商誉/净资产（>25%触发否决权）
+        try:
+            from tools.stock.tushare_fetcher import TushareFetcher
+            from datetime import date as _date, timedelta as _td
+            tf = TushareFetcher()
+            if tf._api is not None:
+                end_d = _date.today().strftime("%Y-%m-%d")
+                start_d = (_date.today() - _td(days=400)).strftime("%Y-%m-%d")
+                bs_df = tf.balancesheet(code, start_date=start_d, end_date=end_d)
+                if bs_df is not None and not bs_df.empty:
+                    # 筛选年报（end_date 月份为12）
+                    bs_df = bs_df.copy()
+                    if 'end_date' in bs_df.columns:
+                        bs_df['_rd'] = pd.to_datetime(bs_df['end_date'], errors='coerce')
+                        ann_bs = bs_df[bs_df['_rd'].dt.month == 12].sort_values('_rd', ascending=False)
+                    else:
+                        ann_bs = bs_df
+                    if not ann_bs.empty:
+                        gw = ann_bs.iloc[0].get('goodwill')
+                        equity = ann_bs.iloc[0].get('total_hldr_eqy_inc_min_int')
+                        if gw is not None and equity is not None and pd.notna(gw) and pd.notna(equity):
+                            eq_float = float(equity)
+                            if abs(eq_float) > 1e-6:
+                                row["goodwill_ratio"] = round(float(gw) / eq_float * 100, 1)
+        except Exception as e:
+            logger.debug(f"[行业估值] {code} 商誉获取失败: {e}")
 
         per_stock.append(row)
 
@@ -151,6 +228,27 @@ def collect_industry_valuation(codes: List[str]) -> Optional[Dict[str, Any]]:
     report_source("行业估值样本", metrics is not None,
                   f"有效样本不足（{len(per_stock)}只入样）" if metrics is None else "")
     return metrics
+
+
+def compute_main_force_net(mf_df: pd.DataFrame) -> Optional[pd.Series]:
+    """按 主力=大单+超大单 的标准口径重新计算主力净流入。
+
+    Tushare 的 net_mf_amount 字段值与 buy/sell 列对不上（差约12倍），
+    统一用 大单净额(买-卖) + 超大单净额(买-卖) 重新计算。返回值单位与
+    输入列一致（Tushare/AkShare 落库后均为万元）；缺少大单/超大单列返回 None。
+
+    被 industry_metrics._moneyflow_net20 与 monitoring.signal_scanner 共用，
+    保证两处资金流口径一致。
+    """
+    if mf_df is None or mf_df.empty:
+        return None
+    for col in ('buy_lg_amount', 'sell_lg_amount', 'buy_elg_amount', 'sell_elg_amount'):
+        if col not in mf_df.columns:
+            return None
+    return (pd.to_numeric(mf_df['buy_lg_amount'], errors='coerce').fillna(0)
+            + pd.to_numeric(mf_df['buy_elg_amount'], errors='coerce').fillna(0)
+            - pd.to_numeric(mf_df['sell_lg_amount'], errors='coerce').fillna(0)
+            - pd.to_numeric(mf_df['sell_elg_amount'], errors='coerce').fillna(0))
 
 
 def _moneyflow_net20(code: str) -> Optional[float]:
@@ -162,14 +260,19 @@ def _moneyflow_net20(code: str) -> Optional[float]:
     start = end - timedelta(days=40)
     df = stock_tool_instance.tushare.moneyflow(
         code, "", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
-    if df is None or df.empty or "net_mf_amount" not in df.columns:
+    if df is None or df.empty:
+        return None
+    # ★ Tushare 的 net_mf_amount 字段值不准确，用 大单+超大单 重新计算（单位：万元）
+    net = compute_main_force_net(df)
+    if net is None:
         return None
     if "trade_date" in df.columns:
-        df = df.sort_values("trade_date", ascending=False)
-    vals = pd.to_numeric(df["net_mf_amount"], errors="coerce").dropna()
+        net.index = df["trade_date"]
+        net = net.sort_index(ascending=False)
+    vals = net.dropna()
     if vals.empty:
         return None
-    return round(float(vals.head(20).sum()) / 1e4, 2)  # 万元→亿元（Tushare moneyflow 返回万元）
+    return round(float(vals.head(20).sum()) / 1e4, 2)  # 万元→亿元
 
 
 def format_industry_valuation(metrics: Optional[Dict[str, Any]]) -> str:
@@ -202,8 +305,12 @@ def format_industry_valuation(metrics: Optional[Dict[str, Any]]) -> str:
             continue
         pe_str = f"PE{pe:.1f}倍"
         pct_str = f"分位{pct:.0f}%" if pct is not None else ""
-        # 双阈值：分位>80% 或 绝对PE>100倍 → 红色预警；分位50-80%且PE 50-100倍 → 黄色；其余绿色
-        if (pct is not None and pct >= 80) or pe > 100:
+        # 双阈值：PE>200倍 → 🔴（无论分位）；PE>100倍 → 🟠；分位>80%且PE>50倍 → 🔴；其余🟢
+        if pe > 200:
+            level = "🔴"
+        elif pe > 100:
+            level = "🟠"
+        elif (pct is not None and pct >= 80) and pe > 50:
             level = "🔴"
         elif (pct is not None and pct >= 50 and pct < 80) and 50 <= pe <= 100:
             level = "🟡"
@@ -211,7 +318,7 @@ def format_industry_valuation(metrics: Optional[Dict[str, Any]]) -> str:
             level = "🟢"
         per_stock_display.append(f"    {level} {s.get('code','')} {pe_str} {pct_str}".rstrip())
     if per_stock_display:
-        lines.append("  逐股PE（双阈值预警：🔴分位>80%/PE>100倍 🟡分位50-80%且PE50-100倍 🟢其余）：")
+        lines.append("  逐股PE（双阈值预警：🔴PE>200倍/分位>80%且PE>50倍 🟠PE100-200倍 🟡分位50-80%且PE50-100倍 🟢其余）：")
         lines.extend(per_stock_display)
     lines.append("  ⚠️ 使用规则：以上为历史/当前状态的量化描述，回调风险分析须基于这些数字展开，"
                  "禁止在此之外编造估值或概率数字；乖离为负=价格已回落到MA20下方（回调已发生），"

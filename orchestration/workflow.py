@@ -178,6 +178,9 @@ class WorkflowExecutor:
 
     def get_final_answer(self, state: AgentState) -> str:
         """从最终状态提取回答文本"""
+        answer = state.get("final_answer")
+        if answer and answer.strip():
+            return answer
         if state.get("error"):
             return f"抱歉，处理您的问题时发生错误：{state['error']}"
-        return state.get("final_answer", "未生成回答，请重试。")
+        return "未生成回答，请重试。"

@@ -9,6 +9,7 @@
 import json
 import re
 import threading
+import time
 import traceback
 from datetime import datetime
 from typing import Dict, Any, Optional, List
@@ -19,6 +20,51 @@ from utils.logger import logger
 
 # 方向对账的涨跌幅阈值（%）：|涨跌| 小于该值视为波动太小、判断未验证
 DIRECTION_THRESHOLD = 1.0
+
+# LLM 调用网络重试配置
+_LLM_MAX_RETRIES = 3
+_LLM_RETRY_BASE_DELAY = 3  # 秒，指数退避基数
+
+# 复盘判错自动重分析：同一标的并发锁 + 开关（config.review.auto_reanalyze_on_error，默认开）
+_REANALYZE_INFLIGHT: set = set()
+_REANALYZE_LOCK = threading.Lock()
+
+
+def _auto_reanalyze_enabled() -> bool:
+    """是否开启「复盘判定方向错误 → 自动重分析并推送」"""
+    try:
+        from utils.config import load_config
+        cfg = load_config() or {}
+        return bool((cfg.get("review") or {}).get("auto_reanalyze_on_error", True))
+    except Exception:
+        return True
+
+
+
+def _invoke_llm_with_retry(llm, prompt, tag: str = ""):
+    """带网络重试的 LLM.invoke 封装。
+    对 ConnectionError / ConnectError / Timeout 等网络异常自动重试（指数退避），
+    其他异常（如 API key 错误）不重试直接抛出。"""
+    last_err = None
+    for attempt in range(1, _LLM_MAX_RETRIES + 1):
+        try:
+            return llm.invoke(prompt)
+        except Exception as e:
+            err_str = str(e).lower()
+            # 只对网络类异常重试
+            is_network_err = any(kw in err_str for kw in (
+                "connection", "timeout", "timed out", "nodename",
+                "name resolution", "dns", "unreachable", "reset by peer",
+                "temporarily unavailable", "retry"
+            )) or isinstance(e, (ConnectionError, TimeoutError, OSError))
+            if not is_network_err or attempt == _LLM_MAX_RETRIES:
+                raise
+            delay = _LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            logger.warning(f"[复盘]{tag} LLM调用网络异常（第{attempt}/{_LLM_MAX_RETRIES}次），"
+                          f"{delay}秒后重试: {e}")
+            last_err = e
+            time.sleep(delay)
+    raise last_err  # 不会到达，保险
 
 _EXTRACT_PROMPT = """从以下股票分析报告中抽取可检验的核心判断，用于日后复盘对账。
 
@@ -97,7 +143,7 @@ def snapshot_analysis(stock_code: str, question: str, final_answer: str,
     try:
         db = get_db()
         from core.llm import get_agent_llm
-        response = get_agent_llm("monitor").invoke(_EXTRACT_PROMPT.format(report=final_answer[:6000]))
+        response = _invoke_llm_with_retry(get_agent_llm("monitor"), _EXTRACT_PROMPT.format(report=final_answer[:6000]), tag=f"抽取判断:{stock_code}")
         raw = response.content if hasattr(response, "content") else str(response)
         judgement = _parse_judgement(raw)
         if judgement is None:
@@ -281,8 +327,8 @@ def snapshot_industry_analysis(industry_name: str, question: str, final_answer: 
     try:
         db = get_db()
         from core.llm import get_agent_llm
-        response = get_agent_llm("monitor").invoke(_INDUSTRY_EXTRACT_PROMPT.format(
-            codes=",".join(candidate_codes), report=final_answer[:6000]))
+        response = _invoke_llm_with_retry(get_agent_llm("monitor"), _INDUSTRY_EXTRACT_PROMPT.format(
+            codes=",".join(candidate_codes), report=final_answer[:6000]), tag=f"产业链抽取:{industry_name}")
         raw = response.content if hasattr(response, "content") else str(response)
 
         ranking, top_pick, industry_view = [], None, None
@@ -383,6 +429,67 @@ class ReviewRunner:
             self._llm = get_agent_llm("monitor")
         return self._llm
 
+    # ========== 判错自动重分析 ==========
+
+    def _trigger_reanalysis(self, code: str, name: str,
+                            kind: str = "stock", industry_name: str = "") -> None:
+        """复盘判定方向错误后，自动重分析该标的/产业链并推送新报告（后台线程，不阻塞复盘循环）。
+
+        kind: "stock" 个股 / "industry" 产业链。同一标的并发去重（_REANALYZE_INFLIGHT）。
+        重分析会再生成新快照，纳入下一轮复盘——闭环天然成立，不会死循环（每轮复盘只触发一次）。
+        """
+        if not _auto_reanalyze_enabled():
+            logger.info("[复盘] 判错自动重分析已关闭（config.review.auto_reanalyze_on_error=false）")
+            return
+        key = f"{kind}:{code or industry_name}"
+        with _REANALYZE_LOCK:
+            if key in _REANALYZE_INFLIGHT:
+                logger.info(f"[复盘] {key} 重分析已在进行中，跳过重复触发")
+                return
+            _REANALYZE_INFLIGHT.add(key)
+        threading.Thread(
+            target=self._run_reanalysis,
+            args=(code, name, kind, industry_name, key),
+            name="review-reanalysis", daemon=True,
+        ).start()
+
+    def _run_reanalysis(self, code: str, name: str,
+                        kind: str, industry_name: str, key: str) -> None:
+        """后台执行重分析：跑完整工作流 → 推送新报告到默认飞书目标"""
+        try:
+            from orchestration.workflow import WorkflowExecutor
+            if kind == "industry":
+                question = (f"重新分析{industry_name}产业链上下游，上次复盘判定方向判断错误，"
+                            f"请重新评估各环节与候选公司排名，修正上次误判点并给出更新后的结论与操作参考")
+                kwargs = {"industry_name": industry_name}
+                label = f"【{industry_name}】产业链复盘修正重分析"
+            else:
+                question = (f"重新分析{name}({code})，上次复盘判定方向判断错误，"
+                            f"请重新审视基本面、技术面与估值，修正上次误判点并给出更新后的结论与操作参考")
+                kwargs = {"stock_code": code}
+                label = f"🔁 {name}({code}) 复盘修正重分析"
+            logger.info(f"[复盘] 判错自动重分析启动: {label}")
+            executor = WorkflowExecutor(enable_memory=False)
+            state = executor.run_sync(question, thread_id=f"review-reanalysis:{key}", **kwargs)
+            answer = executor.get_final_answer(state)
+            if not answer or "系统处理出错" in answer:
+                logger.warning(f"[复盘] 判错重分析未产出有效报告（{(answer or '')[:120]}）")
+                return
+            try:
+                if self.notifier:
+                    self.notifier.send_card_text(answer, label)
+                else:
+                    from monitoring.notifier import FeishuNotifier
+                    FeishuNotifier().send_card_text(answer, label)
+                logger.info(f"[复盘] 判错重分析报告已推送: {label}")
+            except Exception as e:
+                logger.error(f"[复盘] 判错重分析报告推送失败: {e}")
+        except Exception as e:
+            logger.error(f"[复盘] 判错重分析执行失败: {e}\n{traceback.format_exc()}")
+        finally:
+            with _REANALYZE_LOCK:
+                _REANALYZE_INFLIGHT.discard(key)
+
     def review_snapshot(self, snap: Dict[str, Any], push: bool = True) -> Optional[str]:
         """对单个快照复盘：拉最新走势 → 代码对账 → LLM 生成复盘卡片 → 存档/推送"""
         code = snap["code"]
@@ -455,6 +562,9 @@ class ReviewRunner:
 
             feedback_template_line = "\n纠错对账：用户指出过的错误该次是否复发（复发⚠️/已避免✅/无法判断⏸）" \
                 if feedback_block else ""
+            # 让 LLM 在结构化 JSON 里一并输出纠错复发结论（供程序落库，驱动下次分析警示）
+            feedback_recurrence_json = ', "feedback_recurrence": "复发或已避免或无法判断"' \
+                if feedback_block else ""
 
             prompt = f"""你是复盘助手。对之前的一次股票分析做简短复盘，检验**当时推理的质量**。
 
@@ -482,7 +592,7 @@ class ReviewRunner:
 教训：一两句（没有就写"无明显误判"；区分误判与新信息）{feedback_template_line}
 
 【结构化误判分析（只输出JSON，不要markdown包裹）】
-{{"error_pattern": "误判主要类别", "improvement_rule": "具体的改进规则"}}
+{{"error_pattern": "误判主要类别", "improvement_rule": "具体的改进规则"{feedback_recurrence_json}}}
 
 误判类别选项（选最匹配的1项）：
 - 技术面权重失衡：多周期信号权重分配失当（如日线死叉权重过高/周月线金叉被低估）
@@ -497,12 +607,13 @@ class ReviewRunner:
 improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉在周月线金叉+基本面强劲时权重降一档"
 如果 error_pattern 为"无明显误判"，improvement_rule 给空字符串""。"""
 
-            response = self._get_llm().invoke(prompt)
+            response = _invoke_llm_with_retry(self._get_llm(), prompt, tag=f"个股复盘:{snap.get('code','')}")
             content = response.content if hasattr(response, "content") else str(response)
 
             # 解析结构化误判分析
             error_pattern = "其他"
             improvement_rule = ""
+            feedback_recurrence = None
             import json as _json
             import re as _re
             try:
@@ -515,6 +626,10 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
                               "无明显误判", "其他"):
                         error_pattern = ep
                     improvement_rule = str(error_data.get("improvement_rule", "")).strip()[:200]
+                    # 用户纠错复发结论（程序化落库，供下次分析注入警示）
+                    fb_recur = str(error_data.get("feedback_recurrence", "")).strip()
+                    if fb_recur in ("复发", "已避免", "无法判断"):
+                        feedback_recurrence = fb_recur
             except (ValueError, TypeError, _json.JSONDecodeError):
                 pass
 
@@ -528,6 +643,7 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
                 price_now=price_now, pct_change=pct_change,
                 direction_verdict=verdict, review_content=card,
                 error_pattern=error_pattern,
+                feedback_recurrence=feedback_recurrence,
             )
 
             # 如果误判非"无明显误判"且有改进规则，保存为可复用规则
@@ -551,17 +667,76 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
             self.db.mark_snapshot_reviewed(snap["id"])
 
             # 自动调权：如果误判类别对应可调整的权重，自动写入 config
+            # 个股复盘传 code → 技术权重按标的隔离，不影响其他股票
             if error_pattern not in ("无明显误判", "", "其他"):
                 try:
                     from tools.weight_adjuster import apply_review_adjustment
                     source = f"{snap.get('name') or code}({code})"
-                    adjust_ok = apply_review_adjustment(error_pattern, source_info=source)
+                    adjust_ok = apply_review_adjustment(error_pattern, source_info=source, code=code)
                     if adjust_ok:
                         logger.info(f"[复盘] {code} 自动调权完成（{error_pattern}）")
                 except Exception as e:
                     logger.warning(f"[复盘] {code} 自动调权失败: {e}")
+
+            # 改进规则有效性评估与淘汰（生命周期：创建 → 关联快照 → 下次复盘评估效果 → 连续无效则停用）：
+            # 1. 跳过本次复盘刚创建的规则（用同一 verdict 评估是循环论证——该规则就是从本次错误中提炼的）
+            # 2. 查找该标的的所有活跃规则（含通用规则），根据本次方向判断结果评估其效果
+            # 3. 递增引用计数，效果不佳且引用次数 >= 5 时自动停用
+            try:
+                # 记录本次刚创建的规则 ID（跳过循环论证）
+                just_created_rule_id = None
+                linked_rule = self.db.get_rule_by_snapshot(snap["id"])
+                if linked_rule:
+                    just_created_rule_id = linked_rule["id"]
+
+                # 方向判断结果映射为观测值
+                if verdict == "正确":
+                    observation = 1.0
+                elif verdict == "错误":
+                    observation = 0.0
+                else:
+                    observation = 0.5  # 未验证
+
+                # 查找该标的的所有活跃规则（含 code=None 的通用规则），评估其效果
+                active_rules = self.db.get_active_rules(code=code, limit=20)
+                for rule in active_rules:
+                    rule_id = rule["id"]
+                    # 跳过本次刚创建的规则（循环论证）
+                    if rule_id == just_created_rule_id:
+                        continue
+
+                    old_eff = rule.get("effectiveness")
+                    old_hit = rule.get("hit_count") or 0
+
+                    # 加权平均更新 effectiveness（旧值权重 0.7，新观测权重 0.3）
+                    if old_eff is None:
+                        new_eff = observation
+                    else:
+                        new_eff = round(old_eff * 0.7 + observation * 0.3, 4)
+
+                    # 递增引用计数（标记该规则被应用于本次复盘的标的）
+                    self.db.increment_rule_hit(rule_id)
+                    new_hit = old_hit + 1
+
+                    self.db.update_improvement_rule_effectiveness(rule_id, new_eff)
+                    logger.info(f"[复盘] {code} 改进规则 #{rule_id} effectiveness: "
+                                f"{old_eff} → {new_eff}（verdict={verdict}, hit={new_hit}）")
+
+                    # 效果不佳且引用次数 >= 5 时自动停用
+                    if new_eff < 0.5 and new_hit >= 5:
+                        self.db.deactivate_improvement_rule(rule_id)
+                        logger.info(f"[复盘] {code} 改进规则 #{rule_id} 已自动停用"
+                                    f"（effectiveness={new_eff} < 0.5, hit_count={new_hit} >= 5）")
+            except Exception as e:
+                logger.warning(f"[复盘] {code} 改进规则效果评估失败: {e}")
+
             if push and self.notifier:
                 self.notifier.send(card)
+
+            # 判错自动重分析：方向对账为"错误"时，自动重跑一次该标的分析并推送新报告
+            if verdict == "错误":
+                self._trigger_reanalysis(code, snap.get("name") or code, kind="stock")
+
             logger.info(f"[复盘] {code} 完成：{verdict}（{pct_change}%），误判类别：{error_pattern}")
             return card
         except Exception as e:
@@ -630,7 +805,20 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
 
         due = self.db.get_snapshots_due_review(after_days)
         if due:
-            logger.info(f"[复盘] {len(due)} 个个股快照到期，开始复盘")
+            # 去重：同一标的当天多次分析只复盘最新一次
+            latest_per_code = {}
+            for snap in due:
+                code = snap["code"]
+                if code not in latest_per_code or snap["created_at"] > latest_per_code[code]["created_at"]:
+                    latest_per_code[code] = snap
+            skipped = len(due) - len(latest_per_code)
+            if skipped > 0:
+                for snap in due:
+                    if snap is not latest_per_code.get(snap["code"]):
+                        self.db.mark_snapshot_reviewed(snap["id"])
+                        logger.info(f"[复盘] 跳过旧快照 id={snap['id']} {snap['code']}（当日已有更新分析）")
+            due = list(latest_per_code.values())
+            logger.info(f"[复盘] {len(due)} 个个股快照到期{'（去重跳过' + str(skipped) + '个）' if skipped else ''}，开始复盘")
             for snap in due:
                 if self.review_snapshot(snap):
                     done += 1
@@ -649,7 +837,7 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
                 try:
                     from .macro_watcher import fetch_macro_snapshot
                     macro_text = fetch_macro_snapshot(session="post")
-                    self.notifier.send_card_text(macro_text[:6000], "大盘宏观数据快照")
+                    self.notifier.send_card_text(macro_text[:6000], "大盘宏观数据快照", task_id="macro_post")
                 except Exception as e:
                     logger.debug(f"[复盘] 宏观数据快照跳过: {e}")
             return 0
@@ -676,7 +864,7 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
             try:
                 from .macro_watcher import fetch_macro_snapshot
                 macro_text = fetch_macro_snapshot(session="post")
-                self.notifier.send_card_text(macro_text[:6000], "大盘宏观数据快照")
+                self.notifier.send_card_text(macro_text[:6000], "大盘宏观数据快照", task_id="macro_post")
                 logger.info("[复盘] 宏观数据快照推送完成")
             except Exception as e:
                 logger.debug(f"[复盘] 宏观数据快照跳过: {e}")
@@ -789,14 +977,48 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
 【输出模板】
 组合结论：一句话
 排名与首选核验：一两句（谁被高估/低估，标注 误判/新信息）
-教训：一两句（没有就写"无明显误判"）"""
+教训：一两句（没有就写"无明显误判"）
 
-            response = self._get_llm().invoke(prompt)
+【结构化误判分析（只输出JSON，不要markdown包裹）】
+{{"error_pattern": "误判主要类别", "improvement_rule": "具体的改进规则"}}
+
+误判类别选项（选最匹配的1项）：
+- 技术面权重失衡：多周期信号权重分配失当（如日线信号权重过高/周月线信号被低估）
+- 基本面利空高估：过度押注行业基本面利空但板块未跌（利空已被定价/资金面对冲）
+- 基本面利好高估：过度押注行业基本面利好但板块未涨（利好已被定价/技术面压制）
+- 资金面驱动低估：低估了短期资金/情绪/题材驱动的力量
+- 技术面信号误读：误读技术指标含义（如将底部磨盘空头当作下跌中段空头）
+- 信息时效性误判：使用了已过时信息/低估了新信息的影响
+- 无明显误判：事后新信息导致走势偏离，当时推理合理
+- 其他：上述都不匹配则选此项
+
+improvement_rule 要求：50字内，可操作的改进方向，如"产业链排名前半的股票在周线金叉+资金流入时应提高权重"
+如果 error_pattern 为"无明显误判"，improvement_rule 给空字符串""。"""
+
+            response = _invoke_llm_with_retry(self._get_llm(), prompt, tag=f"产业链复盘:{snap.get('industry_name','')}")
             content = response.content if hasattr(response, "content") else str(response)
+
+            # 解析结构化误判分析（与个股复盘同一套枚举，供提炼改进规则与自动调权）
+            import json as _json
+            import re as _re
+            error_pattern = "其他"
+            improvement_rule = ""
+            try:
+                json_match = _re.search(r'\{.*"error_pattern".*\}', content, _re.DOTALL)
+                if json_match:
+                    error_data = _json.loads(json_match.group(0))
+                    ep = str(error_data.get("error_pattern", "")).strip()
+                    if ep in ("技术面权重失衡", "基本面利空高估", "基本面利好高估",
+                              "资金面驱动低估", "技术面信号误读", "信息时效性误判",
+                              "无明显误判", "其他"):
+                        error_pattern = ep
+                    improvement_rule = str(error_data.get("improvement_rule", "")).strip()[:200]
+            except (ValueError, TypeError, _json.JSONDecodeError):
+                pass
 
             header = (f"📋 产业链复盘 | {industry}\n"
                       f"{snap_date} 分析 → {days_elapsed} 天后：组合 {verdicts['portfolio_return']:+.2f}% "
-                      f"vs 基准 {'N/A' if verdicts['benchmark_return'] is None else f'{verdicts['benchmark_return']:+.2f}%'}（{verdicts['portfolio_verdict']}）｜"
+                      f"vs 基准 {'N/A' if verdicts['benchmark_return'] is None else format(verdicts['benchmark_return'], '+.2f') + '%'}（{verdicts['portfolio_verdict']}）｜"
                       f"排名{verdicts['rank_effective']}｜首选名次 {verdicts['top_pick_rank']}\n")
             card = header + content.strip()
 
@@ -811,11 +1033,46 @@ improvement_rule 要求：50字内，可操作的改进方向，如"日线死叉
                 direction_verdict=verdicts["direction_verdict"],
                 excluded_avg_return=excluded_avg_return,
                 review_content=card,
+                error_pattern=error_pattern,
             )
             self.db.mark_industry_snapshot_reviewed(snap["id"])
+
+            # 产业链误判 → 提炼可复用改进规则（存为通用规则，供后续个股/产业链分析注入）
+            if error_pattern not in ("无明显误判", "") and improvement_rule:
+                try:
+                    existing = self.db.get_rule_by_snapshot(snap["id"])
+                    if not existing:
+                        self.db.save_improvement_rule(
+                            rule_text=improvement_rule,
+                            error_pattern=error_pattern,
+                            source_snapshot_id=snap["id"],
+                            code=None,  # 通用规则，跨标的共享
+                            source_stock_name=f"产业链-{industry}",
+                            is_active=1,
+                            hit_count=0,
+                        )
+                        logger.info(f"[复盘] 产业链 {industry} 提炼改进规则：「{improvement_rule}」")
+                except Exception as e:
+                    logger.warning(f"[复盘] 产业链 {industry} 改进规则保存失败: {e}")
+
+            # 产业链误判 → 自动调权（与技术/阶段权重映射共用）
+            if error_pattern not in ("无明显误判", "", "其他"):
+                try:
+                    from tools.weight_adjuster import apply_review_adjustment
+                    adjust_ok = apply_review_adjustment(error_pattern, source_info=f"产业链-{industry}")
+                    if adjust_ok:
+                        logger.info(f"[复盘] 产业链 {industry} 自动调权完成（{error_pattern}）")
+                except Exception as e:
+                    logger.warning(f"[复盘] 产业链 {industry} 自动调权失败: {e}")
+
             if push and self.notifier:
                 self.notifier.send(card)
-            logger.info(f"[复盘] 产业链 {industry} 完成：{verdicts['portfolio_verdict']}")
+
+            # 判错自动重分析：行业方向对账为"错误"时，自动重跑一次产业链分析并推送新报告
+            if verdicts["direction_verdict"] == "错误":
+                self._trigger_reanalysis("", industry, kind="industry", industry_name=industry)
+
+            logger.info(f"[复盘] 产业链 {industry} 完成：{verdicts['portfolio_verdict']}（误判类别：{error_pattern}）")
             return card
         except Exception as e:
             logger.error(f"[复盘] 产业链 {industry} 复盘失败: {e}\n{traceback.format_exc()}")

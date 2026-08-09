@@ -22,6 +22,15 @@ ROUTER_SYSTEM_PROMPT = """你是一个智能路由系统（大脑），负责分
    - 适用场景：需要联网获取最新股价、新闻、公告、行业信息、产业链动态、龙头公司定位
    - 示例："比亚迪最近有什么公告？" "分析白酒行业的景气度" "半导体产业链有哪些龙头"
 
+5. **researcher（宏观分析模式）** - 宏观经济与市场环境影响分析
+   - 适用场景：用户问降息/加息/MLF/LPR/CPI/PMI/M2/社融/美债收益率/汇率等宏观关键词，
+     分析宏观事件对市场或行业的影响（不需要分析具体个股）
+   - 示例："降息对市场有什么影响" "近期CPI数据怎么看" "美债收益率上行对A股的影响" "LPR下调利好哪些行业"
+   - 路由：仅 researcher → responder（不走 technical_agent，宏观分析不涉及个股技术面）
+   - **注意**：若宏观问题中同时出现具体个股（如"降息对工商银行的影响"），按**个股**处理
+     （填 company_name/stock_code），系统会在个股分析材料中自动注入宏观数据；
+     只有纯宏观问题（无具体个股）才归类为 macro_analysis
+
 （合规审查在最终回答生成后自动执行，无需你调度。）
 
 【边界规则】
@@ -32,16 +41,20 @@ ROUTER_SYSTEM_PROMPT = """你是一个智能路由系统（大脑），负责分
 - 公司与行业同时出现时（如"比亚迪在电池产业链里的地位"）：按**个股**处理——
   填 company_name、industry_name 留空。产业链模式是选股筛选流程，
   个股问题的行业背景由个股研究覆盖；只有"筛选/对比某行业的公司"这类纯行业问题才填 industry_name
+- **重要：单一行业/赛道名称本身（如"机器人""半导体""新能源""光伏""人工智能""医药""煤炭""白酒"等）
+  即为有效的行业分析请求**，应归类为 industry_analysis 而非 general_chat。
+  不要因为用户只说了"机器人"三个字就觉得模糊——这是标准的行业/赛道查询。
 
 【输出格式】
 请只返回 JSON 格式，包含以下字段：
 - stock_code: 股票代码。**仅当用户问题中明确出现 6 位数字代码时才填写**，不要凭记忆推测代码；行业分析时为空字符串
 - company_name: 用户提到的公司名称（如"比亚迪"、"贵州茅台"）。没有提到具体公司则为空字符串。系统会用它去股票基础数据库查真实代码
 - industry_name: 行业名称（仅纯行业/产业链筛选问题填写，否则为空字符串）
-- intent: 意图分类 (financial_analysis / technical_analysis / industry_analysis / real_time_info / knowledge_query / general_chat)
+- intent: 意图分类 (financial_analysis / technical_analysis / industry_analysis / macro_analysis / real_time_info / knowledge_query / general_chat)
 - next_agents: 下一步应调用的 Agent 名称列表，按执行顺序排列，只能包含 retriever/analyst/researcher/technical
   - 个股全面分析：["analyst", "technical", "researcher"]（retriever 仅明确的知识库查询才加）
   - 行业/产业链分析：["researcher", "technical"]
+  - 宏观分析（降息/加息/MLF/LPR/CPI/PMI/M2/社融/美债/汇率等，无具体个股）：["researcher"]（不走 technical）
   - 闲聊/不支持的标的：[]
 - confidence: 置信度 (0.0-1.0)（仅日志用途，不影响路由行为）
 - reasoning: 简要路由理由（用于日志）
@@ -53,6 +66,9 @@ ROUTER_USER_TEMPLATE = """用户问题：{question}
 
 注意：
 - 对于个股分析问题（无论用户给的是公司名还是股票代码），把公司名填入 company_name、问题中出现的 6 位代码填入 stock_code
-- 对于行业/产业链分析问题（如"分析白酒行业"、"半导体产业链龙头"），需要：researcher（拆解产业链并筛选公司）→ technical（对筛选出的公司做技术面对比）
+- 对于行业/产业链分析问题（如"分析白酒行业"、"半导体产业链龙头"、"机器人产业链"、"新能源赛道"、"人工智能"、"低空经济"、"储能行业"），需要：researcher（拆解产业链并筛选公司）→ technical（对筛选出的公司做技术面对比）
 - 对于涉及龙头公司对比的问题，需要 researcher 自动识别龙一龙二，然后 technical 做技术面对比
+- 对于宏观分析问题（如"降息对市场的影响"、"近期CPI/PMI怎么看"、"美债收益率上行"、"LPR下调"、"M2和社融数据"、"汇率波动"等宏观关键词，且未指向具体个股），
+  归类为 macro_analysis，next_agents=["researcher"]（不走 technical，宏观分析不涉及个股技术面）；
+  若宏观问题中同时出现具体公司名/股票代码（如"降息对工商银行的影响"），则按个股处理，系统会自动注入宏观数据
 """

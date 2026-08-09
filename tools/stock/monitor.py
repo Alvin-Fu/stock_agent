@@ -4,6 +4,7 @@
 """
 
 import time
+import threading
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 from collections import deque
@@ -87,6 +88,9 @@ class DataSourceMonitor:
             'error_rate': 0.3,        # 错误率超过30%告警
             'consecutive_failures': 5  # 连续失败5次告警
         }
+        
+        # 线程锁（可重入，保护 metrics 和 alerts 的并发访问）
+        self._lock = threading.RLock()
 
     def record_request(
         self,
@@ -108,37 +112,38 @@ class DataSourceMonitor:
             data_type: 数据类型
             error_message: 错误信息（失败时）
         """
-        # 初始化数据源指标
-        if source_name not in self.metrics:
-            self.metrics[source_name] = {
-                'total_requests': 0,
-                'success_requests': 0,
-                'total_response_time': 0,
-                'latency_history': deque(maxlen=100),
-                'consecutive_failures': 0,
-                'error_counts': {},
-                'last_request_time': None
-            }
-        
-        metrics = self.metrics[source_name]
-        metrics['total_requests'] += 1
-        metrics['last_request_time'] = datetime.now()
-        
-        if success:
-            metrics['success_requests'] += 1
-            metrics['consecutive_failures'] = 0
-        else:
-            metrics['consecutive_failures'] += 1
-            # 记录错误类型
-            error_type = self._classify_error(error_message)
-            metrics['error_counts'][error_type] = metrics['error_counts'].get(error_type, 0) + 1
-        
-        # 记录延迟
-        metrics['total_response_time'] += response_time
-        metrics['latency_history'].append(response_time)
-        
-        # 检查告警条件
-        self._check_alerts(source_name, stock_code, metrics)
+        # 初始化数据源指标 + 更新指标（加锁保护）
+        with self._lock:
+            if source_name not in self.metrics:
+                self.metrics[source_name] = {
+                    'total_requests': 0,
+                    'success_requests': 0,
+                    'total_response_time': 0,
+                    'latency_history': deque(maxlen=100),
+                    'consecutive_failures': 0,
+                    'error_counts': {},
+                    'last_request_time': None
+                }
+            
+            metrics = self.metrics[source_name]
+            metrics['total_requests'] += 1
+            metrics['last_request_time'] = datetime.now()
+            
+            if success:
+                metrics['success_requests'] += 1
+                metrics['consecutive_failures'] = 0
+            else:
+                metrics['consecutive_failures'] += 1
+                # 记录错误类型
+                error_type = self._classify_error(error_message)
+                metrics['error_counts'][error_type] = metrics['error_counts'].get(error_type, 0) + 1
+            
+            # 记录延迟
+            metrics['total_response_time'] += response_time
+            metrics['latency_history'].append(response_time)
+            
+            # 检查告警条件
+            self._check_alerts(source_name, stock_code, metrics)
 
     def _classify_error(self, error_message: str) -> str:
         """分类错误类型"""
@@ -213,30 +218,31 @@ class DataSourceMonitor:
 
     def add_alert(self, alert: Alert):
         """添加告警"""
-        # 避免重复告警（同一类型同一数据源5分钟内不重复）
-        recent_alerts = [
-            a for a in self.alerts 
-            if a.alert_type == alert.alert_type 
-            and a.source_name == alert.source_name
-            and (datetime.now() - a.timestamp) < timedelta(minutes=5)
-        ]
-        
-        if not recent_alerts:
-            self.alerts.append(alert)
+        with self._lock:
+            # 避免重复告警（同一类型同一数据源5分钟内不重复）
+            recent_alerts = [
+                a for a in self.alerts 
+                if a.alert_type == alert.alert_type 
+                and a.source_name == alert.source_name
+                and (datetime.now() - a.timestamp) < timedelta(minutes=5)
+            ]
             
-            # 输出日志
-            log_level = {
-                AlertLevel.INFO: logger.info,
-                AlertLevel.WARNING: logger.warning,
-                AlertLevel.ERROR: logger.error,
-                AlertLevel.CRITICAL: logger.critical
-            }
-            log_func = log_level.get(alert.level, logger.info)
-            log_func(f"[告警] [{alert.level.value}] {alert.message}")
-        
-        # 限制告警数量
-        if len(self.alerts) > self.max_alerts:
-            self.alerts = self.alerts[-self.max_alerts:]
+            if not recent_alerts:
+                self.alerts.append(alert)
+                
+                # 输出日志
+                log_level = {
+                    AlertLevel.INFO: logger.info,
+                    AlertLevel.WARNING: logger.warning,
+                    AlertLevel.ERROR: logger.error,
+                    AlertLevel.CRITICAL: logger.critical
+                }
+                log_func = log_level.get(alert.level, logger.info)
+                log_func(f"[告警] [{alert.level.value}] {alert.message}")
+            
+            # 限制告警数量
+            if len(self.alerts) > self.max_alerts:
+                self.alerts = self.alerts[-self.max_alerts:]
 
     def get_alerts(self, level: AlertLevel = None, limit: int = 20) -> List[Alert]:
         """

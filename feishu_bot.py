@@ -10,7 +10,7 @@
 feishu:
   app_id: "cli_xxx"        # 开放平台自建应用
   app_secret: "xxx"
-  push_open_id: ""         # 主动推送目标（你的 open_id，可先留空：给机器人发一句话，日志里会打印你的 open_id）
+  push_open_id: ""         # 主动推送目标（你的 open_id，多人用逗号分隔）
   webhook_url: ""          # 群自定义机器人（可选兜底）
 
 运行：python feishu_bot.py
@@ -88,7 +88,8 @@ def _convert_to_feishu_markdown(text: str) -> str:
             continue
         
         if line.startswith("### "):
-            result.append(line)
+            # ### 子标题转加粗文本（飞书 post 模式不支持 ### 语法，会字面显示）
+            result.append(f"**{line[4:].strip()}**")
             i += 1
             continue
         
@@ -231,7 +232,7 @@ def _markdown_to_card_elements(text: str) -> list:
         line = lines[i]
 
         # ## 标题 → div with heading text_size
-        if line.startswith("## "):
+        if line.startswith("## ") and not line.startswith("### "):
             title = line[3:].strip()
             elements.append({"tag": "hr"})
             elements.append({
@@ -240,9 +241,37 @@ def _markdown_to_card_elements(text: str) -> list:
                 "text_size": "heading-4"
             })
             i += 1
-            # 收集标题后的内容直到下一个标题
+            # 收集标题后的内容直到下一个标题（## 或 ###）
             body_lines = []
-            while i < len(lines) and not lines[i].startswith("## ") and not lines[i].startswith("```"):
+            while i < len(lines) and not lines[i].startswith("## ") and not lines[i].startswith("### ") and not lines[i].startswith("```"):
+                stripped = lines[i].strip()
+                if stripped.startswith("|"):
+                    break
+                body_lines.append(lines[i])
+                i += 1
+            if body_lines:
+                body_text = "\n".join(body_lines).strip()
+                if body_text:
+                    paragraphs = [p.strip() for p in body_text.split("\n\n") if p.strip()]
+                    for p in paragraphs:
+                        elements.append({
+                            "tag": "div",
+                            "text": {"tag": "lark_md", "content": p}
+                        })
+            continue
+
+        # ### 子标题 → div with heading text_size（比 ## 小一级）
+        if line.startswith("### "):
+            title = line[4:].strip()
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"**{title}**"},
+                "text_size": "heading-5"
+            })
+            i += 1
+            # 收集子标题后的内容直到下一个标题（## 或 ###）
+            body_lines = []
+            while i < len(lines) and not lines[i].startswith("## ") and not lines[i].startswith("### ") and not lines[i].startswith("```"):
                 stripped = lines[i].strip()
                 if stripped.startswith("|"):
                     break
@@ -290,7 +319,7 @@ def _markdown_to_card_elements(text: str) -> list:
         body_lines = []
         while i < len(lines):
             li = lines[i]
-            if li.startswith("## ") or li.startswith("```"):
+            if li.startswith("## ") or li.startswith("### ") or li.startswith("```"):
                 break
             stripped = li.strip()
             if stripped.startswith("|"):
@@ -445,6 +474,13 @@ HELP_TEXT = """# 🤖 股票分析助手使用说明
 · 监控 比亚迪 —— 加入监控清单（公司名或6位代码；识别不到时按行业监控）
 · 取消监控 比亚迪
 · 监控列表
+
+## 定时任务订阅
+定时任务默认推送到配置中的 push_open_id，你也可以订阅到自己的会话：
+· **可用任务**：发送「我的订阅」查看所有可订阅的定时任务
+· 订阅 macro_pre —— 将开盘前宏观分析推送到本会话
+· 取消订阅 macro_pre
+· 我的订阅 —— 查看已订阅的任务列表
 
 ## 运维指令
 · 立即扫描 —— 马上跑一轮信号+新闻扫描
@@ -624,7 +660,7 @@ class FeishuBot:
 
     # ---------- 命令处理 ----------
 
-    def _handle_command(self, text: str) -> str:
+    def _handle_command(self, text: str, sender_open_id: str = "") -> str:
         """内置命令；返回 None 表示不是命令（走分析流程）"""
         text = text.strip()
         if text in ("帮助", "help", "菜单"):
@@ -673,6 +709,43 @@ class FeishuBot:
         if text in ("立即扫描", "扫描"):
             # 扫描可能要几分钟，丢线程池异步跑
             return "__SCAN__"
+
+        # ---------- 定时任务订阅管理 ----------
+
+        m = re.match(r"^订阅\s+(.+)$", text)
+        if m:
+            task_id = m.group(1).strip()
+            if not sender_open_id:
+                return "❌ 无法获取您的 open_id，请稍后重试"
+            ok = self.notifier.subscribe(task_id, sender_open_id)
+            if ok:
+                return f"✅ 已订阅任务：`{task_id}`\n该任务的推送消息将发送到本会话"
+            return f"⚠️ 您已经订阅了任务：`{task_id}`"
+
+        m = re.match(r"^取消订阅\s+(.+)$", text)
+        if m:
+            task_id = m.group(1).strip()
+            if not sender_open_id:
+                return "❌ 无法获取您的 open_id，请稍后重试"
+            ok = self.notifier.unsubscribe(task_id, sender_open_id)
+            return f"✅ 已取消订阅：`{task_id}`" if ok else f"未找到订阅记录：`{task_id}`"
+
+        if text in ("我的订阅", "订阅列表"):
+            if not sender_open_id:
+                return "❌ 无法获取您的 open_id，请稍后重试"
+            subs = self.notifier.get_subscriptions(sender_open_id)
+            if not subs:
+                return ("您目前没有订阅任何定时任务。\n\n"
+                        "可用任务列表：\n"
+                        "· `macro_pre` — 开盘前宏观分析（09:00）\n"
+                        "· `macro_post` — 收盘后宏观快照（20:00）\n"
+                        "· `signal_scan` — 盘后信号扫描（18:30）\n"
+                        "· `value_discovery` — 低位价值发现扫描\n"
+                        "· `market_valuation` — 大盘估值快照\n"
+                        "· `golden_weekly` — Golden 周度回归\n\n"
+                        "发送 `订阅 任务名` 即可订阅，如：`订阅 macro_pre`")
+            lines = ["📋 我的订阅："] + [f"· `{t}`" for t in subs]
+            return "\n".join(lines)
 
         return None
 
@@ -816,8 +889,9 @@ class FeishuBot:
             self._last_message_time = now
             if gap > 120:
                 logger.warning(f"[飞书] 消息间隔 {gap:.0f} 秒，WebSocket 可能曾断开")
-            logger.info(f"[飞书] 收到消息 [{chat_type}] {sender_open_id}: {text[:80]}"
-                        f"（push_open_id 未配置时可将此 open_id 填入 local.yaml）")
+            logger.info(f"[飞书] 收到消息 [{chat_type}] {sender_open_id}: {text[:80]}")
+            if chat_type == "p2p":
+                logger.info(f"[飞书] p2p 用户 {sender_open_id}，发送「我的订阅」可管理定时任务推送")
 
             # 线程池排队提醒
             queue_size = self.pool._work_queue.qsize()
@@ -833,7 +907,7 @@ class FeishuBot:
                     reply(quick)
                     return
 
-            command_result = self._handle_command(text)
+            command_result = self._handle_command(text, sender_open_id)
             if command_result == "__SCAN__":
                 reply("🔍 开始扫描，完成后推送结果…")
                 self.pool.submit(self._safe_scan, reply)

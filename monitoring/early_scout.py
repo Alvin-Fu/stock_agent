@@ -112,50 +112,53 @@ def _get_industry_perf(code: str, name: str) -> Optional[Dict[str, Any]]:
 
 
 def _compute_early_signal_score(perf: Dict[str, Any]) -> float:
-    """计算行业的"早期埋伏信号"综合分（0-100）"""
+    """计算行业的"早期埋伏信号"综合分（0-100）。
+    各维度先归一化到 0-100，再用 SCORE_WEIGHTS 加权求和，确保权重字典真正生效
+    （修复原 decline_score * 0.4 / 0.4 这类冗余计算——权重被抵消、SCORE_WEIGHTS 形同虚设）。"""
     t = EARLY_SIGNAL_THRESHOLDS
-    score = 0.0
+    w = SCORE_WEIGHTS
 
-    # 1) 60 日跌幅得分：跌越多分越高（跌透了才有埋伏价值）
+    # 1) 60 日跌幅得分（0-100）：跌越多分越高（跌透了才有埋伏价值）
     ret60 = perf.get("ret60", 0) or 0
     if ret60 < 0:
-        # 跌幅超 20% → 满分 40；跌幅 10% → 20 分；没跌 → 0
-        decline_score = min(abs(ret60) / 20.0, 1.0) * 40
+        # 跌幅超 20% → 满分 100；跌幅 10% → 50 分；没跌 → 0
+        decline_score = min(abs(ret60) / 20.0, 1.0) * 100
     else:
-        decline_score = 0
-    score += decline_score * 0.4 / 0.4  # 权重已内置在分数里
+        decline_score = 0.0
 
-    # 2) 20 日企稳得分：最近不创新低 + 跌幅收窄
-    stability = 0
+    # 2) 20 日企稳得分（0-100）：最近不创新低 + 跌幅收窄
     ret20 = perf.get("ret20", 0) or 0
     new_low = perf.get("new_low_5", True)
-
     if not new_low and ret20 >= t["20d_stability_max"]:
-        stability = 30  # 不创新低 + 企稳 → 满分
+        stabilize_score = 100.0  # 不创新低 + 企稳 → 满分
     elif not new_low:
-        stability = 15  # 不创新低但还在跌
+        stabilize_score = 50.0   # 不创新低但还在跌
     elif ret20 >= t["20d_stability_max"]:
-        stability = 10  # 创新低但跌幅收窄
-    score += stability * 0.3 / 0.3
+        stabilize_score = 33.0   # 创新低但跌幅收窄
+    else:
+        stabilize_score = 0.0
 
-    # 3) PE 得分：越低越好
+    # 3) PE 得分（0-100）：越低越好
     pe = perf.get("pe")
     if pe is not None and pe > 0:
         if pe <= 15:
-            pe_score = 30
+            pe_score = 100.0
         elif pe <= 25:
-            pe_score = 25
+            pe_score = 83.0
         elif pe <= 40:
-            pe_score = 15
+            pe_score = 50.0
         elif pe <= 60:
-            pe_score = 5
+            pe_score = 17.0
         else:
-            pe_score = 0
+            pe_score = 0.0
     else:
-        pe_score = 10  # 无 PE 数据给中等的分
-    score += pe_score * 0.3 / 0.3
+        pe_score = 33.0  # 无 PE 数据给中等的分
 
-    return round(score, 1)
+    # 加权求和：SCORE_WEIGHTS 字典真正生效
+    total = (decline_score * w["decline_60d"]
+             + stabilize_score * w["stability_20d"]
+             + pe_score * w["pe_low"])
+    return round(total, 1)
 
 
 def _get_recently_studied_industries(days: int = 30) -> List[str]:
@@ -176,12 +179,12 @@ def _get_recently_studied_industries(days: int = 30) -> List[str]:
         return []
 
 
-def _push_to_feishu(title: str, content: str):
+def _push_to_feishu(title: str, content: str, task_id: str = ""):
     """推送消息到飞书"""
     try:
         from monitoring.notifier import FeishuNotifier
         notifier = FeishuNotifier()
-        notifier.send_card_text(content[:3500], title)
+        notifier.send_card_text(content[:3500], title, task_id=task_id)
     except Exception as e:
         logger.warning(f"飞书推送失败: {e}")
 
@@ -345,7 +348,7 @@ def run_early_scout() -> str:
         full_report = summary_header + candidate_summary + "\n\n" + "\n\n".join(reports)
 
         # 推送到飞书
-        _push_to_feishu("周六早期信号巡逻", full_report[:3500])
+        _push_to_feishu("周六早期信号巡逻", full_report[:3500], task_id="early_scout")
 
         return full_report
 

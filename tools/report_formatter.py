@@ -10,7 +10,7 @@
 """
 
 import re
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from utils.logger import logger
 
@@ -75,14 +75,14 @@ def _categorize_limitations(text: str) -> str:
 # ======================== 产业链预期维度 ========================
 
 _INDUSTRY_SECTIONS = [
-    ("结论", ["📌", "结论", "核心结论", "行业结论"]),
+    ("结论", ["📌", "结论", "核心结论", "行业结论", "投资建议"]),  # "投资建议"可能出现在结论中
     ("产业链全景图", ["产业链全景", "全景图", "产业链概览", "产业链结构", "全产业链"]),
-    ("关键环节", ["关键环节", "核心环节", "重要环节", "价值环节"]),
-    ("候选公司", ["候选公司", "最值得投资", "⭐", "重点标的", "推荐标的", "投资标的"]),
-    ("行业趋势", ["行业趋势", "发展趋势", "行业前景", "未来趋势", "行业方向"]),
-    ("环节利润迁移判断", ["利润迁移", "环节利润", "利润判断", "利润变动"]),
-    ("投资建议", ["投资建议", "投资策略", "配置建议", "行业配置"]),
-    ("行业风险", ["行业风险", "风险因素", "风险提示", "潜在风险"]),
+    ("关键环节", ["关键环节", "核心环节", "重要环节", "价值环节", "环节利润迁移"]),  # 利润迁移在关键环节内
+    ("⭐最值得投资标的", ["⭐", "最值得投资", "最佳标的", "首选标的", "最优标的"]),  # 含⭐标题优先匹配，排在候选公司之前
+    ("候选公司", ["候选公司", "重点标的", "推荐标的", "投资标的", "候选标的", "标的池"]),
+    ("行业趋势", ["行业趋势", "发展趋势", "行业前景", "未来趋势", "行业方向", "催化时间轴"]),
+    ("风险提示", ["风险提示", "行业风险", "风险因素", "潜在风险"]),
+    ("数据准确性声明", ["数据准确性", "数据声明", "数据来源", "信源", "交叉验证"]),
     ("分析局限性说明", ["分析局限性", "局限", "免责", "风险提示"]),
 ]
 
@@ -100,23 +100,32 @@ def _find_section(heading: str, expected: List[Tuple[str, List[str]]]) -> int:
 
 
 def _split_text(text: str) -> List[Tuple[str, str]]:
-    """将 markdown 文本按 ##/### 标题切分，返回 [(标题, 内容), ...]"""
-    # 按 ## 或 ### 分割（保留标题行），但不匹配 ######
-    pattern = r"^(#{2,3})\s+(.+)$"
+    """将 markdown 文本按 ## 或 **第X节 ...** 标题切分，返回 [(标题, 内容), ...]
+    ### 子标题不切分，归属到上一个 ## 节内。"""
+    _H2_PATTERN = re.compile(r"^##\s+(.+)$")              ## ## 标题（### 不切分）
+    _BOLD_PATTERN = re.compile(r"^\*\*(第\d+节\s*.+?)\*\*\s*$")  # **第X节 标题**
     lines = text.split("\n")
     sections = []
     current_heading = ""
     current_content = []
 
     for line in lines:
-        m = re.match(pattern, line.strip())
+        stripped = line.strip()
+        m = _H2_PATTERN.match(stripped)
         if m:
             if current_heading or current_content:
                 sections.append((current_heading, "\n".join(current_content).strip()))
-            current_heading = m.group(2).strip()
+            current_heading = m.group(1).strip()
             current_content = []
-        else:
-            current_content.append(line)
+            continue
+        m = _BOLD_PATTERN.match(stripped)
+        if m:
+            if current_heading or current_content:
+                sections.append((current_heading, "\n".join(current_content).strip()))
+            current_heading = m.group(1).strip()
+            current_content = []
+            continue
+        current_content.append(line)
 
     if current_heading or current_content:
         sections.append((current_heading, "\n".join(current_content).strip()))
@@ -262,31 +271,95 @@ def _has_proper_table(content: str, min_rows: int = 3) -> bool:
     return table_rows >= min_rows
 
 
-def _extract_chain_companies(text: str) -> List[Dict[str, str]]:
-    """从产业链报告文本中提取候选公司列表"""
+def _extract_chain_companies(text: str) -> List[Dict[str, Any]]:
+    """从产业链报告文本中提取候选公司列表（含评分数据）"""
     companies = []
-    # 尝试匹配 JSON 候选
     import json
-    json_match = re.search(r'"candidates"\s*:\s*\[.*?\]', text, re.DOTALL)
-    if json_match:
-        try:
-            raw = "{" + json_match.group(0) + "}"
-            data = json.loads(raw)
-            for c in data.get("candidates", []):
-                code = c.get("code", "")
-                name = c.get("name", "")
-                companies.append({"code": code, "name": name,
-                                  "business": c.get("business"),
-                                  "moat": c.get("moat"),
-                                  "momentum": c.get("momentum")})
-        except Exception:
-            pass
 
-    # 没有 JSON 或解析失败时从表格行提取
+    # ===== 方式一：从 format_ranking_table 的文本输出中解析（数据最完整） =====
+    # 格式样例：
+    # 1. 汇川技术(300124) 综合7.5 = 业务7.0 基本面8.0 护城河6.5 边际8.5
+    #   ｜PE25.0(30%分位)🟢合理PE｜调整后7.8（+0.3）｜机会象限｜市值1500亿
+    _RANK_LINE = re.compile(
+        r'(\d+)\.\s*'                          # rank
+        r'([\u4e00-\u9fa5a-zA-Z\s]+?)'          # name（非贪婪直到 (code)）
+        r'\((\d{6})\)\s*'                       # code
+        r'综合([\d.]+)\s*=\s*'                  # composite
+        r'业务([\d.]+)\s*'                      # business
+        r'基本面([\d.]+)\s*'                    # fundamental
+        r'护城河([\d.]+)\s*'                    # moat
+        r'边际([\d.]+)'                         # momentum
+    )
+
+    for line in text.split("\n"):
+        m = _RANK_LINE.search(line)
+        if m:
+            rank = int(m.group(1))
+            name = m.group(2).strip()
+            code = m.group(3)
+            composite = float(m.group(4))
+            business = float(m.group(5))
+            fundamental = float(m.group(6))
+            moat = float(m.group(7))
+            momentum = float(m.group(8))
+
+            # 解析｜后的额外字段
+            pe_ttm, pe_percentile, pe_tag = None, None, None
+            composite_adj, valuation_adj = None, None
+            quadrant = None
+
+            rest = line[m.end():]
+            # PE: PE25.0(30%分位)🟢合理PE
+            pe_m = re.search(r'PE([\d.]+)\(([\d.]+)%分位\)([^\|]*)', rest)
+            if pe_m:
+                pe_ttm = float(pe_m.group(1))
+                pe_percentile = float(pe_m.group(2))
+                pe_tag = pe_m.group(3).strip()
+            # 调整后：调整后7.8（+0.3）或 调整后7.8
+            adj_m = re.search(r'调整后([\d.]+)(?:（([+-][\d.]+)）)?', rest)
+            if adj_m:
+                composite_adj = float(adj_m.group(1))
+                if adj_m.group(2):
+                    valuation_adj = float(adj_m.group(2))
+            # 象限：机会象限 / 拥挤区
+            quad_m = re.search(r'([^｜]*(?:象限|拥挤区))', rest)
+            if quad_m:
+                quadrant = quad_m.group(1).strip()
+
+            companies.append({
+                "rank": rank, "code": code, "name": name,
+                "business": business, "fundamental": fundamental,
+                "moat": moat, "momentum": momentum,
+                "composite": composite,
+                "composite_adj": composite_adj,
+                "pe_ttm": pe_ttm, "pe_percentile": pe_percentile,
+                "pe_tag": pe_tag, "quadrant": quadrant,
+                "valuation_adj": valuation_adj,
+            })
+
+    # ===== 方式二：从 JSON candidates 中提取 =====
     if not companies:
-        lines = text.split("\n")
-        for line in lines:
-            # 匹配 "公司名(代码)" 或 "代码" 模式
+        json_match = re.search(r'"candidates"\s*:\s*\[.*?\]', text, re.DOTALL)
+        if json_match:
+            try:
+                raw = "{" + json_match.group(0) + "}"
+                data = json.loads(raw)
+                for c in data.get("candidates", []):
+                    code = c.get("code", "")
+                    name = c.get("name", "")
+                    companies.append({
+                        "code": code, "name": name,
+                        "business": c.get("business"),
+                        "fundamental": c.get("fundamental"),
+                        "moat": c.get("moat"),
+                        "momentum": c.get("momentum"),
+                    })
+            except Exception:
+                pass
+
+    # ===== 方式三：从表格行中提取公司名和代码 =====
+    if not companies:
+        for line in text.split("\n"):
             m = re.search(r'\|[^|]*?([\u4e00-\u9fa5]{2,6}?)[（(](6\d{5}|3\d{5}|0\d{5})[）)]', line)
             if m:
                 companies.append({"code": m.group(2), "name": m.group(1)})
@@ -326,7 +399,7 @@ def _build_panorama_table(text: str, fallback: str = "") -> str:
 
 
 def _build_candidate_table(text: str, candidate_json: str = "") -> str:
-    """构建候选公司完整打分明细总表"""
+    """构建候选公司完整打分明细总表（优先解析 format_ranking_table 输出，数据最完整）"""
     companies = _extract_chain_companies(text)
     if not companies:
         return MSG_MISSING_SECTION
@@ -335,18 +408,93 @@ def _build_candidate_table(text: str, candidate_json: str = "") -> str:
         "| 排名 | 公司名称 | 股票代码 | 赛道归属 | 业务分 | 基本面分 | 护城河分 | 边际变化分 | 调整后总分 | PE历史分位 | 拥挤度标签 |",
         "|-----|---------|---------|---------|-------|---------|---------|----------|----------|----------|----------|",
     ]
-    for i, c in enumerate(companies[:15], 1):
+    for c in companies[:15]:
+        rank = c.get("rank", "-")
+        name = c.get("name", "-")
+        code = c.get("code", "-")
         bus = c.get("business", "-")
+        fundamental = c.get("fundamental", "-")
         moat = c.get("moat", "-")
         mom = c.get("momentum", "-")
+        # 优先用 composite_adj（调整后总分），其次 composite
+        composite_adj = c.get("composite_adj", c.get("composite", "-"))
+        if composite_adj is None:
+            composite_adj = "-"
+        # PE分位
+        pct = c.get("pe_percentile")
+        pe_display = f"{pct:.0f}%" if pct is not None else "-"
+        # 拥挤度标签
+        quad = c.get("quadrant", "-") or "-"
+
         table_parts.append(
-            f"| {i} | {c.get('name', '-')} | {c.get('code', '-')} | - | {bus} | - | {moat} | {mom} | - | - | - |"
+            f"| {rank} | {name} | {code} | - | {bus} | {fundamental} | {moat} | {mom} | {composite_adj} | {pe_display} | {quad} |"
         )
     return "\n".join(table_parts)
 
 
-def format_industry_report(text: str) -> str:
-    """产业链报告后处理：查缺、重排、补占位，确保两大核心表格存在"""
+def _build_candidate_table_from_ranked(ranked: List[Dict[str, Any]]) -> str:
+    """直接从程序计算的 ranked 数据构建候选公司表格（最可靠，不依赖 LLM 输出格式）"""
+    if not ranked:
+        return MSG_MISSING_SECTION
+
+    # 过滤无效项（无代码的跳过）
+    valid_items = [item for item in ranked[:15] if item.get("code") and str(item["code"]).strip()]
+    if not valid_items:
+        return MSG_MISSING_SECTION
+
+    # 缺 name 的统一用 find_company_name 补全
+    name_lookup = {}
+    try:
+        from agents.researcher.researcher_agent import find_company_name
+        for item in valid_items:
+            code = str(item.get("code", "")).strip()
+            name = (item.get("name") or "").strip()
+            if not name and code:
+                if code not in name_lookup:
+                    try:
+                        name_lookup[code] = find_company_name(code) or ""
+                    except Exception:
+                        name_lookup[code] = ""
+                name = name_lookup.get(code, "")
+            item["_display_name"] = name or code
+    except Exception:
+        for item in valid_items:
+            item["_display_name"] = (item.get("name") or "").strip() or str(item.get("code", ""))
+
+    # 确定分位窗口口径（取第一只有效数据的窗口）
+    window_label = ""
+    for item in valid_items:
+        w = item.get("pe_pct_window")
+        if w:
+            window_label = w
+            break
+    pe_header = f"PE分位({window_label})" if window_label else "PE历史分位"
+
+    table_parts = [
+        f"| 排名 | 公司名称 | 股票代码 | 赛道归属 | 业务分 | 基本面分 | 护城河分 | 边际变化分 | 调整后总分 | {pe_header} | 拥挤度标签 |",
+        "|-----|---------|---------|---------|-------|---------|---------|----------|----------|----------|----------|",
+    ]
+    for item in valid_items:
+        rank = item.get("rank", "-")
+        name = item.get("_display_name", item.get("code", "-"))
+        code = str(item.get("code", "")).strip()
+        bus = item.get("business", "-")
+        fundamental = item.get("fundamental", "-")
+        moat = item.get("moat", "-")
+        mom = item.get("momentum", "-")
+        composite_adj = item.get("composite_adj", item.get("composite", "-"))
+        pct = item.get("pe_percentile")
+        pe_display = f"{pct:.0f}%" if pct is not None else "-"
+        quadrant = item.get("quadrant", "-") or "-"
+        table_parts.append(
+            f"| {rank} | {name} | {code} | - | {bus} | {fundamental} | {moat} | {mom} | {composite_adj} | {pe_display} | {quadrant} |"
+        )
+    return "\n".join(table_parts)
+
+
+def format_industry_report(text: str, ranked_data: Optional[List[Dict[str, Any]]] = None) -> str:
+    """产业链报告后处理：查缺、重排、补占位，确保两大核心表格存在。
+    ranked_data: 程序计算的排名数据（来自 researcher），有则直接用（最可靠），无则从文本解析。"""
     if not text or len(text.strip()) < 20:
         return text
 
@@ -372,11 +520,22 @@ def format_industry_report(text: str) -> str:
                 assignments[_PANORAMA_IDX] = ("", f"以下为程序自动整理的产业链全景分层表：\n\n{panorama}")
 
     if _CANDIDATE_IDX in assignments:
-        _, content = assignments[_CANDIDATE_IDX]
-        if len(content.strip()) <= _MIN_CONTENT_CHARS or not _has_proper_table(content):
-            candidate_table = _build_candidate_table(text)
+        heading, content = assignments[_CANDIDATE_IDX]
+        has_table = _has_proper_table(content) if len(content.strip()) > _MIN_CONTENT_CHARS else False
+        if not has_table:
+            # 优先使用程序传入的 ranked_data（最可靠），其次从文本解析
+            if ranked_data:
+                candidate_table = _build_candidate_table_from_ranked(ranked_data)
+            else:
+                candidate_table = _build_candidate_table(text)
             if candidate_table and candidate_table != MSG_MISSING_SECTION:
-                assignments[_CANDIDATE_IDX] = ("", f"以下为程序整理的候选公司完整打分明细总表（综合排名由程序按阶段权重计算）：\n\n{candidate_table}")
+                # 排名表插在候选公司节的最前面，后面保留 LLM 生成的公司详情
+                intro = "以下为程序整理的候选公司完整打分明细总表（综合排名由程序按阶段权重计算）："
+                if content and len(content.strip()) > _MIN_CONTENT_CHARS:
+                    new_content = f"{intro}\n\n{candidate_table}\n\n---\n\n{content}"
+                else:
+                    new_content = f"{intro}\n\n{candidate_table}"
+                assignments[_CANDIDATE_IDX] = (heading, new_content)
 
     output = []
     for idx, (expected_name, _) in enumerate(_INDUSTRY_SECTIONS):
@@ -475,13 +634,14 @@ def _apply_llm_fixes(text: str, mode: str) -> str:
     return text
 
 
-def format_report(text: str, mode: str) -> str:
+def format_report(text: str, mode: str, ranked_data: Optional[List[Dict[str, Any]]] = None) -> str:
     """
     报告格式后处理统一入口。
 
     Args:
         text: LLM 生成的原始报告
         mode: "etf" / "stock" / "industry"
+        ranked_data: 产业链模式下的程序计算排名数据（来自 researcher），有则直接用
 
     Returns:
         格式化后的报告（固定顺序 + 补缺 + LLM 内容修正）
@@ -499,7 +659,7 @@ def format_report(text: str, mode: str) -> str:
         elif mode == "stock":
             return format_stock_report(text)
         elif mode == "industry":
-            return format_industry_report(text)
+            return format_industry_report(text, ranked_data=ranked_data)
         return text
     except Exception as e:
         logger.warning(f"[格式化] 报告后处理失败（返回原文）: {e}")

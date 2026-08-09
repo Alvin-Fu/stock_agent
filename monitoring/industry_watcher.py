@@ -225,7 +225,7 @@ def scan_industry_pools() -> List[str]:
             if archived_pe_pct is not None:
                 current_val = _get_valuation_percentile(code)
                 if current_val:
-                    current_pe = current_val.get("pe_percentile_median")
+                    current_pe = current_val.get("pe_percentile")
                     if current_pe is not None:
                         pe_diff = current_pe - archived_pe_pct
                         if abs(pe_diff) > 15:

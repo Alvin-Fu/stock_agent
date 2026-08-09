@@ -19,6 +19,107 @@ MIN_INDUSTRY_SAMPLES = 15  # 产业链复盘最少次数
 MIN_GATE_PAIRS = 8         # 进池/剔除对照最少配对数
 
 
+def _auto_feedback_thresholds(reviews, acc, pairs, lines):
+    """根据校准结果自动调整配置权重。
+
+    当校准数据发现明显趋势时（剔除组反而更强、命中率偏低、排名反向占比高），
+    自动微调 stage_weights / tech_weights 并写回 local.yaml，下次分析自动生效。
+    每次调整受 STEP_LIMIT / CUMULATIVE_LIMIT 约束，防止过度矫正。
+    """
+    from tools.weight_adjuster import (
+        get_stage_weights, get_tech_weights, _save_weights_to_config,
+        _load_weights_from_config, DEFAULT_STAGE_WEIGHTS, DEFAULT_TECH_WEIGHTS,
+        STEP_LIMIT, CUMULATIVE_LIMIT,
+    )
+    from datetime import datetime
+
+    adjustments_made = []
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    cfg = _load_weights_from_config()
+
+    # 1. 门槛有效性反馈：剔除组明显更强 → 降低 momentum，提升 moat
+    if len(pairs) >= MIN_GATE_PAIRS:
+        diffs = [p - e for p, e in pairs]
+        if statistics.mean(diffs) < -1.0:
+            stage_weights = get_stage_weights()
+            changed = False
+            for stage_name, sw in stage_weights.items():
+                old_mom = sw.get("momentum", 0)
+                old_moat = sw.get("moat", 0)
+                new_mom = max(0.05, old_mom - STEP_LIMIT)
+                new_moat = old_moat + (old_mom - new_mom)
+                default_mom = DEFAULT_STAGE_WEIGHTS.get(stage_name, {}).get("momentum", old_mom)
+                if abs(new_mom - default_mom) <= CUMULATIVE_LIMIT:
+                    sw["momentum"] = round(new_mom, 2)
+                    sw["moat"] = round(new_moat, 2)
+                    changed = True
+            if changed:
+                cfg["stage_weights"] = stage_weights
+                adjustments_made.append(
+                    f"门槛反馈：降低momentum {STEP_LIMIT}，提升moat {STEP_LIMIT}")
+
+    # 2. 方向判断偏差反馈：总体命中率偏低 → 降低 daily，提升 weekly
+    judged = acc.get("judged", 0)
+    if judged >= MIN_STOCK_SAMPLES:
+        accuracy = acc.get("accuracy", 50)
+        if accuracy < 45:
+            tech_weights = get_tech_weights()
+            old_daily = tech_weights.get("daily", 0.5)
+            old_weekly = tech_weights.get("weekly", 0.3)
+            new_daily = max(0.35, old_daily - STEP_LIMIT)
+            new_weekly = old_weekly + (old_daily - new_daily)
+            default_daily = DEFAULT_TECH_WEIGHTS.get("daily", old_daily)
+            if abs(new_daily - default_daily) <= CUMULATIVE_LIMIT:
+                tech_weights["daily"] = round(new_daily, 2)
+                tech_weights["weekly"] = round(new_weekly, 2)
+                cfg["tech_weights"] = tech_weights
+                adjustments_made.append(
+                    f"方向偏差反馈：降低daily {STEP_LIMIT}，提升weekly {STEP_LIMIT}")
+
+    # 3. 产业链排名反向反馈：反向占比超 40% → 降低 fundamental，提升 momentum
+    if len(reviews) >= MIN_INDUSTRY_SAMPLES:
+        eff = [r.get("rank_effective") for r in reviews]
+        total_eff = len([e for e in eff if e in ("有效", "无区分", "反向")])
+        if total_eff > 0:
+            reverse_ratio = eff.count("反向") / total_eff
+            if reverse_ratio > 0.4:
+                stage_weights = cfg.get("stage_weights") or get_stage_weights()
+                changed = False
+                for stage_name, sw in stage_weights.items():
+                    old_fund = sw.get("fundamental", 0)
+                    old_mom = sw.get("momentum", 0)
+                    new_fund = max(0.10, old_fund - STEP_LIMIT)
+                    new_mom = old_mom + (old_fund - new_fund)
+                    default_fund = DEFAULT_STAGE_WEIGHTS.get(stage_name, {}).get("fundamental", old_fund)
+                    if abs(new_fund - default_fund) <= CUMULATIVE_LIMIT:
+                        sw["fundamental"] = round(new_fund, 2)
+                        sw["momentum"] = round(new_mom, 2)
+                        changed = True
+                if changed:
+                    cfg["stage_weights"] = stage_weights
+                    adjustments_made.append(
+                        f"排名反向反馈（反向占比{reverse_ratio:.0%}）："
+                        f"降低fundamental {STEP_LIMIT}，提升momentum {STEP_LIMIT}")
+
+    # 写回配置
+    if adjustments_made:
+        log = cfg.get("adjustment_log") or []
+        for adj in adjustments_made:
+            log.append(f"[{now_str}] [阈值校准] {adj}")
+        cfg["adjustment_log"] = log
+        ok = _save_weights_to_config(cfg)
+        lines.append("\n## 自动反馈执行结果")
+        if ok:
+            for adj in adjustments_made:
+                lines.append(f"- ✅ {adj}")
+            lines.append("- 权重已写回 local.yaml，下次分析自动生效")
+        else:
+            lines.append("- ⚠️ 权重写回失败，请检查 local.yaml 权限")
+    else:
+        lines.append("\n## 自动反馈执行结果")
+        lines.append("- 未触发任何调整（样本不足或偏差未达阈值）")
+
+
 def main() -> None:
     from storage.sqlite.stock_storage import (
         get_db, AnalysisSnapshot, AnalysisReview, IndustryReview)
@@ -96,6 +197,8 @@ def main() -> None:
                          "或降低 moat 权重（改 STAGE_GATES / STAGE_WEIGHTS 后继续观察）")
         else:
             lines.append("- 门槛方向正确；差距<1% 时视为无区分，维持现状继续积累")
+
+    _auto_feedback_thresholds(reviews, acc, pairs, lines)
 
     print("\n".join(lines))
 

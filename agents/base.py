@@ -26,6 +26,9 @@ class AgentState(TypedDict):
         - stock_type: 标的类型（a_stock / etf / hk_stock），由路由器设置，用于管线分流
         - industry_name: 行业名称（行业/产业链分析时使用）
         - chain_leaders: 行业龙头股列表 [{code, name, rank}]（龙一龙二）
+        - ranked_candidates: 产业链候选公司排名数据（含排名/评分/基本面分析，由 researcher 产出供 technical 交叉分析）
+        - stock_attribute: 标的属性分类（周期股/成长股/防御股/价值股），由 router 统一判定，下游 Agent 直接读取避免重复调用
+        - current_node: 当前执行节点名（用于调试与状态追踪）
         - question: 当前用户问题
         - intent: 识别出的意图类型
         - documents: 检索到的文档列表
@@ -45,6 +48,9 @@ class AgentState(TypedDict):
     stock_type: Optional[str]  # a_stock / etf / hk_stock
     industry_name: Optional[str]
     chain_leaders: Optional[Dict[str, Any]]
+    ranked_candidates: Optional[List[Dict[str, Any]]]
+    stock_attribute: Annotated[Optional[Dict[str, Any]], _keep_last]  # 标的属性分类（周期股/成长股/防御股/价值股），由 router 统一判定；并行分支都写入此字段时用 _keep_last 合并
+    current_node: Optional[str]  # 当前执行节点名（用于调试与状态追踪）
     question: str
     intent: Optional[str]
     documents: List[Any]  # Document 对象列表
@@ -53,6 +59,7 @@ class AgentState(TypedDict):
     research_result: Optional[Dict[str, Any]]
     compliance_result: Optional[Dict[str, Any]]
     technical_result: Optional[Dict[str, Any]]
+    quality_metrics: Optional[Dict[str, Any]]  # 质量否决权指标（ROE/扣非/商誉）
     final_answer: Optional[str]
     intermediate_steps: Annotated[List[tuple], operator.add]
     next_agents: List[str]

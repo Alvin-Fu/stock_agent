@@ -21,16 +21,17 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # case 设计：覆盖 成熟白马/亏损承压/技术面单项/导入期产业链/成熟产业链 五种形态
+# expected_direction：预期报告结论的倾向方向（偏多/中性/偏空），用于方向检测维度
 CASES = [
-    {"id": "byd-full", "mode": "stock",
+    {"id": "byd-full", "mode": "stock", "expected_direction": "偏多",
      "question": "全面分析比亚迪（002594）的基本面、技术面和投资价值"},
-    {"id": "moutai-fund", "mode": "stock",
+    {"id": "moutai-fund", "mode": "stock", "expected_direction": "偏多",
      "question": "分析贵州茅台（600519）的财务状况、估值与护城河"},
-    {"id": "catl-tech", "mode": "stock",
+    {"id": "catl-tech", "mode": "stock", "expected_direction": "中性",
      "question": "判断宁德时代（300750）当前的均线走势、MACD信号和支撑压力位"},
-    {"id": "aerospace-chain", "mode": "industry",
+    {"id": "aerospace-chain", "mode": "industry", "expected_direction": "偏多",
      "question": "分析商业航天产业链上下游，筛选出所有关键公司，对比技术面和基本面，选出最值得投资的股票"},
-    {"id": "liquor-chain", "mode": "industry",
+    {"id": "liquor-chain", "mode": "industry", "expected_direction": "中性",
      "question": "分析白酒产业链上下游，筛选出所有关键公司，对比技术面和基本面，选出最值得投资的股票"},
 ]
 
@@ -38,6 +39,17 @@ CASES = [
 REQUIRED_SECTIONS = {
     "stock": ["📌", "利润驱动", "情景推演", "风险"],
     "industry": ["📌", "产业链", "行业风险", "最值得投资标的"],
+}
+
+# 方向检测关键词（用于校验报告结论是否与预期方向一致）
+DIRECTION_KEYWORDS = {
+    "偏多": ["看涨", "上涨", "偏多", "强势", "买入", "增持", "机会", "突破", "金叉",
+            "多头", "入场", "加仓", "反弹", "上行", "企稳回升", "看好", "积极", "配置",
+            "推荐", "布局", "增持评级", "景气"],
+    "中性": ["中性", "震荡", "观望", "持平", "持有", "横盘", "平衡", "谨慎观望",
+            "区间整理", "等待", "稳态", "平稳"],
+    "偏空": ["看跌", "下跌", "偏空", "减仓", "卖出", "规避", "空头", "死叉",
+            "回调", "下行", "承压", "减持", "谨慎", "减配", "回避", "利空", "走弱"],
 }
 
 
@@ -54,6 +66,23 @@ def lint_report(text: str, mode: str) -> list:
     if len(text) < 800:
         issues.append(f"报告过短（{len(text)}字符），疑似链路失败")
     return issues
+
+
+def check_direction(text: str, expected_direction: str) -> dict:
+    """方向检测：检查报告中是否包含与预期方向一致的结论关键词。
+    返回 {"match": bool, "hit_keywords": list, "note": str}。
+    仅做关键词命中检查（不花 LLM 钱），命中即认为方向一致。"""
+    if not expected_direction or expected_direction not in DIRECTION_KEYWORDS:
+        return {"match": True, "hit_keywords": [], "note": "未设置预期方向，跳过方向检测"}
+    expected_kw = DIRECTION_KEYWORDS[expected_direction]
+    hits = [kw for kw in expected_kw if kw in text]
+    match = len(hits) > 0
+    if match:
+        note = (f"预期方向「{expected_direction}」命中关键词{len(hits)}个："
+                f"{','.join(hits[:5])}{'...' if len(hits) > 5 else ''}")
+    else:
+        note = f"预期方向「{expected_direction}」未命中任何结论关键词，方向可能不一致"
+    return {"match": match, "hit_keywords": hits, "note": note}
 
 
 def health_flags(text: str, mode: str) -> list:
@@ -106,39 +135,48 @@ def run(only: str = None) -> str:
         elapsed = round(time.time() - t0)
         issues = lint_report(answer, case["mode"])
         flags = health_flags(answer, case["mode"])
+        # 方向检测：校验报告结论是否与预期方向一致
+        dir_result = check_direction(answer, case.get("expected_direction", ""))
+        dir_label = ("✓" if dir_result["match"] else "✗") + case.get("expected_direction", "无")
         (out_dir / f"{case['id']}.md").write_text(
             f"<!-- question: {case['question']} | 用时{elapsed}s | 问题数{len(issues)} -->\n\n"
             + answer + "\n\n## LINT\n" + "\n".join(f"- {i}" for i in issues)
-            + ("\n\n## 数据成色\n" + "\n".join(f"- {f}" for f in flags) if flags else ""),
+            + ("\n\n## 数据成色\n" + "\n".join(f"- {f}" for f in flags) if flags else "")
+            + f"\n\n## 方向检测\n- {dir_result['note']}",
             encoding="utf-8")
-        rows.append((case["id"], len(issues), len(answer), elapsed, "；".join(flags)))
+        rows.append((case["id"], len(issues), len(answer), elapsed, "；".join(flags), dir_label, dir_result["match"]))
         print(f"  {len(issues)} 个问题，{len(answer)} 字符，{elapsed}s"
-              + (f"，数据成色：{'；'.join(flags)}" if flags else ""))
+              + (f"，数据成色：{'；'.join(flags)}" if flags else "")
+              + f"，方向：{dir_label}")
         for i in issues[:8]:
             print(f"  - {i}")
 
     # 摘要 + 与上次基线对比（降级跑的对比结果只供参考，不定基线）
-    tsv = "\n".join(f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}\t{r[4]}" for r in rows)
-    (out_dir / "summary.tsv").write_text("case\tissues\tchars\tseconds\tdegraded\n" + tsv + "\n",
-                                         encoding="utf-8")
+    tsv = "\n".join(f"{r[0]}\t{r[1]}\t{r[2]}\t{r[3]}\t{r[4]}\t{r[5]}" for r in rows)
+    (out_dir / "summary.tsv").write_text(
+        "case\tissues\tchars\tseconds\tdegraded\tdirection\n" + tsv + "\n",
+        encoding="utf-8")
 
     summary = [f"# Golden 回归 {out_dir.name}", "",
-               "| case | 问题数 | 字符数 | 用时s | 数据成色 | 对比上次 |",
-               "|---|---|---|---|---|---|"]
+               "| case | 问题数 | 字符数 | 用时s | 数据成色 | 方向 | 对比上次 |",
+               "|---|---|---|---|---|---|---|"]
     prev_map = {}
     if prev:
         for line in prev[-1].read_text(encoding="utf-8").splitlines()[1:]:
             parts = line.split("\t")
             if len(parts) >= 2 and parts[1].isdigit():
                 prev_map[parts[0]] = int(parts[1])
-    for cid, n_issues, chars, secs, degraded in rows:
+    for cid, n_issues, chars, secs, degraded, dir_label, dir_match in rows:
         base = prev_map.get(cid)
         diff = "首跑" if base is None else (f"{n_issues - base:+d}" if n_issues != base else "持平")
         flag = " ⚠️回归" if base is not None and n_issues > base else ""
         grade = f"⚠️{degraded}" if degraded else "健康"
-        summary.append(f"| {cid} | {n_issues} | {chars} | {secs} | {grade} | {diff}{flag} |")
+        summary.append(f"| {cid} | {n_issues} | {chars} | {secs} | {grade} | {dir_label} | {diff}{flag} |")
     if any(r[4] for r in rows):
         summary += ["", "⚠️ 存在数据降级的 case：其结果不作为质量基准，回归对比仅供参考。"]
+    n_dir_fail = sum(1 for r in rows if not r[6])
+    if n_dir_fail:
+        summary += [f"", f"⚠️ {n_dir_fail} 个 case 方向检测不匹配：报告结论可能与预期方向不一致，需人工复核。"]
     text = "\n".join(summary)
     (out_dir / "summary.md").write_text(text, encoding="utf-8")
     print("\n" + text)

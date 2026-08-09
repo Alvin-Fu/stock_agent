@@ -102,7 +102,7 @@ search:
 feishu:
   app_id: ""          # 开放平台自建应用 App ID（cli_ 开头）
   app_secret: ""      # 应用 Secret
-  push_open_id: ""    # 监控主动推送给谁：你的 open_id（可先留空，给机器人发条消息，日志里会打印）
+  push_open_id: ""    # 监控主动推送给谁：你的 open_id（多人用逗号分隔，如 "ou_xxx,ou_yyy"）
   webhook_url: ""     # 群自定义机器人 webhook（可选：不建应用时的纯推送兜底）
 
 # 监控配置（watchlist 通过飞书发「监控 比亚迪」管理）

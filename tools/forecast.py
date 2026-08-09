@@ -9,10 +9,67 @@ forward PE 由**程序计算**（现价÷预测EPS），LLM 只允许引用—�
 """
 
 import re
+import json
+import os
+import threading
+from datetime import datetime
 from typing import Any, List, Optional
 
 from utils.logger import logger
 from utils.retry_utils import retry_with_backoff
+
+# Tushare 缓存（模块级，进程内复用）+ 线程锁保护
+_TS_SHARE_CACHE: dict = {}  # code → 总股本(亿股)
+_TS_CLOSE_CACHE: dict = {}  # code → close(元，供 forward PE 兜底)
+_TS_CACHE_LOCK = threading.Lock()
+
+# 机构预测文本的文件缓存目录（主数据源失败时降级读取）
+_FORECAST_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "cache")
+
+
+def _save_forecast_cache(code: str, text: str) -> None:
+    """将成功的预测文本缓存到文件，供下次主数据源失败时降级使用"""
+    try:
+        os.makedirs(_FORECAST_CACHE_DIR, exist_ok=True)
+        cache_path = os.path.join(_FORECAST_CACHE_DIR, f"forecast_{code}.json")
+        cache_data = {
+            "code": code,
+            "text": text,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False)
+    except Exception as e:
+        logger.debug(f"[盈利预测] 缓存写入失败 {code}: {e}")
+
+
+def _load_forecast_cache(code: str) -> Optional[str]:
+    """从文件缓存读取上次的预测文本；缓存不存在或损坏返回 None"""
+    try:
+        cache_path = os.path.join(_FORECAST_CACHE_DIR, f"forecast_{code}.json")
+        if not os.path.exists(cache_path):
+            return None
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cache_data = json.load(f)
+        text = cache_data.get("text", "")
+        timestamp = cache_data.get("timestamp", "未知时间")
+        if text:
+            logger.info(f"[盈利预测] {code} 使用缓存数据（缓存于 {timestamp}）")
+            return f"【以下为缓存数据（{timestamp} 缓存），实时获取失败，仅供参考】\n{text}"
+        return None
+    except Exception as e:
+        logger.debug(f"[盈利预测] 缓存读取失败 {code}: {e}")
+        return None
+
+
+def _forecast_fallback(code: str) -> str:
+    """主数据源失败时的降级方案：文件缓存 → 不可用标注"""
+    cached = _load_forecast_cache(code)
+    if cached:
+        return cached
+    return ("【机构预测数据暂不可用】实时获取失败且无缓存数据，"
+            "请稍后重试或手动查询机构盈利预测。")
 
 
 def _latest_close(code: str) -> Optional[float]:
@@ -29,36 +86,38 @@ def _latest_close(code: str) -> Optional[float]:
 
 def _get_total_shares(code: str) -> Optional[float]:
     """
-    通过 Tushare daily_basic 获取总股本（亿股），用于 EPS × 总股本 → 净利润。
+    通过 TushareFetcher.daily_basic 获取总股本（亿股），用于 EPS × 总股本 → 净利润。
     total_mv（万元）÷ close（元）= 总股本（万股）。
-    缓存总股本和 close 到模块变量，`_ts_close_cache` 供 `_latest_close` 兜底。
+    缓存总股本和 close 到模块变量，`_TS_CLOSE_CACHE` 供 `_latest_close` 兜底。
+    通过 TushareFetcher 调用以受其限流保护，不绕过 _check_rate_limit。
     """
-    if _TS_SHARE_CACHE.get(code) is not None:
-        return _TS_SHARE_CACHE[code]  # type: ignore[return-value]
+    with _TS_CACHE_LOCK:
+        if _TS_SHARE_CACHE.get(code) is not None:
+            return _TS_SHARE_CACHE[code]  # type: ignore[return-value]
     try:
-        import tushare as ts
-        ts_code = f"{code}.SZ" if code.startswith(('000', '002', '300')) else f"{code}.SH"
         from datetime import date, timedelta
-        for days_back in range(0, 5):
-            d = (date.today() - timedelta(days=days_back)).strftime("%Y%m%d")
-            df = ts.pro_api().daily_basic(ts_code=ts_code, trade_date=d,
-                                          fields="close,total_mv")
-            if df is not None and not df.empty:
-                close = float(df.iloc[0].get("close") or 0)
-                total_mv = float(df.iloc[0].get("total_mv") or 0)
-                if close > 0 and total_mv > 0:
-                    shares = total_mv / close / 10000  # 万元÷元 → 万股 → 亿股
+        from tools.stock.tushare_fetcher import TushareFetcher
+        fetcher = TushareFetcher()
+        if fetcher._api is None:
+            return None
+        # 一次查近7天范围（覆盖5个交易日），避免循环多次 API 调用
+        end_date = date.today().strftime("%Y-%m-%d")
+        start_date = (date.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+        df = fetcher.daily_basic(code, start_date=start_date, end_date=end_date)
+        if df is not None and not df.empty:
+            row = df.iloc[0]
+            close = float(row.get("close") or 0)
+            total_mv = float(row.get("total_mv") or 0)
+            if close > 0 and total_mv > 0:
+                shares = total_mv / close / 10000  # 万元÷元 → 万股 → 亿股
+                with _TS_CACHE_LOCK:
                     _TS_SHARE_CACHE[code] = shares
                     _TS_CLOSE_CACHE[code] = close  # 供 forward PE 兜底
-                    return shares
+                return shares
         return None
     except Exception as e:
         logger.debug(f"[盈利预测] 取总股本失败 {code}: {e}")
         return None
-
-# Tushare 缓存（模块级，进程内复用）
-_TS_SHARE_CACHE: dict = {}  # code → 总股本(亿股)
-_TS_CLOSE_CACHE: dict = {}  # code → close(元，供 forward PE 兜底)
 
 
 def _fallback_close(code: str) -> Optional[float]:
@@ -201,9 +260,10 @@ def forward_pe_lines(df, close: Optional[float], total_shares: Optional[float] =
 def forward_peg_lines(df, pe_ttm: float, close: Optional[float] = None,
                       total_shares: Optional[float] = None) -> List[str]:
     """
-    程序计算 forward PEG 区间。
-    forward PEG = PE(TTM) / 预测EPS同比增速（机构预期口径）
-    利用相邻两个预测年度的EPS数据计算每对相邻年度的增速。
+    程序计算 forward PEG。
+    forward PEG = PE(TTM) / 预测净利CAGR（机构预期口径）
+    使用预测期内首末年度的EPS计算CAGR，而非相邻年度增速——
+    相邻年度增速波动大、不反映长期增长趋势，CAGR更稳健。
 
     Args:
         df: 预测 DataFrame（同 forward_pe_lines 的输入）
@@ -245,114 +305,195 @@ def forward_peg_lines(df, pe_ttm: float, close: Optional[float] = None,
     if len(pairs) < 2:
         return lines
 
-    # 计算相邻年度的同比增速 → 再算 PEG
-    peg_pairs = []  # [(year_str, growth%, peg)]
-    for i in range(len(pairs) - 1):
-        y0, e0 = pairs[i]
-        y1, e1 = pairs[i + 1]
-        growth = ((e1 / e0) - 1) * 100
-        if growth > 0:
-            peg = round(pe_ttm / growth, 2)
-            peg_pairs.append((y1, round(growth, 1), peg))
-
-    if not peg_pairs:
+    # 计算 CAGR（复合年均增长率）——使用首末年度EPS
+    (y0, e0), (y1, e1) = pairs[0], pairs[-1]
+    span = int(y1) - int(y0)
+    if span <= 0 or e0 <= 0:
         return lines
 
+    cagr = ((e1 / e0) ** (1 / span) - 1) * 100
+
     lines.append(
-        f"【forward PEG（程序计算，PE(TTM){pe_ttm:.1f}÷预测增速，机构预期口径）】"
+        f"【forward PEG（程序计算，PE(TTM){pe_ttm:.1f}÷预测CAGR，机构预期口径）】"
     )
-    for year, growth, peg in peg_pairs:
-        lines.append(f"  {year}年：预测净利增速{growth:+.1f}% → PEG {peg:.2f}")
+    lines.append(f"  预测EPS CAGR（{y0}→{y1}，{span}年）：{cagr:+.1f}%/年")
 
-    # 如果有多年的 PEG 值，给出区间
-    peg_vals = [p[2] for p in peg_pairs]
-    if len(peg_vals) >= 2:
-        peg_min, peg_max = min(peg_vals), max(peg_vals)
-        if peg_max > peg_min:
-            lines.append(f"  forward PEG 区间：{peg_min:.2f} ~ {peg_max:.2f}")
+    if cagr <= 0:
+        lines.append("  CAGR≤0，无法计算有意义的PEG")
+        lines.append("（PEG<1≈相对低估，1~2≈匹配，>2≈偏贵；基于机构预测CAGR，预测≠事实）")
+        return lines
 
-    lines.append("（PEG<1≈相对低估，1~2≈匹配，>2≈偏贵；基于机构预测，预测≠事实）")
+    peg = round(pe_ttm / cagr, 2)
+    lines.append(f"  forward PEG = {pe_ttm:.1f} / {cagr:.1f} = {peg:.2f}")
+
+    # 展示各年度EPS供交叉验证
+    if len(pairs) >= 3:
+        eps_detail = " → ".join(f"{y}年EPS {e:.2f}" for y, e in pairs)
+        lines.append(f"  EPS序列：{eps_detail}")
+
+    lines.append("（PEG<1≈相对低估，1~2≈匹配，>2≈偏贵；基于机构预测CAGR，预测≠事实）")
     return lines
+
+
+def _fetch_forecast_multi_source(code: str):
+    """同时从东财和同花顺获取机构盈利预测，返回 [(source_name, df, n_inst), ...]。
+    多源并取而非 fallback——不同源机构数和 EPS 可能不同，需同时展示供交叉验证。"""
+    import akshare as ak
+    sources = []
+
+    def _fetch_one(fname, kwargs):
+        fn = getattr(ak, fname, None)
+        if fn is None:
+            raise ValueError(f"函数 {fname} 不存在")
+        result = fn(**kwargs)
+        if result is None or getattr(result, "empty", True):
+            raise ValueError("返回空数据")
+        return result
+
+    # 源1：东财
+    try:
+        raw_df = retry_with_backoff(_fetch_one, max_retries=2,
+                                    fname="stock_profit_forecast_em",
+                                    kwargs={"symbol": code})
+        if raw_df is not None and not getattr(raw_df, "empty", True):
+            df = raw_df.copy()
+            for col in ("代码", "股票代码"):
+                if col in getattr(df, "columns", []):
+                    df = df[df[col].astype(str).str.contains(code)]
+                    break
+            if not getattr(df, "empty", True):
+                n_inst = _count_institutions(df)
+                sources.append(("东财", df, n_inst))
+    except Exception as e:
+        logger.warning(f"[盈利预测] 东财源失败: {e}")
+
+    # 源2：同花顺
+    try:
+        raw_df = retry_with_backoff(_fetch_one, max_retries=2,
+                                    fname="stock_profit_forecast_ths",
+                                    kwargs={"symbol": code})
+        if raw_df is not None and not getattr(raw_df, "empty", True):
+            df = raw_df.copy()
+            for col in ("代码", "股票代码"):
+                if col in getattr(df, "columns", []):
+                    df = df[df[col].astype(str).str.contains(code)]
+                    break
+            if not getattr(df, "empty", True):
+                n_inst = _count_institutions(df)
+                sources.append(("同花顺", df, n_inst))
+    except Exception as e:
+        logger.warning(f"[盈利预测] 同花顺源失败: {e}")
+
+    return sources
+
+
+def _pick_primary_source(sources):
+    """从多源中选机构数最多的作为主源（用于 forward PE/PEG 计算）。
+    机构数相同时优先东财（覆盖面更广）。返回 (source_name, df, n_inst) 或 None。"""
+    if not sources:
+        return None
+
+    def _sort_key(s):
+        name, _df, n = s
+        return (n or 0, 1 if name == "东财" else 0)
+
+    return sorted(sources, key=_sort_key, reverse=True)[0]
 
 
 def fetch_profit_forecast_text(code: str, name: str = "",
                                pe_ttm: Optional[float] = None) -> str:
-    """机构盈利预测文本块（含程序算好的 forward PE + forward PEG 区间）；失败返回空串"""
+    """机构盈利预测文本块（多源并取 + 程序算好的 forward PE + forward PEG）；
+    主数据源失败时降级到文件缓存，缓存也没有则返回不可用标注"""
     from tools.source_health import report_source
     try:
-        import akshare as ak
-        df = None
-
-        def _fetch_one(fname, kwargs):
-            fn = getattr(ak, fname, None)
-            if fn is None:
-                raise ValueError(f"函数 {fname} 不存在")
-            result = fn(**kwargs)
-            if result is None or getattr(result, "empty", True):
-                raise ValueError("返回空数据")
-            return result
-
-        for fname, kwargs in (
-                ("stock_profit_forecast_em", {"symbol": code}),
-                ("stock_profit_forecast_ths", {"symbol": code}),
-                ("stock_profit_forecast", {})):
-            try:
-                raw_df = retry_with_backoff(_fetch_one, max_retries=2, fname=fname, kwargs=kwargs)
-                if raw_df is not None and not getattr(raw_df, "empty", True):
-                    df = raw_df.copy()
-                    for col in ("代码", "股票代码"):
-                        if col in getattr(df, "columns", []):
-                            df = df[df[col].astype(str).str.contains(code)]
-                            break
-                    if not getattr(df, "empty", True):
-                        break
-            except Exception as e:
-                logger.warning(f"[盈利预测] {fname} 失败: {e}")
-                df = None
-        if df is None or getattr(df, "empty", True):
+        sources = _fetch_forecast_multi_source(code)
+        if not sources:
             report_source("机构盈利预测", False, "各接口均无数据")
-            return ""
+            return _forecast_fallback(code)
         report_source("机构盈利预测", True)
-        text = df.head(6).to_string(index=False)[:900]
 
         total_shares = _get_total_shares(code)
+        close = _fallback_close(code)
 
-        # 机构预测摘要行（含家数 + EPS + 净利）—— 放在原始表之前，LLM 优先看到程序算好的精确值
-        inst_lines = _institution_summary_lines(df, total_shares=total_shares)
-        inst_block = "\n" + "\n".join(inst_lines) if inst_lines else ""
+        # 选主源（机构数最多）用于 forward PE/PEG 计算
+        primary = _pick_primary_source(sources)
+        if primary:
+            primary_name, primary_df, primary_n = primary
+        else:
+            primary_name, primary_df, primary_n = sources[0]
 
-        fpe_lines = forward_pe_lines(df, _fallback_close(code), total_shares=total_shares)
+        # 各源摘要行（含家数 + EPS + 净利）
+        all_inst_blocks = []
+        for src_name, src_df, src_n in sources:
+            inst_lines = _institution_summary_lines(src_df, total_shares=total_shares)
+            if inst_lines:
+                header = f"【{src_name}机构预测摘要"
+                if src_n:
+                    header += f"（{src_n}家机构）"
+                header += "】"
+                inst_lines[0] = header
+                all_inst_blocks.append("\n".join(inst_lines))
+
+        inst_block = "\n\n".join(all_inst_blocks) if all_inst_blocks else ""
+
+        # 原始表：仅主源
+        raw_text = primary_df.head(6).to_string(index=False)[:900]
+
+        # forward PE（基于主源）
+        fpe_lines = forward_pe_lines(primary_df, close, total_shares=total_shares)
         fpe_block = ""
         if fpe_lines:
-            fpe_block = ("\n【forward PE（程序计算，引用时必须原样使用并标注\"基于机构预测\"）】\n"
+            src_tag = f"{primary_n}家机构" if primary_n else primary_name
+            fpe_block = (f"\n【forward PE（程序计算，基于{primary_name}主源{src_tag}，"
+                         "引用时必须原样使用并标注\"基于机构预测\"）】\n"
                          + "\n".join(fpe_lines))
 
-        # forward PEG 区间（需要 PE(TTM) 数据，从 analyst 传入）
+        # forward PEG（基于主源，需 PE(TTM)）
         fpeg_block = ""
         if pe_ttm is not None and pe_ttm > 0:
-            fpeg_lines = forward_peg_lines(df, pe_ttm,
-                                           close=_fallback_close(code),
+            fpeg_lines = forward_peg_lines(primary_df, pe_ttm,
+                                           close=close,
                                            total_shares=total_shares)
             if fpeg_lines:
                 fpeg_block = "\n" + "\n".join(fpeg_lines)
 
+        # 多源对比提示
+        multi_source_note = ""
+        if len(sources) >= 2:
+            multi_source_note = (
+                f"\n⚠️ 多源对比：共获取 {len(sources)} 个数据源"
+                f"（{'、'.join(s[0] for s in sources)}），"
+                f"主源为{primary_name}（机构数最多）。"
+                "不同源机构覆盖范围和预测口径可能不同，"
+                "引用时需标注来源和样本量；差异>3%时需说明原因。"
+            )
+
         shares_note = ""
         if total_shares:
-            shares_note = ("总股本{:.1f}亿股（Tushare daily_basic，程序获取）".format(total_shares)
-                           + "——净利润=EPS×总股本，由程序计算，引用时**必须**使用上方精确值（即EPS×总股本的结果），"
-                             "不得从原始表中另行取数。")
-        # inst_block 放 raw text 之前，LLM 看到的第一组数字就是程序算好的精确值
-        return ("【机构盈利预测（东财汇总，预测值仅供参考，不是事实）】\n"
+            shares_note = (
+                "总股本{:.1f}亿股（Tushare daily_basic，程序获取）".format(total_shares)
+                + "——净利润=EPS×总股本，由程序计算，引用时**必须**使用上方精确值，"
+                  "不得从原始表中另行取数。"
+            )
+
+        header = "【机构盈利预测（多源并取，预测值仅供参考，不是事实）】\n"
+
+        result_text = (header
                 + (inst_block + "\n" if inst_block else "")
-                + "【原始预测表（仅供对比参考，禁止从中取数计算）】\n" + text
+                + f"【原始预测表（{primary_name}主源，仅供对比参考，禁止从中取数计算）】\n"
+                + raw_text
                 + fpe_block + fpeg_block
-                + "\n（使用规则：净利润已由程序在【机构预测摘要】段按EPS×总股本直接算好，"
+                + multi_source_note
+                + "\n（使用规则：净利润已由程序在各源【机构预测摘要】段按EPS×总股本直接算好，"
                   "**禁止自行用原始预测表心算**forward PE、净利润或增速/CAGR；"
-                  "若原始表中的数字与程序摘要行不一致，以程序摘要行为准；"
+                  "若各源数据不一致，以主源（机构数最多）为准；"
                   "程序未给出 forward PE 时只说明有机构预测覆盖、不做换算；"
                   + ("\n{}".format(shares_note) if shares_note else "")
                   + "预测与已披露实际数矛盾时以实际数为准）")
+        # 成功获取后写入文件缓存，供下次主数据源失败时降级
+        _save_forecast_cache(code, result_text)
+        return result_text
     except Exception as e:
         logger.warning(f"[盈利预测] 获取失败 {code}: {e}")
         report_source("机构盈利预测", False, str(e))
-        return ""
+        return _forecast_fallback(code)

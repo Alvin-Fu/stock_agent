@@ -117,19 +117,49 @@ def build_main_business_text(records: List[Dict], source: str = "东方财富") 
         section_count += 1
         lines.append(f"◆ {type_name}：")
         lines.append("  ※ 利润比例 = 毛利贡献占比（收入×毛利率倒算，非财报直接披露值）")
+        lines.append("  ※ 毛利金额 = 主营收入 × 毛利率（程序倒算，仅供参考）")
+        # ---- 汇总行：总收入 + 境外/海外占比（防LLM把毛利率当占比）----
+        if "地区" in type_name:
+            total_rev = sum(_num(r.get("主营收入")) or 0 for r in rows)
+            overseas_rev = 0
+            overseas_margin = None
+            domestic_margin = None
+            for r in rows:
+                name = str(r.get("主营构成", "")).strip()
+                rev = _num(r.get("主营收入")) or 0
+                margin = _num(r.get("毛利率"))
+                margin_pct = margin * (100 if margin and margin <= 1.01 else 1) if margin else None
+                if any(k in name for k in ["境外", "海外", "国外"]):
+                    overseas_rev += rev
+                    overseas_margin = margin_pct
+                elif any(k in name for k in ["内地", "国内", "境内", "中国"]):
+                    domestic_margin = margin_pct
+            if total_rev > 0 and overseas_rev > 0:
+                overseas_pct = round(overseas_rev / total_rev * 100, 2)
+                summary = f"  ▶ 汇总：总收入{total_rev / 1e8:.1f}亿，境外收入{overseas_rev / 1e8:.2f}亿（占比 {overseas_pct}%）"
+                if overseas_margin is not None and domestic_margin is not None:
+                    diff = round(overseas_margin - domestic_margin, 1)
+                    summary += f"；境外毛利率 {round(overseas_margin, 1)}% vs 内地 {round(domestic_margin, 1)}%（溢价 {diff}pct）"
+                lines.append(summary)
+                lines.append(f"  ⚠️ 注意：境外收入占比仅 {overseas_pct}%，体量较小，出海是高利润率业务的潜在杠杆而非当前主要利润来源")
         for r in rows[:_MAX_ITEMS]:
             name = str(r.get("主营构成", "")).strip()
             revenue = _num(r.get("主营收入"))
             rev_share = _fmt_pct(_num(r.get("收入比例")), scale)
             profit_share = _fmt_pct(_num(r.get("利润比例")), scale)
             margin = _fmt_pct(_num(r.get("毛利率")), _pct_scale([_num(r.get("毛利率"))]))
+            gross_profit = None
+            if revenue is not None and margin is not None:
+                gross_profit = round(revenue * margin / 100 / 1e8, 1)
             seg = f"  - {name}:"
             if revenue is not None:
                 seg += f" 收入{revenue / 1e8:.1f}亿"
+            if gross_profit is not None:
+                seg += f" 毛利(倒算){gross_profit}亿"
             if rev_share is not None:
                 seg += f" 占收入{rev_share}%"
             if profit_share is not None:
-                seg += f" 占利润{profit_share}%"
+                seg += f" 占毛利{profit_share}%"
             if margin is not None:
                 seg += f" 毛利率{margin}%"
             if rev_share is not None and name in prev_share:
@@ -143,10 +173,12 @@ def build_main_business_text(records: List[Dict], source: str = "东方财富") 
 def latest_profit_split(records: List[Dict]) -> List[Dict]:
     """
     最新年报（12-31 期）按产品维度的分部利润占比（纯函数，分部估值 SOTP 用）。
-    返回 [{"name", "profit_share_pct", "rev_share_pct}]；无年报数据返回 []。
+    返回 [{"name", "profit_share_pct", "rev_share_pct", "period",
+           "revenue", "gross_margin", "rev_yoy"}]；无年报数据返回 []。
     
     注意：利润占比来自东财「利润比例」字段 = 毛利贡献占比（收入×毛利率倒算），
     非财报直接披露的净利占比，仅供方向参考。
+    增强字段：revenue(营收绝对值,元), gross_margin(毛利率,%), rev_yoy(营收同比,%)
     """
     if not records:
         return []
@@ -155,6 +187,15 @@ def latest_profit_split(records: List[Dict]) -> List[Dict]:
     if not fy_dates:
         return []
     latest_fy = fy_dates[0]
+    # 上年同期用于计算同比
+    prev_fy = None
+    try:
+        cand = f"{int(latest_fy[:4]) - 1}{latest_fy[4:]}"
+        if cand in fy_dates:
+            prev_fy = cand
+    except ValueError:
+        pass
+
     rows = [r for r in records
             if str(r.get("报告日期", ""))[:10] == latest_fy
             and str(r.get("分类类型", "")).strip() in ("按产品分类", "按产品", "按行业分类", "按行业")
@@ -163,15 +204,39 @@ def latest_profit_split(records: List[Dict]) -> List[Dict]:
         return []
     scale = _pct_scale([_num(r.get("利润比例")) for r in rows])
     rev_scale = _pct_scale([_num(r.get("收入比例")) for r in rows])
+    gm_scale = _pct_scale([_num(r.get("毛利率")) for r in rows])
+
+    # 上年同期分部营收，用于计算同比
+    prev_revenues = {}
+    if prev_fy:
+        prev_rows = [r for r in records
+                     if str(r.get("报告日期", ""))[:10] == prev_fy
+                     and str(r.get("分类类型", "")).strip() in ("按产品分类", "按产品", "按行业分类", "按行业")]
+        for r in prev_rows:
+            name = str(r.get("主营构成", "")).strip()
+            rev = _num(r.get("主营收入"))
+            if name and rev:
+                prev_revenues[name] = rev
+
     out = []
     for r in rows:
         ps = _fmt_pct(_num(r.get("利润比例")), scale)
         rs = _fmt_pct(_num(r.get("收入比例")), rev_scale)
         if ps is None:
             continue
-        out.append({"name": str(r.get("主营构成", "")).strip(),
+        revenue = _num(r.get("主营收入"))
+        gm = _fmt_pct(_num(r.get("毛利率")), gm_scale)
+        # 同比增速
+        rev_yoy = None
+        name = str(r.get("主营构成", "")).strip()
+        if revenue and name in prev_revenues and prev_revenues[name] > 0:
+            rev_yoy = round((revenue / prev_revenues[name] - 1) * 100, 1)
+        out.append({"name": name,
                     "profit_share_pct": ps, "rev_share_pct": rs,
-                    "period": latest_fy})
+                    "period": latest_fy,
+                    "revenue": revenue,
+                    "gross_margin": gm,
+                    "rev_yoy": rev_yoy})
     out.sort(key=lambda x: x["profit_share_pct"], reverse=True)
     return out[:6]
 

@@ -44,6 +44,7 @@ import logging
 from utils.logger import logger
 import random
 import time
+import threading
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Union
 from .common import extract_last_segment_standard, _is_etf_code, _is_hk_code
@@ -203,6 +204,36 @@ USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 ]
 
+# 当前生效的 User-Agent（_set_random_user_agent 每次轮换更新）
+_current_user_agent: str = USER_AGENTS[0]
+_ua_patch_installed: bool = False
+
+
+def _install_user_agent_patch() -> None:
+    """一次性 patch requests 的默认 UA，使 akshare 等基于 requests 的库
+    实际带上我们轮换的 User-Agent。
+
+    akshare 内部用 requests.get / requests.Session 发请求，自身不暴露
+    session 注入口；requests 的默认 UA 由 requests.utils.default_user_agent()
+    产生（Session.__init__ 经 default_headers() 调用，模块级 requests.get
+    每次新建 Session 也会调用）。patch 该函数即可让所有新建会话带上我们的 UA。
+    已在请求 headers 里显式设置 UA 的调用不受影响（请求级 headers 优先）。
+    """
+    global _ua_patch_installed
+    if _ua_patch_installed:
+        return
+    try:
+        import requests as _requests
+
+        def _patched_default_user_agent():
+            return _current_user_agent
+
+        _requests.utils.default_user_agent = _patched_default_user_agent
+        _ua_patch_installed = True
+        logger.debug("已安装 requests User-Agent 补丁")
+    except Exception as e:
+        logger.debug(f"安装 User-Agent 补丁失败: {e}")
+
 
 # 缓存实时行情数据（避免重复请求）
 _realtime_cache: Dict[str, Any] = {
@@ -217,6 +248,9 @@ _etf_realtime_cache: Dict[str, Any] = {
     'timestamp': 0,
     'ttl': 60  # 60秒缓存有效期
 }
+
+# 线程锁（保护实时行情缓存的并发读写）
+_realtime_cache_lock = threading.Lock()
 
 
 class AkshareFetcher(BaseFetcher):
@@ -250,16 +284,17 @@ class AkshareFetcher(BaseFetcher):
     def _set_random_user_agent(self) -> None:
         """
         设置随机 User-Agent
-        
-        通过修改 requests Session 的 headers 实现
-        这是关键的反爬策略之一
+
+        通过 patch requests 的默认 User-Agent（requests.utils.default_user_agent）
+        实际生效，使 akshare 内部的 requests.get / Session 调用都带上轮换后的 UA。
+        这是关键的反爬策略之一。
         """
+        global _current_user_agent
         try:
-            import akshare as ak
-            # akshare 内部使用 requests，我们通过环境变量或直接设置来影响
-            # 实际上 akshare 可能不直接暴露 session，这里通过 fake_useragent 作为补充
-            random_ua = random.choice(USER_AGENTS)
-            logger.debug(f"设置 User-Agent: {random_ua[:50]}...")
+            ua = random.choice(USER_AGENTS)
+            _current_user_agent = ua
+            _install_user_agent_patch()
+            logger.debug(f"设置 User-Agent: {ua[:50]}...")
         except Exception as e:
             logger.debug(f"设置 User-Agent 失败: {e}")
     
@@ -287,7 +322,7 @@ class AkshareFetcher(BaseFetcher):
     @retry(
         stop=stop_after_attempt(3),  # 最多重试3次
         wait=wait_exponential(multiplier=1, min=2, max=30),  # 指数退避：2, 4, 8... 最大30秒
-        retry=retry_if_exception_type((ConnectionError, TimeoutError)),
+        retry=retry_if_exception_type((ConnectionError, TimeoutError, DataFetchError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def _fetch_raw_data(self, freq: str, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -305,8 +340,16 @@ class AkshareFetcher(BaseFetcher):
         4. 调用对应的 akshare API
         5. 处理返回数据
         """
-        if freq != "daily":
+        if freq not in ("daily", "weekly", "monthly"):
             raise ValueError(f"不支持的频率: {freq}")
+
+        # 周线/月线降级：Akshare 无直接周/月线接口，用日线 resample 生成
+        if freq in ("weekly", "monthly"):
+            daily_df = self._fetch_raw_data("daily", stock_code, start_date, end_date)
+            if daily_df is None or daily_df.empty:
+                raise DataFetchError(f"Akshare 周月线降级失败: 日线数据为空 {stock_code}")
+            return self._resample_kline(daily_df, freq)
+
         # 根据代码类型选择不同的获取方法
         if _is_hk_code(stock_code):
             return self._fetch_hk_data(stock_code, start_date, end_date)
@@ -314,32 +357,58 @@ class AkshareFetcher(BaseFetcher):
             return self._fetch_etf_data(stock_code, start_date, end_date)
         else:
             return self._fetch_stock_data(stock_code, start_date, end_date)
-    
+
+    @staticmethod
+    def _resample_kline(daily_df: pd.DataFrame, freq: str) -> pd.DataFrame:
+        """将日线 DataFrame resample 为周线/月线（Akshare 降级方案）"""
+        import pandas as pd
+        df = daily_df.copy()
+        # 确保有 date 列且为 datetime
+        if 'date' not in df.columns:
+            return daily_df
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date')
+        rule = 'W-FRI' if freq == 'weekly' else 'M'
+        agg = {}
+        for col in ('open', 'high', 'low', 'close', 'volume', 'amount'):
+            if col in df.columns:
+                agg[col] = 'last' if col == 'close' else ('sum' if col in ('volume', 'amount') else 'first')
+            # high/low 需要特殊处理
+        if 'high' in df.columns:
+            agg['high'] = 'max'
+        if 'low' in df.columns:
+            agg['low'] = 'min'
+        if 'open' in df.columns:
+            agg['open'] = 'first'
+        resampled = df.resample(rule).agg(agg).dropna(subset=['close'])
+        resampled = resampled.reset_index()
+        resampled['date'] = resampled['date'].dt.strftime('%Y-%m-%d')
+        if 'pct_chg' in resampled.columns:
+            resampled['pct_chg'] = resampled['close'].pct_change() * 100
+        return resampled
+
     def _fetch_stock_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
         获取普通 A 股历史数据
         
-        数据来源：ak.stock_zh_a_hist()
+        数据来源：主=ak.stock_zh_a_hist() (东方财富), 备=ak.stock_zh_a_hist_tx() (腾讯)
         """
         import akshare as ak
+        import time as _time
 
-        
         # 防封禁策略 1: 随机 User-Agent
         self._set_random_user_agent()
-        
         # 防封禁策略 2: 强制休眠
         self._enforce_rate_limit()
-        
+
+        # ---- 主数据源：东方财富 stock_zh_a_hist ----
         logger.info(f"[API调用] ak.stock_zh_a_hist(symbol={stock_code}, period=daily, "
                    f"start_date={start_date.replace('-', '')}, end_date={end_date.replace('-', '')}, adjust=qfq)")
-        
+
+        primary_ok = False
+        df = None
         try:
-            # 调用 akshare 获取 A 股日线数据
-            # period="daily" 获取日线数据
-            # adjust="qfq" 获取前复权数据
-            import time as _time
             api_start = _time.time()
-            
             df = ak.stock_zh_a_hist(
                 symbol=stock_code,
                 period="daily",
@@ -347,29 +416,71 @@ class AkshareFetcher(BaseFetcher):
                 end_date=end_date.replace('-', ''),
                 adjust="qfq"  # 前复权
             )
-            
+
             api_elapsed = _time.time() - api_start
-            
-            # 记录返回数据摘要
+
             if df is not None and not df.empty:
+                primary_ok = True
                 logger.info(f"[API返回] ak.stock_zh_a_hist 成功: 返回 {len(df)} 行数据, 耗时 {api_elapsed:.2f}s")
                 logger.info(f"[API返回] 列名: {list(df.columns)}")
                 logger.info(f"[API返回] 日期范围: {df['日期'].iloc[0]} ~ {df['日期'].iloc[-1]}")
                 logger.debug(f"[API返回] 最新3条数据:\n{df.tail(3).to_string()}")
             else:
                 logger.warning(f"[API返回] ak.stock_zh_a_hist 返回空数据, 耗时 {api_elapsed:.2f}s")
-            
-            return df
-            
+
         except Exception as e:
-            error_msg = str(e).lower()
-            
-            # 检测反爬封禁
-            if any(keyword in error_msg for keyword in ['banned', 'blocked', '频率', 'rate', '限制']):
-                logger.warning(f"检测到可能被封禁: {e}")
-                raise RateLimitError(f"Akshare 可能被限流: {e}") from e
-            
-            raise DataFetchError(f"Akshare 获取数据失败: {e}") from e
+            logger.warning(f"[API异常] ak.stock_zh_a_hist 失败 ({type(e).__name__}), 尝试备用数据源...")
+
+        if primary_ok:
+            return df
+
+        # ---- 备用数据源：腾讯 stock_zh_a_hist_tx ----
+        # 腾讯接口需要市场前缀：sh/sz/bj
+        code = stock_code.strip()
+        # 沪市：600xxx, 601xxx, 603xxx, 605xxx (主板), 688xxx (科创板)
+        # 深市：000xxx (主板), 001xxx (主板), 002xxx (中小板/主板), 300xxx (创业板)
+        # 北交所：920xxx, 8xxxxx, 4xxxxx
+        if code.startswith(('600', '601', '603', '605', '688')):
+            tx_symbol = f"sh{code}"
+        elif code.startswith(('000', '001', '002', '300')):
+            tx_symbol = f"sz{code}"
+        elif code.startswith(('920', '8', '4')):
+            tx_symbol = f"bj{code}"
+        else:
+            tx_symbol = f"sz{code}"  # 默认深市
+
+        # 备用源也需要休眠防封禁
+        self._enforce_rate_limit()
+
+        logger.info(f"[API调用] ak.stock_zh_a_hist_tx(symbol={tx_symbol}, "
+                   f"start_date={start_date.replace('-', '')}, end_date={end_date.replace('-', '')}, adjust=qfq)")
+
+        try:
+            api_start = _time.time()
+            df_tx = ak.stock_zh_a_hist_tx(
+                symbol=tx_symbol,
+                start_date=start_date.replace('-', ''),
+                end_date=end_date.replace('-', ''),
+                adjust="qfq"
+            )
+            api_elapsed = _time.time() - api_start
+
+            if df_tx is not None and not df_tx.empty:
+                logger.info(f"[API返回] ak.stock_zh_a_hist_tx 成功: 返回 {len(df_tx)} 行数据, 耗时 {api_elapsed:.2f}s")
+                logger.info(f"[API返回] 列名: {list(df_tx.columns)}")
+                return df_tx
+            else:
+                logger.warning(f"[API返回] ak.stock_zh_a_hist_tx 返回空数据, 耗时 {api_elapsed:.2f}s")
+
+        except Exception as e2:
+            logger.warning(f"[API异常] ak.stock_zh_a_hist_tx 也失败 ({type(e2).__name__}): {e2}")
+            # 检测反爬封禁（以最近一次异常为准）
+            error_msg = str(e2).lower()
+            if any(kw in error_msg for kw in ['banned', 'blocked', '频率', 'rate', '限制']):
+                raise RateLimitError(f"Akshare 可能被限流: {e2}") from e2
+
+        # 全部失败
+        raise DataFetchError(f"Akshare 获取数据失败: 主(东方财富)和备(腾讯)数据源均失败")
     
     def _fetch_etf_data(self, stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
         """
@@ -506,7 +617,7 @@ class AkshareFetcher(BaseFetcher):
         需要映射到标准列名：
         date, open, high, low, close, volume, amount, pct_chg
         """
-        if freq != "daily":
+        if freq not in ("daily", "weekly", "monthly"):
             raise ValueError(f"不支持的频率: {freq}")
 
         df = df.copy()
@@ -559,6 +670,79 @@ class AkshareFetcher(BaseFetcher):
         else:
             return self._get_stock_realtime_quote(stock_code)
     
+    def _fallback_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:
+        """AkShare 实时行情全市场快照失败时的降级方案：
+        1. 尝试 Tushare daily_basic 获取单只股票的 PE/PB/市值/换手率
+        2. 如果 Tushare 也失败，返回过期缓存数据（即使已过期）
+        3. 如果缓存也没有，返回 None"""
+        # ---- 1. Tushare daily_basic 降级 ----
+        try:
+            from .tushare_fetcher import TushareFetcher
+            ts_fetcher = TushareFetcher()
+            if ts_fetcher._api is not None:
+                from datetime import date, timedelta
+                end_date = date.today().strftime("%Y-%m-%d")
+                start_date = (date.today() - timedelta(days=7)).strftime("%Y-%m-%d")
+                ts_df = ts_fetcher.daily_basic(stock_code, start_date=start_date, end_date=end_date)
+                if ts_df is not None and not ts_df.empty:
+                    row = ts_df.iloc[0]
+
+                    def _safe(v, d=0.0):
+                        try:
+                            f = float(v)
+                            return f if not pd.isna(f) else d
+                        except (TypeError, ValueError):
+                            return d
+
+                    quote = RealtimeQuote(
+                        code=stock_code,
+                        name=stock_code,  # daily_basic 不返回名称
+                        price=_safe(row.get('close')),
+                        pe_ratio=_safe(row.get('pe_ttm') or row.get('pe')),
+                        pb_ratio=_safe(row.get('pb')),
+                        total_mv=_safe(row.get('total_mv')) * 10000,  # Tushare total_mv 单位万元 → 元
+                        circ_mv=_safe(row.get('circ_mv')) * 10000,
+                        turnover_rate=_safe(row.get('turnover_rate')),
+                    )
+                    logger.info(f"[降级] {stock_code} 使用 Tushare daily_basic 获取估值数据: "
+                                f"价格={quote.price}, PE={quote.pe_ratio}, PB={quote.pb_ratio}")
+                    return quote
+        except Exception as e:
+            logger.warning(f"[降级] Tushare daily_basic 也失败: {e}")
+
+        # ---- 2. 过期缓存降级 ----
+        with _realtime_cache_lock:
+            if _realtime_cache['data'] is not None:
+                cached_df = _realtime_cache['data']
+                row = cached_df[cached_df['代码'] == stock_code]
+                if not row.empty:
+                    row = row.iloc[0]
+
+                    def _safe(v, d=0.0):
+                        try:
+                            f = float(v)
+                            return f if not pd.isna(f) else d
+                        except (TypeError, ValueError):
+                            return d
+
+                    quote = RealtimeQuote(
+                        code=stock_code,
+                        name=str(row.get('名称', '')),
+                        price=_safe(row.get('最新价')),
+                        change_pct=_safe(row.get('涨跌幅')),
+                        pe_ratio=_safe(row.get('市盈率-动态')),
+                        pb_ratio=_safe(row.get('市净率')),
+                        total_mv=_safe(row.get('总市值')),
+                        circ_mv=_safe(row.get('流通市值')),
+                        turnover_rate=_safe(row.get('换手率')),
+                    )
+                    cache_age = int(time.time() - _realtime_cache['timestamp'])
+                    logger.warning(f"[降级] {stock_code} 使用过期缓存数据"
+                                   f"（缓存于 {cache_age} 秒前）")
+                    return quote
+
+        return None
+
     def _get_stock_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:
         """
         获取普通 A 股实时行情数据
@@ -571,13 +755,16 @@ class AkshareFetcher(BaseFetcher):
         try:
             # 检查缓存
             current_time = time.time()
-            if (_realtime_cache['data'] is not None and 
-                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
-                df = _realtime_cache['data']
-                logger.debug(f"[缓存命中] 使用缓存的A股实时行情数据")
-            else:
+            with _realtime_cache_lock:
+                if (_realtime_cache['data'] is not None and 
+                    current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
+                    df = _realtime_cache['data']
+                    logger.debug(f"[缓存命中] 使用缓存的A股实时行情数据")
+                else:
+                    df = None  # 标记需要重新获取
+            
+            if df is None:
                 last_error: Optional[Exception] = None
-                df = None
                 for attempt in range(1, 3):
                     try:
                         # 防封禁策略
@@ -598,22 +785,30 @@ class AkshareFetcher(BaseFetcher):
                         logger.warning(f"[API错误] ak.stock_zh_a_spot_em 获取失败 (attempt {attempt}/2): {e}")
                         time.sleep(min(2 ** attempt, 5))
 
-                # 更新缓存：成功缓存数据；失败也缓存空数据，避免同一轮任务对同一接口反复请求
+                # 不缓存失败结果，避免瞬时网络抖动阻塞全部行情60秒
                 if df is None:
                     logger.error(f"[API错误] ak.stock_zh_a_spot_em 最终失败: {last_error}")
-                    df = pd.DataFrame()
-                _realtime_cache['data'] = df
-                _realtime_cache['timestamp'] = current_time
+                    return self._fallback_realtime_quote(stock_code)
+                # 只有成功获取数据时才缓存（双重检查：避免覆盖其他线程已刷新的缓存）
+                if not df.empty:
+                    with _realtime_cache_lock:
+                        if (_realtime_cache['data'] is None or
+                                time.time() - _realtime_cache['timestamp'] >= _realtime_cache['ttl']):
+                            _realtime_cache['data'] = df
+                            _realtime_cache['timestamp'] = time.time()
+                else:
+                    logger.warning(f"[API错误] ak.stock_zh_a_spot_em 返回空数据，不缓存")
+                    return self._fallback_realtime_quote(stock_code)
 
             if df is None or df.empty:
                 logger.warning(f"[实时行情] A股实时行情数据为空，跳过 {stock_code}")
-                return None
+                return self._fallback_realtime_quote(stock_code)
             
             # 查找指定股票
             row = df[df['代码'] == stock_code]
             if row.empty:
                 logger.warning(f"[API返回] 未找到股票 {stock_code} 的实时行情")
-                return None
+                return self._fallback_realtime_quote(stock_code)
             
             row = row.iloc[0]
             
@@ -651,7 +846,7 @@ class AkshareFetcher(BaseFetcher):
             
         except Exception as e:
             logger.error(f"[API错误] 获取 {stock_code} 实时行情失败: {e}")
-            return None
+            return self._fallback_realtime_quote(stock_code)
     
     def _get_etf_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:
         """
@@ -671,13 +866,16 @@ class AkshareFetcher(BaseFetcher):
         try:
             # 检查缓存
             current_time = time.time()
-            if (_etf_realtime_cache['data'] is not None and 
-                current_time - _etf_realtime_cache['timestamp'] < _etf_realtime_cache['ttl']):
-                df = _etf_realtime_cache['data']
-                logger.debug(f"[缓存命中] 使用缓存的ETF实时行情数据")
-            else:
+            with _realtime_cache_lock:
+                if (_etf_realtime_cache['data'] is not None and 
+                    current_time - _etf_realtime_cache['timestamp'] < _etf_realtime_cache['ttl']):
+                    df = _etf_realtime_cache['data']
+                    logger.debug(f"[缓存命中] 使用缓存的ETF实时行情数据")
+                else:
+                    df = None  # 标记需要重新获取
+            
+            if df is None:
                 last_error: Optional[Exception] = None
-                df = None
                 for attempt in range(1, 3):
                     try:
                         # 防封禁策略
@@ -698,11 +896,20 @@ class AkshareFetcher(BaseFetcher):
                         logger.warning(f"[API错误] ak.fund_etf_spot_em 获取失败 (attempt {attempt}/2): {e}")
                         time.sleep(min(2 ** attempt, 5))
 
+                # 不缓存失败结果，避免瞬时网络抖动阻塞全部行情60秒
                 if df is None:
                     logger.error(f"[API错误] ak.fund_etf_spot_em 最终失败: {last_error}")
-                    df = pd.DataFrame()
-                _etf_realtime_cache['data'] = df
-                _etf_realtime_cache['timestamp'] = current_time
+                    return None
+                # 只有成功获取数据时才缓存（双重检查：避免覆盖其他线程已刷新的缓存）
+                if not df.empty:
+                    with _realtime_cache_lock:
+                        if (_etf_realtime_cache['data'] is None or
+                                time.time() - _etf_realtime_cache['timestamp'] >= _etf_realtime_cache['ttl']):
+                            _etf_realtime_cache['data'] = df
+                            _etf_realtime_cache['timestamp'] = time.time()
+                else:
+                    logger.warning(f"[API错误] ak.fund_etf_spot_em 返回空数据，不缓存")
+                    return None
 
             if df is None or df.empty:
                 logger.warning(f"[实时行情] ETF实时行情数据为空，跳过 {stock_code}")
@@ -998,7 +1205,7 @@ class AkshareFetcher(BaseFetcher):
                 year_match = re.search(r'(\d{4})', col)
                 if year_match:
                     year = year_match.group(1)
-                    df[f'ratio_year{index_share}'] = year
+                    df[f'ratio_year{index_ratio}'] = year
                 else:
                     logger.warning(f"[数据处理] 未找到年份信息，将使用默认值 '2023'")
 

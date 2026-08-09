@@ -4,15 +4,13 @@
 输入：用户问题
 输出：更新状态中的 intent / stock_code / industry_name / next_agents（待执行 Agent 队列）
 
-队列的消费方式：
-  - route_node 把完整队列写入 state["next_agents"]（schema 内字段，LangGraph 正常合并）
-  - 每个下游节点执行完后，由 graph.py 的节点包装器把自己从队首弹出
-  - 条件边函数 route_next_agent 只读队首，不修改任何状态
+并行扇出架构：route_node 把待执行 Agent 列表写入 state["next_agents"]，
+由 graph.py 的并行节点直接消费，路由层不再维护队列弹出/条件边逻辑。
 """
 
 import json
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -111,6 +109,11 @@ class RouterAgent:
             logger.info("ETF 模式：跳过 analyst（无财报数据）")
             next_agents.remove("analyst")
 
+        # 宏观分析不涉及个股技术面，跳过 technical_agent
+        if intent == IntentType.MACRO and "technical" in next_agents:
+            logger.info("宏观分析模式：跳过 technical（宏观分析不走技术面）")
+            next_agents.remove("technical")
+
         # 个股分析类意图但没解析出代码时，去掉依赖代码的节点，交给 researcher 联网研究
         if not stock_code and not industry_name:
             code_dependent = {"analyst", "technical"}
@@ -122,11 +125,25 @@ class RouterAgent:
                     f"stock_type={stock_type}, industry={industry_name}, "
                     f"next_agents={next_agents}, confidence={confidence}")
 
+        # 标的属性分类（周期股/成长股/防御股/价值股）：router 统一判定后写入 state，
+        # 下游 Agent（analyst/technical/responder）直接读取，避免各自重复调用 classify_stock_attribute
+        stock_attr = None
+        if stock_code and "," not in stock_code and stock_type != "etf":
+            try:
+                from tools.stock_classifier import classify_stock_attribute
+                stock_attr = classify_stock_attribute(stock_code)
+                if stock_attr and stock_attr.get("type", "unknown") != "unknown":
+                    logger.info(f"标的属性分类(router): {stock_code} → "
+                                f"{stock_attr.get('type')}({stock_attr.get('label', '')})")
+            except Exception as e:
+                logger.debug(f"标的属性分类失败（不影响路由）: {e}")
+
         return {
             "intent": intent,
             "stock_code": stock_code,
             "stock_type": stock_type,
             "industry_name": industry_name,
+            "stock_attribute": stock_attr,
             "next_agents": next_agents,
             "confidence": confidence,
             "intermediate_steps": [("router", {
@@ -175,15 +192,40 @@ class RouterAgent:
                 "reasoning": "规则匹配 ETF 代码，路由至 researcher → technical",
             }
 
-        industry_keywords = ["行业", "产业", "产业链", "龙头", "龙一", "龙二", "景气", "赛道"]
+        # 常见行业/赛道名称，即使不带"行业/产业链"后缀也应命中
+        industry_keywords = [
+            "行业", "产业", "产业链", "龙头", "龙一", "龙二", "景气", "赛道",
+            "机器人", "人形机器人", "新能源", "光伏", "半导体", "芯片",
+            "人工智能", "ai", "医药", "白酒", "消费", "汽车", "军工",
+            "储能", "煤炭", "电力", "地产", "金融",
+        ]
         is_industry = any(kw in question_lower for kw in industry_keywords)
 
         stock_keywords = ["股票", "分析", "走势", "财务", "均线", "macd", "k线"]
         is_stock_analysis = any(kw in question_lower for kw in stock_keywords)
 
+        # 宏观关键词：降息/加息/MLF/LPR/CPI/PMI/M2/社融/美债收益率/汇率等
+        macro_keywords = [
+            "降息", "加息", "mlf", "lpr", "cpi", "pmi", "m2", "社融", "社融数据",
+            "美债收益率", "美债", "国债收益率", "汇率", "宏观", "货币政策", "降准",
+            "公开市场操作", "逆回购", "再贷款",
+        ]
+        has_macro = any(kw in question_lower for kw in macro_keywords)
+
         has_financial = any(kw in question_lower for kw in ["财务", "比率", "roe", "roa", "毛利率", "净利率", "估值", "杜邦"])
         has_technical = any(kw in question_lower for kw in ["均线", "macd", "k线", "走势", "金叉", "死叉"])
         has_realtime = any(kw in question_lower for kw in ["股价", "新闻", "最新", "实时", "今天", "公告"])
+
+        # 宏观分析：含宏观关键词且未聚焦具体个股时识别为宏观分析
+        # （宏观+个股混合问题走个股分析链路，在 researcher._analyze_stock 中注入宏观数据）
+        has_stock_code = bool(re.search(r'\b\d{6}\b', question))
+        if has_macro and not is_stock_analysis and not has_stock_code:
+            return {
+                "intent": IntentType.MACRO,
+                "next_agents": ["researcher"],
+                "confidence": 0.8,
+                "reasoning": "宏观分析问题（降息/加息/MLF/LPR/CPI/PMI/M2/社融/美债/汇率等），路由至 researcher → responder",
+            }
 
         # 行业/产业链关键词优先：这类问题通常也含"分析"等个股词，不能被个股分支劫走
         if is_industry:
@@ -241,32 +283,3 @@ def create_router_node():
     """返回一个 LangGraph 节点函数"""
     agent = RouterAgent()
     return agent.route_node
-
-
-def route_next_agent(state: AgentState) -> str:
-    """
-    条件边函数：只读 state["next_agents"] 的队首决定下一个节点。
-    队列的弹出由 with_queue_pop 节点包装器完成，这里不做任何修改。
-    """
-    queue: List[str] = state.get("next_agents") or []
-    for node in queue:
-        if node in VALID_AGENT_NODES:
-            logger.info(f"route_next_agent -> {node}（剩余队列: {queue}）")
-            return node
-    return "responder"
-
-
-def with_queue_pop(node_name: str, node_fn):
-    """
-    节点包装器：节点执行完后，把自己从 next_agents 队首弹出。
-    队列消费统一在这里做，各 Agent 节点无需感知队列的存在。
-    """
-    def wrapped(state: AgentState):
-        update = node_fn(state) or {}
-        queue = list(state.get("next_agents") or [])
-        if queue and queue[0] == node_name:
-            queue = queue[1:]
-        # 节点自己返回了 next_agents 则以节点为准
-        update.setdefault("next_agents", queue)
-        return update
-    return wrapped

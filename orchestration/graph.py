@@ -24,6 +24,7 @@ from agents.researcher.researcher_agent import create_researcher_node
 from agents.technical_agent.technical_agent import create_technical_node
 from agents.compliance.compliance_agent import create_compliance_node
 from agents.responder.responder_agent import create_responder_node
+from utils.constants import IntentType
 from utils.logger import logger
 
 EXEC_AGENTS = ("retriever", "analyst", "researcher", "technical")
@@ -34,30 +35,79 @@ def _is_industry_mode(state) -> bool:
     return bool(state.get("industry_name")) and not state.get("stock_code")
 
 
+def _is_macro_mode(state) -> bool:
+    """宏观分析模式：不走 technical_agent，只走 researcher → responder"""
+    return state.get("intent") == IntentType.MACRO
+
+
 def route_fanout(state):
     """
     router 之后的并行分发（返回列表 = 同一超步并行执行）。
-    产业链模式只放 researcher 首发，其余计划节点由接力边处理，
+    产业链模式只放 researcher 首发，analyst/technical 由 route_after_researcher 接力，
     避免 responder 在不同超步被触发两次。
+    宏观分析模式同理：只走 researcher → responder，不走 technical。
     """
     plan = [a for a in (state.get("next_agents") or []) if a in EXEC_AGENTS]
     if not plan:
         return ["responder"]
-    if _is_industry_mode(state):
+    if _is_macro_mode(state):
+        # 宏观分析不涉及个股技术面，只走 researcher（technical 等节点跳过）
         if "researcher" in plan:
-            dropped = [a for a in plan if a not in ("researcher",)]
-            if [a for a in dropped if a != "technical"]:
-                logger.info(f"产业链模式：{dropped} 中除 technical 外的节点不适用多代码输入，跳过")
+            dropped = [a for a in plan if a != "researcher"]
+            if dropped:
+                logger.info(f"宏观分析模式：跳过 {dropped}（宏观分析不走技术面）")
             return ["researcher"]
+        return ["responder"]
+    if _is_industry_mode(state):
+        # 产业链模式：researcher 首发产出候选代码，
+        # analyst/technical 待 researcher 产出候选代码后由 route_after_researcher 接力
+        if "researcher" in plan:
+            logger.info("产业链模式：researcher 首发，analyst/technical 待候选代码产出后接力")
+            return ["researcher"]
+        return ["responder"]
+    # stock_code 已含逗号（用户直接给出多代码）：确保 analyst 在扇出列表中，
+    # analyst 会取排名第一的候选代码做财务分析
+    if "," in (state.get("stock_code") or "") and "analyst" not in plan:
+        plan = list(plan) + ["analyst"]
+        logger.info("多代码模式：将 analyst 加入并行扇出（取首候选代码做财务分析）")
     return plan
 
 
 def route_after_researcher(state):
-    """researcher 之后：产业链模式且计划含 technical 时接力，否则汇合到 responder"""
+    """researcher 之后：产业链模式且计划含 analyst/technical 时接力（并行扇出），
+    宏观模式或其余情况汇合到 responder。
+
+    产业链模式下 researcher 已产出逗号分隔的候选代码：
+    - analyst 取排名第一的候选代码做财务分析（analyst 内部自行取首代码）
+    - technical 对全部候选做技术面对比
+    两者并行执行，均完成后汇合到 responder。
+    """
     plan = state.get("next_agents") or []
-    if state.get("industry_name") and "technical" in plan and "," in (state.get("stock_code") or ""):
-        return "technical"
+    if _is_macro_mode(state):
+        # 宏观分析不走 technical，researcher 完成后直接汇合到 responder
+        return "responder"
+    if state.get("industry_name") and "," in (state.get("stock_code") or ""):
+        # 产业链模式：researcher 已产出候选代码，analyst + technical 并行接力
+        # analyst 始终接入（取排名第一的候选代码做财务分析），technical 看计划是否包含
+        nodes = ["analyst"]
+        if "technical" in plan:
+            nodes.append("technical")
+        logger.info(f"产业链模式接力：researcher → {nodes}（analyst 取首候选代码做财务分析）")
+        return nodes
     return "responder"
+
+
+def route_after_compliance(state):
+    """compliance 之后：审查未通过且尚未重试时路由回 responder 重新生成，否则结束。
+
+    防死循环机制：compliance 节点在 _compliance_retried 中标记是否已经重试过一次。
+    - 首次 fail：compliance_failed=True, _compliance_retried=False → 路由回 responder
+    - 重试后仍 fail：compliance_failed=True, _compliance_retried=True → 路由到 END
+    """
+    if state.get("compliance_failed") and not state.get("_compliance_retried"):
+        logger.warning("合规审查未通过，路由回 responder 重新生成（仅重试1次）")
+        return "responder"
+    return END
 
 
 def _make_checkpointer():
@@ -129,13 +179,16 @@ class MultiAgentGraph:
         workflow.add_edge("retriever", "responder")
         workflow.add_edge("analyst", "responder")
         workflow.add_edge("technical", "responder")
-        # researcher 的出边有分支：产业链模式接力 technical，其余直接汇合
+        # researcher 的出边有分支：产业链模式接力 analyst + technical，其余直接汇合
         workflow.add_conditional_edges("researcher", route_after_researcher,
-                                       {"technical": "technical", "responder": "responder"})
+                                       {"technical": "technical", "analyst": "analyst",
+                                        "responder": "responder"})
 
         # ---------- 收尾：整合回答 → 合规审查 ----------
         workflow.add_edge("responder", "compliance")
-        workflow.add_edge("compliance", END)
+        # 合规审查未通过时条件路由：首次 fail 路由回 responder 重新生成，否则结束
+        workflow.add_conditional_edges("compliance", route_after_compliance,
+                                       {"responder": "responder", END: END})
 
         if self.enable_memory:
             return workflow.compile(checkpointer=self.memory)

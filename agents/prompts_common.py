@@ -4,6 +4,8 @@
 改这里 = 同时改所有引用方；新增 Agent 需要文风约束时直接 import。
 """
 
+from utils.logger import logger
+
 # ============ 封闭枚举（单点定义）============
 # prompt 文本和 compliance 的程序检查都从这两个常量渲染——改这里=两边同时生效，
 # 杜绝"prompt 改了、regex 忘了"的镜像漂移。
@@ -67,3 +69,67 @@ STYLE_RULES = f"""【文风硬规则（违反即不合格）】
 INTERMEDIATE_PRODUCT_NOTE = """【输出定位】你的输出是下游汇总 Agent 的原料，不面向最终读者：
 最大化数字密度与结论明确性，每个数字带期间与单位；不写开场白、过渡句和总结套话，
 不需要照顾阅读体验——下游会重新组织表达。"""
+
+
+# ============ 复盘教训注入（公共函数，单点维护）============
+# analyst / researcher / technical_agent 三处原先各自实现了相同的 _format_review_lesson，
+# 提取为公共函数后改这里 = 同时改所有调用方，避免三份逻辑悄悄漂移。
+
+def format_review_lesson(stock_code: str = "", industry_name: str = "") -> str:
+    """注入最近一次复盘的误判模式和相关改进规则（避免重复同类错误）。
+
+    从历史复盘提炼规则作为分析约束：
+    - 个股模式（stock_code）：读取该标的最近复盘 + 该标的及通用规则
+    - 产业链模式（industry_name）：读取该产业链最近复盘 + 通用规则
+    - 若最近复盘方向判断为"错误"或用户纠错复发，追加针对性警示
+
+    Args:
+        stock_code: 股票代码（个股模式）。为空且 industry_name 为空时返回空串。
+        industry_name: 行业/产业链名（产业链模式）。
+
+    Returns:
+        格式化的复盘教训文本块；无数据时返回空串。
+    """
+    is_industry = bool(industry_name)
+    if not stock_code and not is_industry:
+        return ""
+    if "," in stock_code:
+        return ""
+    try:
+        from storage.sqlite.stock_storage import get_db
+        db = get_db()
+        if is_industry:
+            review = db.get_last_industry_review(industry_name)
+            rules = db.get_active_rules(limit=8)  # 产业链规则存为通用规则
+        else:
+            review = db.get_last_review_for_code(stock_code)
+            rules = db.get_active_rules(code=stock_code, limit=8)
+        if not review and not rules:
+            return ""
+        parts = ["[历史复盘教训]"]
+        if review:
+            error_pattern = review.get("error_pattern") or "未记录"
+            parts.append(f"上次分析{industry_name if is_industry else '该标的'}时存在以下误判模式：{error_pattern}；")
+            review_brief = (review.get("review_content") or "")[:300]
+            if review_brief:
+                parts.append(f"复盘要点：{review_brief}；")
+        rule_texts = []
+        for r in rules:
+            source = f"（来自{r.get('source_stock_name') or '通用'}）" if r.get("source_stock_name") else ""
+            rule_texts.append(f"[{r.get('error_pattern', '通用')}] {r['rule_text']}{source}")
+            try:
+                db.increment_rule_hit(r["id"])  # 统计规则引用次数
+            except Exception:
+                pass
+        if rule_texts:
+            parts.append("改进规则：" + "；".join(rule_texts))
+        if review and review.get("error_pattern") and review.get("direction_verdict") == "错误":
+            parts.append(f"【⚠️ 最近一次复盘误判类别：{review['error_pattern']}】"
+                         f"本次必须特别避免同类型误判，如方向不同的判断需提供更充分的证据支撑")
+        if review and review.get("feedback_recurrence") == "复发":
+            parts.append(f"【⚠️ 上次复盘确认用户纠错的问题仍复发】本次必须给出可验证的证据来支持相应结论，"
+                         f"并在报告相应位置明确标注，避免再次复发")
+        return "".join(parts)
+    except Exception as e:
+        logger.warning(f"读取复盘教训失败（不影响本次分析）: {e}")
+        return ""

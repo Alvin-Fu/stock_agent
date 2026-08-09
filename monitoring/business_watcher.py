@@ -71,17 +71,20 @@ def _get_watch_codes() -> List[str]:
         targets = db.get_watch_targets()
         codes = []
         for t in targets:
-            if hasattr(t, 'code') and t.code:
-                codes.append(t.code)
-            elif hasattr(t, 'target_type') and t.target_type == 'company':
-                if hasattr(t, 'name') and t.name:
-                    from tools.company_code_validator import find_stock_code
-                    try:
-                        code = find_stock_code(t.name)
-                        if code:
-                            codes.append(code)
-                    except Exception:
-                        pass
+            if isinstance(t, dict):
+                code = t.get("code")
+                if code:
+                    codes.append(code)
+                elif t.get("target_type") == "company":
+                    name = t.get("name")
+                    if name:
+                        from tools.company_code_validator import find_stock_code
+                        try:
+                            code = find_stock_code(name)
+                            if code:
+                                codes.append(code)
+                        except Exception:
+                            pass
         return list(set(codes))
     except Exception as e:
         logger.warning(f"获取监控列表失败: {e}")

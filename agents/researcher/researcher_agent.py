@@ -19,6 +19,7 @@ from core.llm import get_agent_llm
 from .web_search_tool import web_search
 from tools.company_code_validator import find_stock_code, find_company_name
 from tools.weight_adjuster import get_stage_weights
+from utils.constants import IntentType
 from utils.logger import logger
 
 
@@ -146,8 +147,9 @@ def compute_composite_ranking(candidates: List[Dict[str, Any]], stage: str = DEF
                 scores[key] = 5.0
                 missing.append(key)
         composite = round(sum(scores[k] * w for k, w in weights.items()), 2)
+        name = (c.get("name") or "").strip()
         ranked.append({
-            "code": code, **scores, "composite": composite, "stage": stage, "missing": missing,
+            "code": code, "name": name, **scores, "composite": composite, "stage": stage, "missing": missing,
             "note": "分项缺失按5分中性处理" if missing else "",
         })
     ranked.sort(key=lambda x: x["composite"], reverse=True)
@@ -159,39 +161,116 @@ def compute_composite_ranking(candidates: List[Dict[str, Any]], stage: str = DEF
 def apply_valuation_adjustment(ranked: List[Dict[str, Any]],
                                per_stock: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    预期差调整（纯函数）：基本面评分和估值分位必须见面——综合分9但PE分位95%不该排第一。
+    预期差调整 + 质量折扣（纯函数）：
+    1. 基本面评分和估值分位必须见面——综合分9但PE分位95%不该排第一
+    2. 质量指标否决权：ROE过低/扣非占比过低/商誉过高 → 质量折扣
     对高历史分位减分、低分位加分，并标注机会/拥挤象限；按调整后综合分重排。
-    per_stock 来自 industry_metrics 的逐股程序数据（pe_percentile/total_mv/mf_net20）。
+    per_stock 来自 industry_metrics 的逐股程序数据（pe_percentile/total_mv/mf_net20/roe等）。
+    拥挤度判定优先级：绝对PE > 分位（10年窗口统一口径）。
+    调整阈值从 config weights.pe_adjustments 读取（复盘/校准可动态微调），不写死。
     """
+    try:
+        from tools.weight_adjuster import get_pe_adjustments
+        pe_adj = get_pe_adjustments()
+    except Exception:
+        pe_adj = {}
+    pe_gt_200 = pe_adj.get("pe_gt_200", -1.5)
+    pe_gt_100 = pe_adj.get("pe_gt_100", -1.0)
+    pct_ge_80 = pe_adj.get("pct_ge_80", -1.0)
+    pct_ge_60 = pe_adj.get("pct_ge_60", -0.5)
+    pct_le_30 = pe_adj.get("pct_le_30", 0.5)
+    dual_high = pe_adj.get("dual_high", -1.5)
+
     metrics_map = {str(r.get("code", "")): r for r in per_stock or []}
     for item in ranked:
         m = metrics_map.get(item["code"]) or {}
         pct = m.get("pe_percentile")
         item["pe_percentile"] = pct
-        item["pe_ttm"] = m.get("pe_ttm")  # 绝对PE值，供排名表展示+双阈值预警
+        item["pe_ttm"] = m.get("pe_ttm")
         item["total_mv"] = m.get("total_mv")
         item["mf_net20"] = m.get("mf_net20")
+        # 多窗口分位（供报告展示，说明口径）
+        item["pe_pct_3y"] = m.get("pe_pct_3y")
+        item["pe_pct_5y"] = m.get("pe_pct_5y")
+        item["pe_pct_window"] = m.get("pe_pct_window") or "10年"
+        pe_abs = m.get("pe_ttm")
         adj = 0.0
-        if pct is not None:
-            if pct >= 80 or (m.get("pe_ttm") and m["pe_ttm"] > 100):
-                adj = -1.0
+
+        # 估值调整：绝对PE优先，其次分位（阈值来自 config，可动态微调）
+        if pe_abs is not None and pe_abs > 200:
+            adj = pe_gt_200  # 极端泡沫
+        elif pe_abs is not None and pe_abs > 100:
+            adj = pe_gt_100  # 高PE
+        elif pct is not None:
+            if pct >= 80:
+                adj = pct_ge_80  # 高分位
             elif pct >= 60:
-                adj = -0.5
+                adj = pct_ge_60  # 中高分位
             elif pct <= 30:
-                adj = 0.5
+                adj = pct_le_30  # 低分位
+        # 分位+绝对PE双高时额外扣分
+        if pct is not None and pe_abs is not None and pct >= 80 and pe_abs > 100:
+            adj = min(adj, dual_high)
+
+        # === 质量指标否决权 ===
+        quality_discount = 1.0
+        quality_notes = []
+        # 1. ROE 过低
+        roe = m.get("roe")
+        if roe is not None and isinstance(roe, (int, float)):
+            item["roe"] = round(roe, 2)
+            if roe < 5.0:
+                quality_discount *= 0.85
+                quality_notes.append(f"ROE仅{roe:.1f}%（<5%）")
+            elif roe < 10.0:
+                quality_notes.append(f"ROE{roe:.1f}%（偏低）")
+        else:
+            item["roe"] = None
+        # 2. 扣非占比过低（如数据可用）
+        deduct_ratio = m.get("deduct_net_ratio")
+        if deduct_ratio is not None and isinstance(deduct_ratio, (int, float)):
+            item["deduct_net_ratio"] = round(deduct_ratio, 1)
+            if deduct_ratio < 30.0:
+                quality_discount *= 0.7
+                quality_notes.append(f"扣非/归母仅{deduct_ratio:.1f}%（<30%）")
+        # 3. 商誉占比过高（如数据可用）
+        goodwill_ratio = m.get("goodwill_ratio")
+        if goodwill_ratio is not None and isinstance(goodwill_ratio, (int, float)):
+            item["goodwill_ratio"] = round(goodwill_ratio, 1)
+            if goodwill_ratio > 25.0:
+                quality_discount *= 0.85
+                quality_notes.append(f"商誉/净资产{goodwill_ratio:.1f}%（>25%）")
+
+        # 应用质量折扣
+        if quality_discount < 1.0:
+            quality_adj = round(item["composite"] * (quality_discount - 1), 2)
+            adj += quality_adj
+            item["quality_discount"] = quality_discount
+            item["quality_notes"] = "；".join(quality_notes)
+        else:
+            item["quality_discount"] = 1.0
+            item["quality_notes"] = ""
+
         item["valuation_adj"] = adj
         item["composite_adj"] = round(item["composite"] + adj, 2)
-        pe_abs = m.get("pe_ttm")
-        if pct is None:
-            item["quadrant"] = "无估值分位数据"
-        elif item["composite"] >= 7 and pct <= 40 and (pe_abs is None or pe_abs <= 50):
-            item["quadrant"] = "机会区（高分低估）"
-        elif item["composite"] >= 7 and (pct >= 70 or (pe_abs and pe_abs > 100)):
-            item["quadrant"] = "拥挤区（高分高估）"
-        elif item["composite"] < 6 and pct >= 70:
-            item["quadrant"] = "危险区（低分高估）"
+
+        # 拥挤度标签（优先级：极端泡沫 > 极度拥挤 > 拥挤 > 机会 > 中性）
+        if pe_abs is not None and pe_abs > 200:
+            item["quadrant"] = "🔴极端泡沫(PE>200倍)"
+        elif pe_abs is not None and pe_abs > 100 and (pct is None or pct >= 70):
+            item["quadrant"] = "🔴极度拥挤"
+        elif (pct is not None and pct >= 80) or (pe_abs is not None and pe_abs > 100):
+            item["quadrant"] = "🟠拥挤"
+        elif pct is not None and pct <= 30 and (pe_abs is None or pe_abs <= 50):
+            if item["composite"] >= 7:
+                item["quadrant"] = "🟢机会区"
+            else:
+                item["quadrant"] = "🟢低估"
+        elif pct is None and pe_abs is None:
+            item["quadrant"] = "无估值数据"
         else:
-            item["quadrant"] = "中性"
+            item["quadrant"] = "🟡中性"
+
     ranked.sort(key=lambda x: x.get("composite_adj", x["composite"]), reverse=True)
     for i, item in enumerate(ranked, 1):
         item["rank"] = i
@@ -204,8 +283,35 @@ def format_ranking_table(ranked: List[Dict[str, Any]], name_of=None) -> str:
         return ""
     stage = ranked[0].get("stage", DEFAULT_STAGE)
     w = get_stage_weights()[normalize_stage(stage)]
+    # 分位窗口口径（取第一只有效数据的窗口）
+    pct_window = ""
+    for it in ranked:
+        if it.get("pe_pct_window"):
+            pct_window = it["pe_pct_window"]
+            break
+    pct_label = f"（{pct_window}窗口）" if pct_window else ""
     lines = [f"【综合排名（行业阶段：{stage}；程序按 业务{w['business']:.0%}+基本面{w['fundamental']:.0%}"
-             f"+护城河{w['moat']:.0%}+边际变化{w['momentum']:.0%} 加权，再按PE历史分位做预期差调整）】"]
+             f"+护城河{w['moat']:.0%}+边际变化{w['momentum']:.0%} 加权，再按PE历史分位{pct_label}做预期差调整）】"]
+
+    # ===== 硬伤检测：核心字段为 None 或 5.0 中性兜底时触发警告 =====
+    _score_warnings = []
+    for item in ranked:
+        missing_fields = []
+        for k in ("business", "fundamental", "moat", "momentum"):
+            v = item.get(k)
+            if v is None:
+                missing_fields.append(k)
+            elif k in item.get("missing", []) and v == 5.0:
+                missing_fields.append(f"{k}(5分中性)")  # LLM没给出分数，程序兜底
+        if missing_fields:
+            _score_warnings.append(f"{item.get('code','?')} 缺少：{', '.join(missing_fields)}")
+        pe_ttm = item.get("pe_ttm")
+        if pe_ttm is None:
+            _score_warnings.append(f"{item.get('code','?')} PE数据缺失")
+    if _score_warnings:
+        lines.append(f"⚠️ 打分数据警告（{len(_score_warnings)}项）：{'；'.join(_score_warnings)}")
+        lines.append("  → 上述标的关键评分数据缺失，排名仅供参考，建议人工复核基本面后再做决策。")
+
     for item in ranked:
         label = item["code"]
         if name_of:
@@ -220,14 +326,16 @@ def format_ranking_table(ranked: List[Dict[str, Any]], name_of=None) -> str:
         pe_ttm = item.get("pe_ttm")
         pct = item.get("pe_percentile")
         if pe_ttm is not None and pct is not None:
-            # 双阈值预警标签
-            if pct >= 80 or pe_ttm > 100:
-                pe_tag = "🔴极高PE"
-            elif pct >= 50 and 50 <= pe_ttm <= 100:
-                pe_tag = "🟡偏高PE"
+            # 双阈值预警标签（用户要求：绝对值优先于分位）
+            if pe_ttm > 200:
+                pe_tag = "🔴极端泡沫(PE>200倍)"
+            elif pe_ttm > 100:
+                pe_tag = "🟠极高PE(100-200倍)"
+            elif pct >= 80 and pe_ttm > 50:
+                pe_tag = "🔴高估(分位>80%且PE>50倍)"
             else:
                 pe_tag = "🟢合理PE"
-            extra.append(f"PE{pe_ttm:.1f}({pct:.0f}%分位){pe_tag}")
+            extra.append(f"PE{pe_ttm:.1f}({pct:.0f}%{pct_window}分位){pe_tag}")
         elif pe_ttm is not None:
             extra.append(f"PE{pe_ttm:.1f}")
         if item.get("composite_adj") is not None:
@@ -309,6 +417,12 @@ class ResearcherAgent:
         if errors:
             raise errors[0]
         return container[0] if container else None
+
+    @staticmethod
+    def _format_review_lesson(stock_code: str) -> str:
+        """注入该标的最近一次复盘的误判模式和相关改进规则（公共函数代理）"""
+        from agents.prompts_common import format_review_lesson
+        return format_review_lesson(stock_code)
 
     # ========== 结构化数据提取（通用） ==========
 
@@ -648,6 +762,20 @@ class ResearcherAgent:
 - 机构评级降权处理：A股卖方几乎不出卖出评级，"N家机构全部买入"不构成有效利好，最多作为关注度参考
 - 目标价：搜索结果里有具体数字才引用，没有就不写"上涨空间较大"这类无依据表述
 
+**【核心风险因素研报验证规则】**
+- 报告中标注的"最大风险"必须有研报交叉验证，禁止仅凭直觉列风险
+- 搜索结果中多家研报对同一风险的归因解释必须引用并标注来源
+  （如"广发证券：'业绩受产品价税改革影响'；银河证券：'毛利率显著下滑主因价税改革'"）
+- 核心风险因素必须区分"行业共性风险"（全行业面临）与"个股特有风险"（仅该公司）
+- 风险归因须与财务数据交叉验证（如"价税改革→毛利率下滑5.87pct"需对应分部毛利率数据）
+
+**【券商目标价明细引用规则】**
+- 程序提供的【目标价矩阵】可能因数据源覆盖不全而缺少部分券商目标价
+- 搜索结果中出现头部券商目标价时，**必须逐家引用**并标注：券商名称/报告日期/评级/EPS预测/目标价
+  （如"中信建投(2026-05-09)：买入，EPS 0.37元；广发证券(2026-04-08)：增持，目标价23.95元（26年80倍PE）"）
+- 目标价对应的估值逻辑（如"80倍PE"）也需一并引用，帮助读者理解定价假设
+- 禁止将程序目标价矩阵与搜索结果中的券商目标价混为一谈，需分别标注来源
+
 【价格反弹与基本面反转区分原则】
 - 报告中必须区分两组独立判断：
   ① **短期价格反弹**：仅基于超卖/技术面支撑的反弹，不改变基本面方向，不可作为建仓依据
@@ -796,7 +924,15 @@ class ResearcherAgent:
     def _validate_chain_coverage(self, industry: str, chain: Dict[str, Any],
                                  all_leader_codes: set) -> tuple[str, list[Dict], set]:
         """产业链覆盖度校验：映射当前候选到12标准环节 → 统计覆盖数 → 缺环节自动补充搜索。
-        返回 (coverage_warning, new_leaders, updated_codes)"""
+        返回 (coverage_warning, new_leaders, updated_codes)
+
+        仅当行业名称包含"机器人"或"人形"时启用 HUMANOID_CHAIN_CHECKLIST 专用覆盖度校验；
+        其他行业跳过专用覆盖度校验，仅记录日志。"""
+        # 按行业动态判断：只有机器人/人形相关行业才使用专用覆盖度校验
+        if "机器人" not in industry and "人形" not in industry:
+            logger.info(f"非机器人行业（{industry}），跳过专用覆盖度校验")
+            return ("", [], all_leader_codes)
+
         # Step 1: 建立候选->环节快照（用链结构中的 segment name 做别名映射）
         covered_segments = set()
         segment_to_codes: Dict[str, list[str]] = {}
@@ -950,13 +1086,18 @@ class ResearcherAgent:
         return []
 
     def _build_chain_queries(self, industry: str, chain: Dict) -> List[str]:
-        """生成产业链全景+各环节龙头+资金偏好的搜索查询（含不可替代性/溢价能力维度)"""
+        """生成产业链全景+各环节龙头+资金偏好的搜索查询（含不可替代性/溢价能力维度)
+
+        query 数量上限 30 条：10 条行业级 + 排名前 10 的候选公司各 2 条
+        （每家公司经营现状+护城河合并 1 条、资金面+估值合并 1 条），超出截断。
+        """
         today = date.today()
         three_months = today - timedelta(days=90)
         recent_period = f"{today.year}年{today.month}月"
         three_month_range = f"{three_months.strftime('%Y-%m')} {today.strftime('%Y-%m')}"
 
-        queries = [
+        # ===== 10 条行业级 query =====
+        industry_queries = [
             f"{industry} 行业 现状 景气度 市场规模 {recent_period}",
             f"{industry} 产业链 政策 利好 利空 {three_month_range}",
             f"{industry} 行业 发展趋势 投资机会 {today.year} {today.year + 1}",
@@ -974,6 +1115,8 @@ class ResearcherAgent:
             f"{industry} 量产 时间表 SOP 交付 订单 供应链 业绩兑现 {today.year}",
         ]
 
+        # ===== 每个候选公司 2 条 query（经营现状+护城河合并 1 条、资金面+估值合并 1 条）=====
+        company_query_groups: List[List[str]] = []
         for level in ["upstream", "midstream", "downstream", "niche_innovators"]:
             for seg_data in chain.get(level, []):
                 seg = seg_data.get("segment", "")
@@ -981,18 +1124,26 @@ class ResearcherAgent:
                     name = leader.get("name", "")
                     code = leader.get("code", "")
                     tag = f"{name}({code})" if name and code else seg
-                    # 经营竞争力
-                    queries.append(f"{tag} {seg} 业绩 竞争力 利好 利空 {recent_period}")
-                    # 业务拆解：收入毛利占比 + 出货量 + 资本开支 + 新增订单
-                    queries.append(f"{tag} 业务构成 各板块收入占比 毛利占比 分业务毛利率")
-                    queries.append(f"{tag} 出货量 产能 产能利用率 新增订单量 订单来源 资本开支")
-                    # 不可替代性 + 护城河
-                    queries.append(f"{tag} 不可替代性 护城河 技术壁垒 专利 供应链依赖 切换成本")
-                    # 溢价能力 + 定价权
-                    queries.append(f"{tag} 毛利率 溢价能力 议价权 定价权 品牌壁垒 成本转嫁")
-                    # 资金偏好：主力/游资/散户
-                    queries.append(f"{tag} 资金流向 主力资金 游资 散户 机构持仓 龙虎榜")
+                    # 经营现状+护城河合并：业绩/竞争力/业务构成/不可替代性/技术壁垒
+                    q_biz = (f"{tag} {seg} 业绩 竞争力 业务构成 收入占比 毛利率 "
+                             f"护城河 技术壁垒 不可替代性 议价权 {recent_period}")
+                    # 资金面+估值合并：主力资金/机构持仓/估值/PE/龙虎榜
+                    q_capital = (f"{tag} 资金流向 主力资金 机构持仓 北向资金 "
+                                 f"估值 PE 历史分位 龙虎榜 {today.year}")
+                    company_query_groups.append([q_biz, q_capital])
 
+        # ===== 合并：10 行业级 + 排名前 10 的候选公司各 2 条 = 最多 30 条 =====
+        queries = list(industry_queries)
+        top_company_count = min(len(company_query_groups), 10)
+        for qs in company_query_groups[:top_company_count]:
+            queries.extend(qs)
+
+        # 安全兜底：总数超过 30 条时只取前 30 条
+        if len(queries) > 30:
+            queries = queries[:30]
+
+        logger.info(f"产业链搜索query: 共{len(queries)}条"
+                    f"（行业级{len(industry_queries)} + 候选公司{top_company_count}×2）")
         return queries
 
     def _build_chain_system_prompt(self, stage: str = DEFAULT_STAGE, stage_reason: str = "") -> str:
@@ -1021,7 +1172,7 @@ class ResearcherAgent:
 纯JSON格式（不要markdown包裹）：
 {{
   "candidates": [
-    {{"code": "股票代码", "business": 业务经营分0-10, "fundamental": 基本面分0-10,
+    {{"code": "股票代码", "name": "公司名称", "business": 业务经营分0-10, "fundamental": 基本面分0-10,
       "moat": 不可替代与溢价分0-10, "momentum": 边际变化分0-10}},
     ...
   ],
@@ -1056,7 +1207,11 @@ class ResearcherAgent:
 
 ## 一、产业链公司全景筛选
 - 用表格列出产业链上中下游 + 特精专新共筛选出的所有公司
-- 表头：环节 | 细分领域 | 排名 | 公司名称 | 代码 | 核心业务一句话 | 资金偏好
+- 表头：环节 | 细分领域 | 公司名称 | 代码 | 核心业务一句话 | 资金偏好
+  ⚠️ **表格不包含评分/PE列**——综合排名表由程序在报告末尾自动生成（加权+预期差调整后排序）
+- **环节列**：必须引用【公司→环节映射】数据块中的映射关系填写，禁止自行推测
+- **核心业务列**：必须从下方"候选公司主营业务构成"程序数据块或"全网搜索结果"中提取引用，不得为空或"-"
+- **资金偏好列**：依据搜索数据中提及的资金类型判断，无公开证据写「无公开数据」（详见下方资金偏好标签说明）
 - **分类精度要求**：航天业务关联极弱的公司（如慈星股份、创耀科技）单独标注为「纯题材概念股」，
   与真正受益标的分开列示，不得混入核心受益环节
 
@@ -1146,6 +1301,40 @@ class ResearcherAgent:
 - ⚠️ 特别关注行业内正在推进 IPO（已注册/过会/获批/招股）的重要公司，
   其上市后的资本开支和产业链带动是独立的二级催化，必须在时间轴中列出并标注弹性
 
+**【涨价事件归因分类规则】**
+涉及"涨价"的事件必须先做归因分类，禁止笼统引用：
+- **类型A：上游零部件厂涨价（供不应求信号）** 🟢 真正的供给紧张信号
+  - 判定：零部件厂商（如减速器/丝杠/电机/传感器厂）主动提价、交期延长、排产爆满
+  - 影响：上游环节定价权提升 → 利润向上游迁移 → 利好上游核心零部件标的
+  - 示例：绿的谐波交期延长至12周+、哈默纳科对华断供/涨价
+- **类型B：下游整机厂提价（成本传导信号）** 🟡 中性或偏利空（需求端承压）
+  - 判定：整机厂/系统集成商（如埃斯顿/新时达/埃夫特）因铜/铝/芯片等原材料成本上涨而提价
+  - 影响：成本压力从下游向上游传导的结果 ≠ 上游供不应求；
+    若提价导致需求萎缩，反而利空整个产业链
+  - 注意：整机厂提价绝对不能作为"上游议价权提升"或"行业景气"的证据，两者因果方向完全相反
+- **类型C：渠道/经销商涨价（中间商行为）** ⚪ 参考价值低
+  - 判定：贸易商/经销商囤货炒作导致的价格波动
+  - 影响：不代表真实供需格局，通常不构成长期催化
+- ⚠️ 引用涨价事件必须标注类型（A/B/C），不得将B类（整机厂提价）误判为行业景气信号
+
+**【机器人纯度分类规则】**
+涉及机器人的催化事件必须标注"机器人纯度"——即该事件对哪类机器人的拉动最大：
+- **人形机器人核心催化** 🤖：直接利好执行人形机器人核心零部件（谐波减速器/行星滚柱丝杠/空心杯电机/力矩传感器/控制器）的事件
+  - 示例：特斯拉Optimus量产、Figure拿到大额订单、国产人形机器人核心零部件通过认证
+  - 受益标的：绿的谐波、拓普集团、三花智控等核心零部件厂
+- **工业机器人催化** 🏭：主要利好工业机器人本体、系统集成、工业自动化的事件
+  - 示例：制造业自动化改造补贴、3C/汽车行业扩产、工业机器人销量同比大增
+  - 受益标的：汇川技术、埃斯顿、机器人等工业自动化/本体厂商
+- **四足/巡检机器人催化** 🐕：主要利好四足机器人、巡检机器人、特种机器人的事件
+  - 示例：国家电网/南方电网巡检机器人集采、安防机器人招标、消防机器人列装
+  - 受益标的：宇树科技供应链、奥比中光（3D视觉）、柯力传感（传感器）等
+- **混合催化**：同时涉及多类机器人，但拉动力度不同——必须说明各类受益程度排序
+  - 示例："国家电网68亿集采" → 四足巡检🐕 > 工业操作臂🏭 > 人形带电作业🤖
+    （5000台四足+3000台双臂+500台人形，四足是主力，人形占比<6%）
+- ⚠️ 禁止笼统地把任何机器人相关事件都归为"人形机器人一级β催化"，
+  必须实事求是地拆分受益结构和拉动力度。人形机器人是高弹性赛道，
+  但非人形事件强行碰瓷人形机器人 = 误导读者
+
 ## 九、行业近况与重大事件（近1-3个月已发生）
 催化剂时间轴看未来，本节看已经发生的行情驱动：
 - 技术里程碑（如"国产火箭回收试验成功"）、重要政策落地、大额融资/订单、事故与挫折，
@@ -1162,6 +1351,19 @@ class ResearcherAgent:
 - 对应当前总市值的PE Band（例如：绿的谐波即使按最乐观2028E净利润，PE仍有XX倍）
 - 标注共识度：覆盖机构家数、目标价均值/中位数、当前价相对目标价的空间
 - 同步检查机构是否在最近1个月上调/下调了预测（方向比绝对值重要）
+
+**【机构一致预期数据使用规则】**
+- **产业链分析**：程序数据块中的数据来自**Tushare report_rc**（含多家券商汇总，样本量最大，约40+家机构），引用时必须标注"Tushare N家机构"
+- **个股分析**：程序数据块中的数据来自**AkShare多源并取**（东财+同花顺），引用时必须标注来源和机构家数
+  （如"19家机构一致预期2026年EPS 0.37元"、"同花顺8家均值EPS 0.31元"）
+- 搜索结果中若出现同花顺/东方财富/万得等其他来源的一致预期数据，**必须标注来源和样本量**
+  （如"同花顺近6月16家机构均值"、"东方财富14家机构"）
+- 不同来源数据差异 >3% 以上时，**必须同时列出并说明差异原因**
+  （如"41家Tushare均值60.6亿 vs 16家同花顺均值64.6亿，差异+6.6%，或因样本机构不同/时间窗口不同）
+- **forward PE**：必须使用程序计算值（基于机构数最多的主源），禁止自行用原始预测表心算
+- **forward PEG**：必须使用程序计算值（基于预测期CAGR而非相邻年度增速），禁止自行推算增速
+- **目标价**：必须引用程序提供的【目标价矩阵】（区间/中位数/机构明细），禁止将单一券商目标价冒充"一致预期"
+- 不得将单一券商的个别目标价冒充"一致预期"。"一致预期"定义：≥3家机构的汇总值（中位数或均值）
 
 ## 十一、技术路径博弈分析
 基于搜索结果分析本行业关键技术路线的竞争格局与演变趋势：
@@ -1200,46 +1402,186 @@ class ResearcherAgent:
 
     def _fetch_consensus_forecasts(
             self, codes: List[str]) -> Dict[str, Dict[int, dict]]:
-        """拉取一致预期数据，返回 {code: {year: {revenue, profit, eps, n_inst}}}；失败返回空 dict"""
+        """拉取一致预期数据 + 去年实际值（作为基准锚）+ 目标价矩阵。
+        
+        数据获取优先级：DB缓存 → Tushare API → 失败回退到DB缓存
+        （Tushare report_rc 仅 10次/天 配额，必须优先用缓存）
+        
+        返回 {code: {year: {revenue, profit, eps, n_inst, is_actual}, 
+                '_target_prices': [{'org', 'target', 'rating', 'date'}, ...],
+                '_target_stats': {'avg', 'median', 'min', 'max', 'count'}}}}；
+        失败返回空 dict"""
         import pandas as pd
-        from tools.stock.tushare_fetcher import TushareFetcher
+        from datetime import date
         result: Dict[str, Dict[int, dict]] = {}
+        # 数据库连接（优先用DB缓存，节省Tushare配额）
+        db = None
         try:
-            tf = TushareFetcher()
+            from storage.sqlite.stock_storage import get_db
+            db = get_db()
         except Exception:
-            return result
+            pass
+        # Tushare 实例（仅当需要刷新时调用）
+        tf = None
         profit_col, rev_col, eps_col = 'forecast_np', 'forecast_revenue', 'forecast_eps'
-        for code in codes[:6]:
-            try:
-                df = tf.report_rc(code)
-                if df is None or df.empty or profit_col not in df.columns:
-                    continue
-                df = df[df[profit_col].notna()].copy()
-                if df.empty:
-                    continue
-                df['end_date_dt'] = pd.to_datetime(df['end_date'], format='%Y%m%d', errors='coerce')
-                df['year'] = df['end_date_dt'].dt.year
-                df = df[df['year'].between(2026, 2028)].copy()
-                if df.empty:
-                    continue
-                year_data: Dict[int, dict] = {}
-                for yr in sorted(df['year'].unique()):
-                    yr_df = df[df['year'] == yr]
-                    p_med = yr_df[profit_col].median()
-                    r_med = yr_df[rev_col].median() if rev_col in yr_df.columns and yr_df[rev_col].notna().any() else None
-                    e_med = yr_df[eps_col].median() if eps_col in yr_df.columns and yr_df[eps_col].notna().any() else None
+        today = date.today()
+        for code in codes[:12]:
+            year_data: Dict[int, dict] = {}
+            # 1. 2025A 实际值（年报，基准锚）
+            if db is not None:
+                try:
+                    inc_df = db.get_stock_income(code)
+                    if inc_df is not None and not inc_df.empty:
+                        inc_df = inc_df.copy()
+                        inc_df['_rd'] = pd.to_datetime(inc_df['report_date'], errors='coerce')
+                        ann_df = inc_df[inc_df['_rd'].dt.month == 12].sort_values('_rd', ascending=False)
+                        if not ann_df.empty:
+                            last_annual = ann_df.iloc[0]
+                            yr = int(last_annual['_rd'].year)
+                            np_ = last_annual.get('net_profit')
+                            rev = last_annual.get('total_revenue')
+                            eps = last_annual.get('basic_eps')
+                            if np_ is not None and float(np_) > 0:
+                                year_data[yr] = {
+                                    'profit': round(float(np_) / 1e8, 2),
+                                    'revenue': round(float(rev) / 1e8, 1) if rev is not None else None,
+                                    'eps': round(float(eps), 4) if eps is not None else None,
+                                    'n_inst': 0,
+                                    'is_actual': True,
+                                }
+                except Exception:
+                    pass
+            # 2. 一致预期数据：DB缓存优先，API刷新兜底
+            df = None
+            data_source = "none"
+            # 2.1 先读DB缓存
+            if db is not None:
+                try:
+                    cached = db.get_stock_report_rc(code, limit=50)
+                    if cached is not None and not cached.empty:
+                        latest_date = cached['report_date'].max()
+                        if isinstance(latest_date, pd.Timestamp):
+                            latest_date = latest_date.date()
+                        elif isinstance(latest_date, str):
+                            from datetime import datetime as _dt
+                            latest_date = _dt.strptime(str(latest_date)[:10], "%Y-%m-%d").date()
+                        # 缓存7天内有效；非交易日不刷新
+                        days_old = (today - latest_date).days if latest_date else 999
+                        if days_old <= 7 or today.weekday() >= 5:
+                            df = cached
+                            data_source = "db_cache"
+                except Exception:
+                    pass
+            # 2.2 缓存过期/不存在 → 尝试API刷新（有配额限制，一天最多10次）
+            if df is None and tf is None:
+                try:
+                    from tools.stock.tushare_fetcher import TushareFetcher
+                    tf = TushareFetcher()
+                except Exception:
+                    tf = None
+            if df is None and tf is not None:
+                try:
+                    from datetime import date as _date
+                    _today = _date.today()
+                    start_date = f"{_today.year - 1}-01-01"
+                    end_date_str = _today.strftime("%Y-%m-%d")
+                    api_df = tf.report_rc(code, start_date=start_date, end_date=end_date_str)
+                    if api_df is not None and not api_df.empty and profit_col in api_df.columns:
+                        df = api_df
+                        data_source = "tushare_api"
+                        # 保存到DB缓存（供后续使用）
+                        if db is not None:
+                            try:
+                                db.save_stock_report_rc(df, code)
+                            except Exception:
+                                pass
+                except Exception as e:
+                    # API失败（配额超限/网络问题）→ 回退到DB缓存（即使过期了也用）
+                    if db is not None:
+                        try:
+                            cached2 = db.get_stock_report_rc(code, limit=50)
+                            if cached2 is not None and not cached2.empty:
+                                df = cached2
+                                data_source = "db_cache_fallback"
+                        except Exception:
+                            pass
+            # 3. 解析一致预期数据 + 目标价
+            if df is not None and not df.empty:
+                self._parse_forecast_data(df, year_data, profit_col, rev_col, eps_col)
+            if year_data:
+                result[code] = year_data
+        return result
+
+    def _parse_forecast_data(self, df, year_data, profit_col, rev_col, eps_col):
+        """从report_rc DataFrame中解析一致预期和目标价数据，写入year_data"""
+        import pandas as pd
+        target_prices = []
+        # 目标价数据
+        tp_col = 'target_price'
+        org_col = 'forecast_org' if 'forecast_org' in df.columns else 'org_name'
+        if tp_col in df.columns and org_col in df.columns:
+            tp_df = df[df[tp_col].notna()].copy()
+            if not tp_df.empty:
+                if 'report_date' in tp_df.columns:
+                    tp_df['_rd'] = pd.to_datetime(tp_df['report_date'], format='%Y%m%d', errors='coerce')
+                elif 'ann_date' in tp_df.columns:
+                    tp_df['_rd'] = pd.to_datetime(tp_df['ann_date'], format='%Y%m%d', errors='coerce')
+                else:
+                    tp_df['_rd'] = pd.NaT
+                tp_df = tp_df.sort_values('_rd', ascending=False)
+                seen_orgs = set()
+                for _, row in tp_df.head(20).iterrows():
+                    org = str(row.get(org_col, '') or '')
+                    if not org or org in seen_orgs:
+                        continue
+                    seen_orgs.add(org)
+                    tp = float(row.get(tp_col) or 0)
+                    if tp <= 0:
+                        continue
+                    date_val = row.get('report_date') or row.get('ann_date') or ''
+                    rating = str(row.get('rating', '') or '')
+                    target_prices.append({
+                        'org': org,
+                        'target': round(tp, 2),
+                        'rating': rating,
+                        'date': str(date_val)[:8],
+                    })
+                if target_prices:
+                    tp_vals = [t['target'] for t in target_prices]
+                    year_data['_target_stats'] = {
+                        'avg': round(sum(tp_vals) / len(tp_vals), 2),
+                        'median': round(sorted(tp_vals)[len(tp_vals)//2], 2),
+                        'min': round(min(tp_vals), 2),
+                        'max': round(max(tp_vals), 2),
+                        'count': len(target_prices),
+                    }
+                    year_data['_target_prices'] = target_prices[:8]
+        # 盈利预测数据
+        if profit_col in df.columns:
+            df2 = df[df[profit_col].notna()].copy()
+            if not df2.empty and 'end_date' in df2.columns:
+                df2['end_date_dt'] = pd.to_datetime(df2['end_date'], format='%Y%m%d', errors='coerce')
+                df2['year'] = df2['end_date_dt'].dt.year
+                cur_year = pd.Timestamp.now().year
+                df2 = df2[df2['year'].between(cur_year, cur_year + 3)].copy()
+                for yr in sorted(df2['year'].unique()):
+                    yr_df = df2[df2['year'] == yr]
+                    p_vals = pd.to_numeric(yr_df[profit_col], errors='coerce').dropna()
+                    p_med = p_vals.median()
+                    r_vals = pd.to_numeric(yr_df[rev_col], errors='coerce').dropna() if rev_col in yr_df.columns else pd.Series(dtype=float)
+                    r_med = r_vals.median() if not r_vals.empty else None
+                    e_vals = pd.to_numeric(yr_df[eps_col], errors='coerce').dropna() if eps_col in yr_df.columns else pd.Series(dtype=float)
+                    e_med = e_vals.median() if not e_vals.empty else None
                     if p_med is not None and p_med > 0:
                         year_data[yr] = {
                             'profit': round(p_med / 1e8, 2),
+                            'profit_p25': round(p_vals.quantile(0.25) / 1e8, 2) if len(p_vals) >= 3 else None,
+                            'profit_p75': round(p_vals.quantile(0.75) / 1e8, 2) if len(p_vals) >= 3 else None,
                             'revenue': round(r_med / 1e8, 1) if r_med is not None else None,
                             'eps': round(e_med, 4) if e_med is not None else None,
                             'n_inst': len(yr_df),
+                            'is_actual': False,
                         }
-                if year_data:
-                    result[code] = year_data
-            except Exception:
-                continue
-        return result
 
     def _format_forecast_table(self, forecasts: Dict[str, Dict[int, dict]],
                                per_stock_valuation: Optional[List[Dict]] = None) -> str:
@@ -1263,15 +1605,38 @@ class ResearcherAgent:
             cur_pe = vm.get("pe_ttm")
             pe_pct = vm.get("pe_percentile")
             # --- 表格头 ---
-            years = sorted(yd.keys())
-            header_years = " | ".join(f"{y}E" for y in years)
-            lines.append(f"\n◇ {name}({code})  当前PE={cur_pe or 'N/A'} PE分位={pe_pct or 'N/A'}%  总市值={cur_mv or 'N/A'}亿")
+            years = sorted([k for k in yd.keys() if isinstance(k, int)])
+            def _yr_label(y):
+                if yd[y].get('is_actual'):
+                    return f"{y}A(实际)"
+                return f"{y}E"
+            header_years = " | ".join(_yr_label(y) for y in years)
+            target_stats = yd.get('_target_stats', {})
+            target_prices = yd.get('_target_prices', [])
+            cur_price = vm.get("current_price")
+            target_upside = ""
+            if target_stats and cur_price:
+                upside = (target_stats['avg'] / cur_price - 1) * 100
+                target_upside = f"  平均目标价空间: +{upside:.1f}%"
+            lines.append(f"\n◇ {name}({code})  当前PE={cur_pe or 'N/A'} PE分位={pe_pct or 'N/A'}%  总市值={cur_mv or 'N/A'}亿{target_upside}")
             lines.append(f"  指标    | {header_years}")
             # 营收行
             revs = [f"{yd[y].get('revenue','-')}" for y in years]
             lines.append(f"  营收(亿) | {' | '.join(revs)}")
-            # 净利润行
-            profits = [f"{yd[y]['profit']:.2f}" for y in years]
+            # 净利润行（实际值标★，预测值附P25-P75区间）
+            profits = []
+            for y in years:
+                p = yd[y]['profit']
+                is_act = yd[y].get('is_actual', False)
+                if is_act:
+                    profits.append(f"★{p:.2f}")
+                else:
+                    p25 = yd[y].get('profit_p25')
+                    p75 = yd[y].get('profit_p75')
+                    if p25 is not None and p75 is not None:
+                        profits.append(f"{p:.2f}（{p25:.1f}-{p75:.1f}亿）")
+                    else:
+                        profits.append(f"{p:.2f}")
             lines.append(f"  净利(亿) | {' | '.join(profits)}")
             # 营收同比
             rev_growths = []
@@ -1310,18 +1675,75 @@ class ResearcherAgent:
             n_insts = [f"{yd[y]['n_inst']}家" for y in years]
             lines.append(f"  机构覆盖 | {' | '.join(n_insts)}")
 
-            # --- 估值敏感性矩阵 ---
+            # --- 目标价矩阵（券商一致预期）---
+            if target_prices:
+                tp_count = target_stats.get('count', 0)
+                tp_avg = target_stats.get('avg', '-')
+                tp_med = target_stats.get('median', '-')
+                tp_min = target_stats.get('min', '-')
+                tp_max = target_stats.get('max', '-')
+                lines.append(f"\n  🎯 券商目标价矩阵（Tushare，共{tp_count}家机构）：")
+                lines.append(f"  统计 | 均价{tp_avg}元  中位数{tp_med}元  区间{tp_min}-{tp_max}元")
+                if cur_price and isinstance(tp_avg, (int, float)):
+                    avg_upside = (tp_avg / cur_price - 1) * 100
+                    med_upside = (tp_med / cur_price - 1) * 100 if isinstance(tp_med, (int, float)) else 0
+                    lines.append(f"  现价 {cur_price}元，距均价空间 {avg_upside:+.1f}%，距中位数空间 {med_upside:+.1f}%")
+                    lines.append(f"  ⚠️ 注意：目标价仅为券商一致预期均值，不构成投资建议；实际走势受大盘/行业/公司多重因素影响")
+                lines.append(f"  主要机构目标价（按报告日期排序）：")
+                for tp in target_prices[:8]:
+                    rating_str = f" [{tp['rating']}]" if tp['rating'] else ""
+                    date_str = f" ({tp['date'][:4]}-{tp['date'][4:6]}-{tp['date'][6:]})" if tp['date'] else ""
+                    lines.append(f"    - {tp['org']}: {tp['target']}元{rating_str}{date_str}")
+
+            # --- 估值锚：合理市值测算（基于2026E一致预期 + 行业合理PE）---
+            if cur_mv and len(years) >= 2:
+                # 取2026E（或最近一个预测年）作为基准年
+                forecast_years = [y for y in years if not yd[y].get('is_actual')]
+                if forecast_years:
+                    base_year = forecast_years[0]  # 最近预测年（通常是2026E）
+                    base_profit = yd[base_year]['profit']
+                    # 合理PE：用当前PE × (50%分位 / 当前分位) 反推历史中位PE
+                    # 简化：用当前PE的0.7倍作为合理PE（假设分位30%左右时合理）
+                    # 或者直接给出三档PE供参考
+                    lines.append(f"\n  🎯 合理市值锚（基准={base_year}E一致预期净利 {base_profit:.2f}亿）：")
+                    lines.append(f"  估值情景 | 目标PE | 合理市值(亿) | 对应股价(元) | 相对现价空间")
+                    # 获取总股本以计算对应股价
+                    total_share = None
+                    try:
+                        from storage.sqlite.stock_storage import get_db
+                        _db = get_db()
+                        basic_df = _db.get_latest_daily_basic_data(code, 1)
+                        if basic_df is not None and not basic_df.empty:
+                            total_share = float(basic_df.iloc[0].get('total_share') or 0) / 1e4  # 万股→亿股
+                    except Exception:
+                        pass
+                    # 三档合理PE：保守/中性/乐观
+                    pe_scenarios = [
+                        ("保守(行业下沿)", 25),
+                        ("中性(行业中枢)", 35),
+                        ("乐观(成长溢价)", 50),
+                    ]
+                    for label, pe_target in pe_scenarios:
+                        implied_mv = round(base_profit * pe_target, 1)
+                        room = round((implied_mv / cur_mv - 1) * 100, 1) if cur_mv > 0 else 0
+                        room_str = f"+{room}%" if room >= 0 else f"{room}%"
+                        price_str = "-"
+                        if total_share and total_share > 0:
+                            target_price = round(implied_mv / total_share, 2)
+                            price_str = f"{target_price}"
+                        lines.append(f"  {label} | {pe_target}x | {implied_mv} | {price_str} | {room_str}")
+                    lines.append(f"  ⚠️ 注：合理PE为参考值，需结合行业增速、公司护城河、市场风险偏好动态调整")
+
+            # --- 估值敏感性矩阵（远期视角）---
             if cur_mv and len(years) >= 1:
-                last_profit = yd[years[-1]]['profit']  # 最远期(2028E)
-                lines.append(f"\n  估值敏感性（基准={last_profit:.2f}亿净利润）：")
+                last_profit = yd[years[-1]]['profit']  # 最远期
+                last_year = years[-1]
+                lines.append(f"\n  估值敏感性（远期视角，基准={last_year}E净利 {last_profit:.2f}亿）：")
                 lines.append(f"  情景          | 远期PE | 隐含市值(亿) | 相对当前空间")
-                # 乐观: Optimus 10万台 → 给激进PE(产能充分释放, 市场赋予高估值)
-                # 中性: 国内整机10万台 → 给行业平均PE
-                # 悲观: 量产推迟 → 给保守PE
                 scenarios = [
-                    ("乐观(量产如期放量)", 80),
-                    ("中性(行业稳步增长)", 60),
-                    ("悲观(量产大幅推迟)", 40),
+                    ("乐观(超预期)", 80),
+                    ("中性(符合预期)", 60),
+                    ("悲观(低于预期)", 40),
                 ]
                 for label, pe_assumption in scenarios:
                     implied_mv = round(last_profit * pe_assumption, 1)
@@ -1572,7 +1994,11 @@ ETF 名称：{etf_name}
             industry_name = state.get("industry_name", "")
             stock_type = state.get("stock_type", "")
             question = state.get("question", "")
+            intent = state.get("intent", "")
 
+            # 宏观分析意图（无具体个股）：拉取宏观数据快照 → 分析宏观事件对市场/行业的影响
+            if intent == IntentType.MACRO and not stock_code:
+                return self._analyze_macro(state)
             if industry_name and not stock_code:
                 return self._analyze_industry(state)
             if stock_type == "etf":
@@ -1589,10 +2015,106 @@ ETF 名称：{etf_name}
                 "intermediate_steps": [("researcher", {"error": str(e)})],
             }
 
+    def _build_macro_system_prompt(self) -> str:
+        return f"""你是一个专业的宏观经济分析师，擅长分析宏观事件对A股市场和各行业的影响。
+
+{INTERMEDIATE_PRODUCT_NOTE}
+
+【分析要求】
+- 总体判断：用一句话定性当前宏观环境（偏多/中性/偏空）及核心逻辑
+- 关键信号：列出 2-4 个最具信息量的宏观数据变化（利率/流动性/通胀/汇率等），每条带数据支撑
+- 行业影响映射：宏观事件对哪些行业构成利好/利空，传导逻辑是什么
+  （如降息利好高负债率行业/地产/券商；美债收益率上行压制成长股估值等）
+- 市场情绪与资金面：大盘资金流向、北向资金、两融余额等反映的市场情绪
+- 关注点：当前最值得跟踪的宏观变数（1-2条）
+
+【输出原则】
+- 所有结论必须基于提供的宏观数据快照与搜索结果，不足处标注「信息不足」
+- 禁止给出具体的个股买卖建议（如"建议买入XX"）
+- 宏观数据为程序拉取的真实值，引用时注明来源口径
+- 历史胜率/统计只能说"历史统计"，禁止说"上涨概率"
+"""
+
+    def _analyze_macro(self, state: AgentState) -> Dict[str, Any]:
+        """宏观分析：拉取宏观数据快照 → LLM 分析宏观事件对市场/行业的影响（不分析具体个股）"""
+        question = state.get("question", "")
+        logger.info(f"研究 Agent（宏观模式）")
+
+        # ---- 宏观数据快照（程序拉取：资金流向/利率/美债/CPI/PMI/M2/社融等）----
+        macro_text = ""
+        try:
+            from monitoring.macro_watcher import fetch_macro_snapshot
+            macro_text = fetch_macro_snapshot()
+            if macro_text:
+                logger.info(f"宏观数据快照获取成功，长度: {len(macro_text)}")
+            else:
+                macro_text = "（宏观数据暂不可用）"
+        except Exception as e:
+            logger.warning(f"宏观数据获取失败（不影响分析）: {e}")
+            macro_text = "（宏观数据暂不可用）"
+
+        # ---- 网页搜索：宏观事件最新动态与解读 ----
+        queries = [
+            f"{question} 最新动态 影响 {date.today().year}",
+            "央行 货币政策 降息 加息 MLF LPR 降准 最新",
+            "CPI PMI 社融 M2 宏观经济 最新数据 解读",
+            "美债收益率 汇率 A股 影响 最新",
+        ]
+        search_text = self._search_text(self._do_search(queries))
+
+        messages = [
+            SystemMessage(content=self._build_macro_system_prompt()),
+            HumanMessage(content=f"""用户问题：{question}
+
+========== 宏观数据快照（程序拉取，含资金流向/利率/美债收益率/CPI/PMI/M2/社融等） ==========
+{macro_text[:8000]}
+
+========== 全网搜索结果（宏观事件最新动态，T4） ==========
+{search_text[:8000]}
+
+请基于以上信息分析宏观环境及其对市场和行业的影响。"""),
+        ]
+
+        logger.info("LLM 宏观分析中...")
+        response = self._llm_invoke_with_timeout(messages)
+        if response is None:
+            logger.warning("LLM 宏观分析超时，返回空结果")
+            return {
+                "messages": [],
+                "research_result": {"summary": "LLM分析超时", "sources": queries, "mode": "macro"},
+                "intermediate_steps": [("researcher", {"mode": "macro", "queries": len(queries)})],
+            }
+        summary = response.content if hasattr(response, 'content') else str(response)
+        logger.info(f"宏观分析完成，长度: {len(summary)}")
+
+        return {
+            "messages": [response],
+            "research_result": {"summary": summary, "sources": queries, "mode": "macro"},
+            "intermediate_steps": [("researcher", {"mode": "macro", "queries": len(queries)})],
+        }
+
     def _analyze_stock(self, state: AgentState) -> Dict[str, Any]:
         stock_code = state.get("stock_code", "")
         question = state.get("question", "")
         logger.info(f"研究 Agent（个股模式），股票: {stock_code}")
+
+        # 标的属性分类（周期股/成长股/防御股/价值股）→ 差异化分析重点
+        # 优先从 state 读取 router 统一判定的结果，避免重复调用 classify_stock_attribute
+        stock_attr = state.get("stock_attribute") or {}
+        if not stock_attr:
+            from tools.stock_classifier import classify_stock_attribute
+            stock_attr = classify_stock_attribute(stock_code)
+        attr_label = stock_attr.get("label", "未分类")
+        logger.info(f"标的属性分类: {stock_code} → {stock_attr.get('type', 'unknown')}({attr_label})")
+        attr_block = ""
+        if stock_attr.get("type") != "unknown":
+            attr_block = f"""
+========== 标的属性分类（程序判定，指导分析重点） ==========
+属性：{attr_label}（行业：{stock_attr.get('industry', '未知')}）
+差异化分析重点：{stock_attr.get('key_metrics', '')}
+估值方法指导：{stock_attr.get('valuation_method', '')}
+{stock_attr.get('valuation_warning', '')}
+"""
 
         # ---- 结构化信源（主）：东财新闻 / 巨潮公告 / 财联社快讯 ----
         from tools.info_sources import (
@@ -1675,11 +2197,33 @@ ETF 名称：{etf_name}
             return ""
         def _run_sensitivity_sotp():
             try:
-                from tools.stock_tools import call_fetch_fina_indicator
-                raw_fina = call_fetch_fina_indicator(stock_code)
-                import re
-                np_match = re.search(r'(?:归母净利润|净利润)[：:]\s*([\d.]+)\s*亿', str(raw_fina))
-                base_profit = float(np_match.group(1)) if np_match else None
+                import pandas as pd
+                base_profit = None
+                base_year = None
+                base_period_type = None
+                try:
+                    from storage.sqlite.stock_storage import get_db
+                    db = get_db()
+                    inc_df = db.get_stock_income(stock_code)
+                    if inc_df is not None and not inc_df.empty:
+                        inc_df = inc_df.copy()
+                        inc_df['_rd'] = pd.to_datetime(inc_df['report_date'], errors='coerce')
+                        ann_df = inc_df[inc_df['_rd'].dt.month == 12].sort_values('_rd', ascending=False)
+                        if not ann_df.empty:
+                            last_annual = ann_df.iloc[0]
+                            np_val = last_annual.get('net_profit')
+                            if np_val is not None and float(np_val) > 0:
+                                base_profit = round(float(np_val) / 1e8, 2)
+                                base_year = int(last_annual['_rd'].year)
+                                base_period_type = '年报'
+                except Exception:
+                    pass
+                if base_profit is None:
+                    from tools.stock_tools import call_fetch_fina_indicator
+                    raw_fina = call_fetch_fina_indicator(stock_code)
+                    import re
+                    np_match = re.search(r'(?:归母净利润|净利润)[：:]\s*([\d.]+)\s*亿', str(raw_fina))
+                    base_profit = float(np_match.group(1)) if np_match else None
                 from tools.main_business import fetch_main_business_text
                 mb_text = fetch_main_business_text(stock_code)
                 segments = []
@@ -1695,8 +2239,8 @@ ETF 名称：{etf_name}
                         segments.append({"name": "主营业务", "profit": base_profit, "pe_assumed": 15, "weight": 1.0})
                 blocks = []
                 if base_profit and base_profit > 0:
+                    base_label = f"{base_year}年{base_period_type}" if base_year and base_period_type else "最新报告期"
                     from tools.sensitivity_analysis import build_sensitivity_table
-                    # 百分比变动敏感性
                     sens_vars = [
                         {"name": "营收增速变动", "impact": round(base_profit * 0.3, 2),
                          "unit": "亿元/±1%增速", "range": [-20, -10, 0, 10, 20]},
@@ -1705,9 +2249,7 @@ ETF 名称：{etf_name}
                     ]
                     sens = build_sensitivity_table(base_profit, sens_vars)
                     if sens:
-                        blocks.append(f"========== 敏感性分析（百分比弹性） ==========\n{sens}")
-                    # 核心情景敏感性：针对整车/新能源标的的专项变量
-                    # 各变量的 impact（每单位变动对净利润影响）和 range（变动幅度%）根据行业典型值设定
+                        blocks.append(f"========== 敏感性分析（百分比弹性，基准={base_label}净利润{base_profit}亿） ==========\n{sens}")
                     car_sens_vars = [
                         {"name": "欧盟反补贴关税", "impact": round(base_profit * 0.1, 2),
                          "unit": "亿元/±10%关税强度", "range": [-40, -20, 0, 20, 40]},
@@ -1720,7 +2262,7 @@ ETF 名称：{etf_name}
                     ]
                     car_sens = build_sensitivity_table(base_profit, car_sens_vars)
                     if car_sens:
-                        blocks.append(f"========== 核心情景敏感性（关税/原材料/毛利率/海外月销）==========\n"
+                        blocks.append(f"========== 核心情景敏感性（关税/原材料/毛利率/海外月销，基准={base_label}净利润{base_profit}亿）==========\n"
                                       f"{car_sens}\n"
                                       f"**说明**：关税每±10%强度±{round(base_profit*0.1,2)}亿；"
                                       f"毛利率±1pct±{round(base_profit*0.12,2)}亿；"
@@ -1779,7 +2321,33 @@ ETF 名称：{etf_name}
                 logger.warning(f"补充个股数据拉取失败: {e}")
             return ""
 
-        with ThreadPoolExecutor(max_workers=8) as _exe:
+        def _run_consensus_forecast():
+            try:
+                forecasts = self._fetch_consensus_forecasts([stock_code])
+                if forecasts and stock_code in forecasts:
+                    return self._format_forecast_table(forecasts)
+            except Exception as e:
+                logger.warning(f"一致预期拉取失败: {e}")
+            return ""
+
+        # 宏观环境注入：仅当问题含宏观关键词时拉取（避免无关个股分析额外开销），
+        # 用于"降息对XX股票影响"这类宏观+个股混合问题
+        macro_keywords = ["降息", "加息", "mlf", "lpr", "cpi", "pmi", "m2", "社融",
+                          "美债", "国债收益率", "汇率", "宏观", "货币政策", "降准"]
+        need_macro = any(kw in question.lower() for kw in macro_keywords)
+
+        def _run_macro():
+            try:
+                from monitoring.macro_watcher import fetch_macro_snapshot
+                text = fetch_macro_snapshot()
+                if text:
+                    return ("========== 宏观环境快照（程序拉取，含资金流向/利率/美债收益率/CPI/PMI/M2/社融等）"
+                            f" ==========\n{text[:6000]}")
+            except Exception as e:
+                logger.debug(f"宏观数据获取跳过（不影响主流程）: {e}")
+            return ""
+
+        with ThreadPoolExecutor(max_workers=9) as _exe:
             _futs = {
                 _exe.submit(_run_search): 'search',
                 _exe.submit(_run_industry): 'industry',
@@ -1788,7 +2356,11 @@ ETF 名称：{etf_name}
                 _exe.submit(_run_sensitivity_sotp): 'sens_sotp',
                 _exe.submit(_run_nine_turn): 'nine_turn',
                 _exe.submit(_run_extra_stock): 'extra_stock',
+                _exe.submit(_run_consensus_forecast): 'consensus',
             }
+            if need_macro:
+                _futs[_exe.submit(_run_macro)] = 'macro'
+                logger.info("检测到宏观关键词，并行拉取宏观环境快照注入个股分析")
             for _future in as_completed(_futs):
                 _key = _futs[_future]
                 try:
@@ -1804,6 +2376,12 @@ ETF 名称：{etf_name}
         sensitivity_sotp_block = collected.get('sens_sotp', '')
         nine_turn_block = collected.get('nine_turn', '')
         extra_stock_block = collected.get('extra_stock', '')
+        consensus_forecast_block = collected.get('consensus', '')
+        macro_block = collected.get('macro', '')
+
+        # 注入历史复盘教训（误判模式 + 改进规则），避免重复同类错误
+        review_lesson = self._format_review_lesson(stock_code)
+        review_block = f"\n========== 历史复盘教训 ==========\n{review_lesson}\n" if review_lesson else ""
 
         # ---- 结构化数据提取（依赖搜索结果，顺序执行） ----
         structured_data = self._extract_structured_data_from_search(search_text, company_name=company_name)
@@ -1820,11 +2398,14 @@ ETF 名称：{etf_name}
             HumanMessage(content=f"""用户问题：{question}
 股票代码：{stock_code}{f'（{company_name}）' if company_name else ''}
 
+{attr_block}
+
 ========== 信源优先级规则 ==========
-🟢 T1 权威（公告/财报/认证官方社交）> 🔵 T2 结构化（财经媒体）> 🟡 T3 未验证社交 > ⚪ T4 网络搜索
+🟢 T1 权威（公告/财报/年报实际值/认证官方社交）> 🔵 T2 结构化（一致预期/财经媒体）> 🟡 T3 未验证社交 > ⚪ T4 网络搜索
 - 高等级信源与低等级信源数据不一致时，以高等级为准并标注差异
 - 销量/产销类数字：提供了【产销快报公告原文】时**只能引用该原文的数字**并注明"根据公司公告"
 - 运营数据（销量/出货量等）优先引用【程序提取的结构化数据】区块中的时序数字
+- **净利润基准锚定规则**：【候选公司一致预期数据】区块中带 ★ 标记的年份为年报实际值（T1 权威），所有情景推演、同比计算、估值分析必须以此为基准，不得使用搜索结果中的估算值或过时数据
 
 ========== 结构化信源 ==========
 {structured_text[:8000]}
@@ -1833,15 +2414,21 @@ ETF 名称：{etf_name}
 
 {industry_section}
 
+{consensus_forecast_block}
+
 {capital_block}
 
 {peer_block}
 
 {sensitivity_sotp_block}
 
+{macro_block}
+
 {nine_turn_block}
 
 {extra_stock_block}
+
+{review_block}
 
 ========== 全网搜索结果（补充信息，T4） ==========
 {search_text[:10000]}
@@ -1877,6 +2464,7 @@ ETF 名称：{etf_name}
         return {
             "messages": [response],
             "research_result": {"summary": summary, "sources": queries},
+            "stock_attribute": stock_attr,
             "intermediate_steps": [("researcher", {"mode": "stock", "stock_code": stock_code, "queries": len(queries)})],
         }
 
@@ -1955,6 +2543,26 @@ ETF 名称：{etf_name}
             index_block = format_industry_index(industry_index)
         except Exception as e:
             logger.warning(f"行业指数获取失败（不影响分析主流程）: {e}")
+            # 降级：明确说明指数数据缺失，禁止LLM自行编造
+            index_block = ("【行业指数表现】程序获取失败，无法提供近5/20/60日指数涨跌幅数据。\n"
+                           "⚠️ 指数行情是判断板块 beta 趋势的事实依据，获取失败意味着走势脱锚。\n"
+                           "   LLM 禁止凭记忆或推断编造指数涨跌幅数字，仅提供定性描述。")
+
+        # 公司→环节扁平映射（程序拼表，LLM 直接引用填入全景表格，防止 LLM 自行映射出错）
+        code_to_segment = {}  # {code: segment_name}
+        for level in ["upstream", "midstream", "downstream", "niche_innovators"]:
+            for seg_data in chain.get(level, []):
+                seg = seg_data.get("segment", "")
+                for l in seg_data.get("leaders", []):
+                    c = str(l.get("code", "")).strip()
+                    if c:
+                        code_to_segment[c] = seg
+        company_chain_map_lines = ['========== 公司→环节映射（每家公司所属产业链环节，LLM必须引用此映射填写全景表格的"环节"列） ==========']
+        for c in sorted(all_leader_codes):
+            seg = code_to_segment.get(c, "未分类")
+            seg_alt = {v: k for k, v in _CHAIN_SEGMENT_ALIASES.items()}.get(seg, seg)
+            company_chain_map_lines.append(f"  {c} → {seg_alt}")
+        company_chain_map = "\n".join(company_chain_map_lines)
 
         # 行业估值与位置（程序计算，用龙头池做行业代理样本）——回调风险分析的量化锚
         from tools.industry_metrics import collect_industry_valuation, format_industry_valuation
@@ -2013,47 +2621,168 @@ ETF 名称：{etf_name}
                     r = call_fetch_income_data(c)
                     if r and '❌' not in r and len(r) > 50:
                         snap_lines.append(r.strip().split('\n')[:15])
+                    else:
+                        snap_lines.append("  ⚠️ 利润表数据获取失败")
                 except Exception:
-                    pass
+                    snap_lines.append("  ⚠️ 利润表数据获取失败")
                 # 财务指标（ROE/毛利率/费用率）
                 try:
                     r = call_fetch_fina_indicator(c)
                     if r and '❌' not in r and len(r) > 50:
                         snap_lines.append(r.strip().split('\n')[:20])
+                    else:
+                        snap_lines.append("  ⚠️ 财务指标数据获取失败")
                 except Exception:
-                    pass
+                    snap_lines.append("  ⚠️ 财务指标数据获取失败")
                 # 资产负债表（存货/应收账款/总资产等）
                 try:
                     r = call_fetch_balance_sheet_data(c)
                     if r and '❌' not in r and len(r) > 50:
                         snap_lines.append(r.strip().split('\n')[:12])
+                    else:
+                        snap_lines.append("  ⚠️ 资产负债表数据获取失败")
                 except Exception:
-                    pass
+                    snap_lines.append("  ⚠️ 资产负债表数据获取失败")
                 # 现金流量表（资本开支/CAPEX/自由现金流）
                 try:
                     r = call_fetch_cashflow_data(c)
                     if r and '❌' not in r and len(r) > 50:
                         snap_lines.append(r.strip().split('\n')[:12])
+                    else:
+                        snap_lines.append("  ⚠️ 现金流量表数据获取失败")
                 except Exception:
-                    pass
+                    snap_lines.append("  ⚠️ 现金流量表数据获取失败")
                 # 财务健康度（周转天数/FCF/杜邦等）
                 try:
                     r = call_fetch_financial_health_summary(c)
                     if r and '❌' not in r and len(r) > 50:
                         snap_lines.append(r.strip().split('\n')[:15])
+                    else:
+                        snap_lines.append("  ⚠️ 财务健康度数据获取失败")
                 except Exception:
-                    pass
+                    snap_lines.append("  ⚠️ 财务健康度数据获取失败")
                 # 筹码成本估算
                 try:
                     r = call_fetch_cost_basis(c)
                     if r and '❌' not in r and len(r) > 50:
                         snap_lines.append(r.strip().split('\n')[:10])
+                    else:
+                        snap_lines.append("  ⚠️ 筹码成本数据获取失败")
                 except Exception:
-                    pass
+                    snap_lines.append("  ⚠️ 筹码成本数据获取失败")
                 snapshot_blocks.append("\n".join(snap_lines))
             stock_snapshot_text = "\n\n".join(snapshot_blocks)
         except Exception as e:
             logger.warning(f"候选标的关键数据拉取失败（不影响分析）: {e}")
+
+        # 核心财务指标摘要（直接从DB cache提取，独立于API调用）
+        # 用户要求：每只候选股至少输出营收/归母净利/毛利率/净利率/3年复合增速
+        # 缺失任一项触发"数据缺口"警告而非沉默跳过
+        core_fin_block = ""
+        try:
+            fin_lines = ["========== 候选公司核心财务指标（程序从DB cache提取，非LLM编造） =========="]
+            fin_lines.append("说明：最新年报(2025A) + 最新季报(2026Q1) 双列展示，毛利率/净利率/ROE 均来自正式财报")
+            from storage.sqlite.stock_storage import get_db
+            _db = get_db()
+            for c in sorted(all_leader_codes)[:12]:
+                c_fin = []
+                # 从DB拉取利润表+财务指标+资产负债表
+                try:
+                    inc_df = _db.get_stock_income(c)
+                    fina_df = _db.get_stock_fina_indicator(c)
+                    bs_df = _db.get_stock_balance_sheet(c)
+                except Exception:
+                    inc_df, fina_df, bs_df = None, None, None
+                # ===== 提取最新年报数据（12月31日）=====
+                ann_rev, ann_np, ann_gm, ann_nm, ann_roe = None, None, None, None, None
+                ann_date = None
+                q_rev, q_np, q_rev_yoy, q_np_yoy = None, None, None, None
+                q_date = None
+                if inc_df is not None and not inc_df.empty:
+                    inc_df = inc_df.copy()
+                    inc_df['_rd'] = pd.to_datetime(inc_df['report_date'], errors='coerce')
+                    # 最新年报
+                    ann_rows = inc_df[inc_df['_rd'].dt.month == 12].sort_values('_rd', ascending=False)
+                    if not ann_rows.empty:
+                        ann = ann_rows.iloc[0]
+                        ann_date = ann['_rd']
+                        ann_rev = round(float(ann.get('total_revenue') or 0) / 1e8, 2) if ann.get('total_revenue') is not None else None
+                        ann_np = round(float(ann.get('net_profit') or 0) / 1e8, 2) if ann.get('net_profit') is not None else None
+                        ann_gm = round(float(ann.get('gross_margin') or 0), 1) if ann.get('gross_margin') is not None else None
+                    # 最新季报
+                    if len(inc_df) > 0:
+                        q = inc_df.iloc[0]
+                        q_date = q.get('_rd')
+                        if q_date and (q_date.month != 12 or (ann_date and q_date > ann_date)):
+                            q_rev = round(float(q.get('total_revenue') or 0) / 1e8, 2) if q.get('total_revenue') is not None else None
+                            q_np = round(float(q.get('net_profit') or 0) / 1e8, 2) if q.get('net_profit') is not None else None
+                            q_rev_yoy = round(float(q.get('revenue_growth') or 0), 1) if q.get('revenue_growth') is not None else None
+                            q_np_yoy = round(float(q.get('profit_growth') or 0), 1) if q.get('profit_growth') is not None else None
+                # 财务指标（净利率、ROE）
+                if fina_df is not None and not fina_df.empty:
+                    fina_df = fina_df.copy()
+                    fina_df['_rd'] = pd.to_datetime(fina_df['report_date'], errors='coerce')
+                    # 找最新年报期的fina指标
+                    if ann_date is not None:
+                        ann_fina = fina_df[fina_df['_rd'] == ann_date]
+                        if not ann_fina.empty:
+                            frow = ann_fina.iloc[0]
+                            # netprofit_margin 是小数（如0.12=12%），需要×100
+                            nm_raw = frow.get('netprofit_margin') or frow.get('net_margin')
+                            if nm_raw is not None:
+                                nm_val = float(nm_raw)
+                                ann_nm = round(nm_val * 100, 1) if nm_val <= 1.0 else round(nm_val, 1)
+                            roe_raw = frow.get('roe')
+                            if roe_raw is not None:
+                                roe_val = float(roe_raw)
+                                ann_roe = round(roe_val * 100, 1) if roe_val <= 1.0 else round(roe_val, 1)
+                # 3年营收复合增速（用近3年年报营收计算）
+                cagr = None
+                if inc_df is not None and not inc_df.empty:
+                    ann_rows2 = inc_df[inc_df['_rd'].dt.month == 12].sort_values('_rd', ascending=False).head(4)
+                    if len(ann_rows2) >= 4:
+                        revs = [float(r.get('total_revenue') or 0) for _, r in ann_rows2.iterrows()]
+                        if revs[-1] > 0:
+                            cagr = round(((revs[0] / revs[-1]) ** (1/3) - 1) * 100, 1)
+                # ===== 组装输出 =====
+                line1 = f"◆ {c}"
+                if ann_date is not None:
+                    line1 += f"  {ann_date.year}年报"
+                parts = []
+                if ann_rev is not None: parts.append(f"营收{ann_rev}亿")
+                if ann_np is not None: parts.append(f"归母净利{ann_np}亿")
+                if ann_gm is not None: parts.append(f"毛利率{ann_gm}%")
+                if ann_nm is not None: parts.append(f"净利率{ann_nm}%")
+                if ann_roe is not None: parts.append(f"ROE{ann_roe}%")
+                if cagr is not None: parts.append(f"营收3年CAGR{cagr}%")
+                if parts:
+                    line1 += ": " + " / ".join(parts)
+                c_fin.append(line1)
+                # 最新季报
+                if q_date is not None:
+                    q_parts = []
+                    if q_rev is not None: q_parts.append(f"营收{q_rev}亿")
+                    if q_rev_yoy is not None: q_parts.append(f"营收同比{'+' if q_rev_yoy >= 0 else ''}{q_rev_yoy}%")
+                    if q_np is not None: q_parts.append(f"归母净利{q_np}亿")
+                    if q_np_yoy is not None: q_parts.append(f"净利同比{'+' if q_np_yoy >= 0 else ''}{q_np_yoy}%")
+                    if q_parts:
+                        q_label = f"{q_date.year}Q{q_date.month}" if q_date.month in (3, 6, 9) else f"{q_date.year}{q_date.month}月"
+                        c_fin.append(f"    {q_label}: " + " / ".join(q_parts))
+                # 数据缺口检查
+                missing = []
+                if ann_rev is None: missing.append("年报营收")
+                if ann_np is None: missing.append("年报净利")
+                if ann_gm is None: missing.append("年报毛利率")
+                if ann_nm is None: missing.append("年报净利率")
+                if ann_roe is None: missing.append("年报ROE")
+                if cagr is None: missing.append("3年CAGR")
+                if missing:
+                    c_fin.append(f"    ⚠️ 数据缺口：{'/'.join(missing)}")
+                fin_lines.extend(c_fin)
+            core_fin_block = "\n".join(fin_lines)
+        except Exception as e:
+            logger.warning(f"核心财务指标提取失败（不影响分析）: {e}")
+            core_fin_block = "========== 核心财务指标提取失败，使用上述API调用数据 =========="
 
         # 资金筹码数据（程序拉取北向/两融/股东户数/机构持仓/解禁）
         capital_block = ""
@@ -2077,11 +2806,21 @@ ETF 名称：{etf_name}
         all_results = self._do_search(all_queries)
         search_text = self._search_text(all_results)
 
+        # 产业链历史复盘教训注入（误判模式 + 通用改进规则，避免重复同类错误）
+        try:
+            from agents.prompts_common import format_review_lesson
+            industry_review_lesson = format_review_lesson(industry_name=industry_name)
+        except Exception:
+            industry_review_lesson = ""
+        industry_review_block = (f"========== 历史复盘教训 ==========\n"
+                                 f"{industry_review_lesson}\n") if industry_review_lesson else ""
+
         messages = [
             SystemMessage(content=self._build_chain_system_prompt(stage, stage_reason)),
             HumanMessage(content=f"""用户问题：{question}
 目标行业：{industry_name}（行业阶段：{stage}{f'，{stage_reason}' if stage_reason else ''}）
 
+{industry_review_block}
 ========== 信源优先级规则 ==========
 🟢 T1 权威（公告/财报/认证官方社交）> 🔵 T2 结构化（财经媒体）> 🟡 T3 未验证社交 > ⚪ T4 网络搜索
 - 高等级信源与低等级信源数据不一致时，以高等级为准并标注差异
@@ -2093,6 +2832,8 @@ ETF 名称：{etf_name}
 
 {valuation_block if valuation_block else ''}
 
+{company_chain_map if company_chain_map else ''}
+
 ========== 产业链结构（上中下游+特精专新+细分领域+龙一龙二） ==========
 {chain_summary}
 
@@ -2101,6 +2842,8 @@ ETF 名称：{etf_name}
 
 ========== 候选公司关键财务数据快照（程序拉取，含利润表/财务指标/资产负债表/现金流/资本开支/健康度/股东户数/北向资金/筹码成本+同业估值对比） ==========
 {stock_snapshot_text[:10000] if stock_snapshot_text else '（未获取到个股级关键数据）'}
+
+{core_fin_block if core_fin_block else ''}
 
 {capital_block if capital_block else ''}
 
@@ -2117,7 +2860,9 @@ ETF 名称：{etf_name}
 
 **第2节 产业链全景图**
 - 产业链上中下游结构 + 环节完整度自检（覆盖了12个标准环节中的几个、缺了哪几个、已自动补充）
-- 全景筛选结果：各环节龙头公司及所属环节
+- 全景筛选结果：用**简单表格**列出各环节龙头公司及所属环节（表头：环节 | 公司名称 | 代码 | 核心业务 | 资金偏好）
+  ⚠️ **不要在此表格中包含评分列（业务分/基本面分/护城河分/边际变化分/综合分/PE分位/拥挤度等）**
+  — 评分排名表由程序在报告末尾自动生成（含加权计算+PE分位调整），你在JSON中给出分项评分即可
 
 **第3节 关键环节深度分析**
 - 环节利润迁移判断（当前瓶颈在哪、利润正在向哪个环节集中、未来2-4季度的迁移方向）
@@ -2128,6 +2873,8 @@ ETF 名称：{etf_name}
 对每只候选公司，按以下结构输出（每只2-3页级别）：
 - **公司概况与业务拆解**：主营构成数据（各业务收入/利润占比与毛利率）、出货量/产能、客户集中度
 - **基本面与护城河评分**：产业链地位、近期经营表现、不可替代性、溢价能力，含双向依据
+- **核心财务指标**：引用上方【核心财务指标】程序块中的营收/归母净利/毛利率/净利率/营收CAGR数据
+  （⚠️ 禁止写"该维度未覆盖"——以上数据由程序直接从DB提取，有缺口时已标注⚠️数据缺口，照实引用即可）
 - **财务预测表**：3年一致预期（营收/净利/增速/Forward PE/机构覆盖数），引用下方【一致预期数据】程序块
 - **估值锚**：当前PE+PE分位+双阈值预警（🔴/🟡/🟢）+ 估值敏感性矩阵（乐观/中性/悲观情景）
 - **回踩观察位（双重校验）**：技术位（程序计算）+ 基本面锚（PE历史中位对应价格）+ 校准取保守值
@@ -2360,8 +3107,12 @@ ETF 名称：{etf_name}
                                 "industry_stage": stage,
                                 # 门槛剔除组：留档后与进池组对照，用事后收益验证门槛有效性
                                 "gate_excluded_codes": [it["code"] for it in gate_excluded],
-                                "gate_watch_codes": [it["code"] for it in gate_watch]},
+                                "gate_watch_codes": [it["code"] for it in gate_watch],
+                                # 程序计算的排名数据（供下游 formatter 直接使用，不依赖 LLM 输出格式）
+                                "ranked_candidates": ranked},
             "chain_leaders": chain,
+            # 排名数据写入 state 顶层字段，供 technical_agent 做基本面×技术面交叉分析
+            "ranked_candidates": ranked,
             "stock_code": ",".join(verified_codes) if verified_codes else "",
             "intermediate_steps": [("researcher", {"mode": "chain", "industry": industry_name, "segments": sum(len(chain.get(k,[])) for k in ["upstream","midstream","downstream","niche_innovators"]), "candidates": len(verified_codes), "queries": len(all_queries)})],
         }

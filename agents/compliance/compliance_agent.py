@@ -6,6 +6,7 @@
 
 import json
 import re
+import traceback
 from typing import Dict, Any
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -32,8 +33,10 @@ def scan_exaggerated_phrases(text: str) -> list:
     return [(p, (text or "").count(p)) for p in EXAGGERATED_PHRASES if p in (text or "")]
 
 
-def run_quality_checks(text: str) -> list:
-    """机械质量检查：prompt 可客观判定的硬规则，靠 regex 保证"""
+def run_quality_checks(text: str, quality_metrics: dict = None) -> list:
+    """机械质量检查：prompt 可客观判定的硬规则，靠 regex 保证。
+    quality_metrics：可选，来自 analyst 的质量否决权指标，用于校验报告是否标注了质量折扣。
+    """
     issues = []
     text = text or ""
 
@@ -81,6 +84,20 @@ def run_quality_checks(text: str) -> list:
     for wrong, right in (("JDJ", "KDJ"), ("MCAD", "MACD")):
         if re.search(rf"(?<![A-Za-z]){wrong}(?![A-Za-z])", text):
             issues.append(f"技术指标名笔误：「{wrong}」应为「{right}」")
+
+    # 8) 质量否决权校验：quality_metrics 存在且 quality_discount < 1.0 时，
+    #    检查报告中是否标注了质量折扣；未提及则标记为质量问题
+    if quality_metrics and quality_metrics.get("quality_discount", 1.0) < 1.0:
+        triggers = quality_metrics.get("triggers", [])
+        if triggers:
+            has_quality_mention = any(kw in text for kw in (
+                "质量折扣", "质量否决", "盈利质量存疑", "利润质量",
+                "扣非", "商誉", "ROE", "净资产收益率"))
+            if not has_quality_mention:
+                issues.append(
+                    f"质量否决权已触发（折扣系数{quality_metrics['quality_discount']}）"
+                    f"但报告未标注质量折扣/风险——触发项："
+                    + "；".join(triggers))
 
     return issues
 
@@ -159,8 +176,12 @@ class ComplianceAgent:
                 logger.info("最终回答为空，跳过合规审查")
                 return {"intermediate_steps": [("compliance", {"skipped": "final_answer 为空"})]}
 
-            # 程序质量检查
-            quality_issues = run_quality_checks(final_answer)
+            # 取财务分析结果与质量指标，供质量否决权校验
+            analysis_result = state.get("analysis_result") or {}
+            quality_metrics = state.get("quality_metrics")
+
+            # 程序质量检查（传入质量指标以校验否决权是否被标注）
+            quality_issues = run_quality_checks(final_answer, quality_metrics=quality_metrics)
             if quality_issues:
                 logger.warning(f"[合规] 机械检查命中 {len(quality_issues)} 个问题: {quality_issues[:5]}")
 
@@ -173,21 +194,47 @@ class ComplianceAgent:
             if review_result.get("required_disclaimer") and DISCLAIMER not in revised:
                 revised += f"\n\n---\n*{DISCLAIMER}*"
 
+            # 数据源健康摘要：程序化附加（不经 LLM，不会被改写）
+            try:
+                from tools.source_health import format_health
+                health_summary = format_health()
+                if health_summary:
+                    revised += f"\n\n_{health_summary}_"
+            except Exception as e:
+                logger.debug(f"[合规] 数据源健康摘要附加失败: {e}")
+
             # 风险等级高时追加提示
             if review_result.get("risk_level") in ("high", "unknown"):
                 issues = review_result.get("issues") or []
                 if issues:
                     revised += f"\n\n*合规提示：{'；'.join(str(i) for i in issues[:3])}*"
 
-            logger.info(f"合规审查完成，通过: {review_result['passed']}，"
+            # 检测是否为合规重试（上游 compliance 已失败、responder 已重新生成）
+            is_compliance_retry = bool(state.get("compliance_failed", False))
+
+            passed = review_result.get("passed", True)
+            if not passed:
+                # 合规审查未通过：在报告开头追加醒目合规警告
+                issues_list = review_result.get("issues", []) or []
+                issues_str = "；".join(str(i) for i in issues_list[:3])
+                warning = (f"⚠️ 合规审查提示：本报告存在以下合规风险：{issues_str}。"
+                           f"请投资者注意相关风险。\n\n")
+                revised = warning + revised
+                logger.warning(f"合规审查未通过：{issues_list}")
+
+            logger.info(f"合规审查完成，通过: {passed}，"
                         f"风险等级: {review_result.get('risk_level')}，"
                         f"质量问题: {len(quality_issues)}")
 
             return {
                 "final_answer": revised,
                 "compliance_result": review_result,
+                "compliance_failed": not passed,
+                "compliance_issues": review_result.get("issues", []) if not passed else [],
+                # 标记是否已重试过，防止 route_after_compliance 无限循环回 responder
+                "_compliance_retried": is_compliance_retry,
                 "intermediate_steps": [("compliance", {
-                    "passed": review_result["passed"],
+                    "passed": passed,
                     "risk_level": review_result.get("risk_level"),
                     "issues": review_result.get("issues", []),
                     "quality_issues": quality_issues,

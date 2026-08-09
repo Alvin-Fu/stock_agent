@@ -223,54 +223,63 @@ def calc_congestion(
     industry_pe_median: float = None,
 ) -> Dict:
     """
-    判定PE拥挤区，并计算惩罚系数。
+    判定PE拥挤区（5级标签体系），并计算惩罚系数。
+
+    绝对PE优先于分位判定，按以下顺序匹配（命中即停）：
+      🔴极端泡沫   : PE > 200倍
+      🔴极度拥挤   : PE > 100倍 且 PE分位 >= 70%
+      🟠拥挤       : PE分位 >= 80% 或 PE > 100倍
+      🟡中性       : 其他
+      🟢机会区·低估: PE分位 <= 30% 且 PE <= 50倍
 
     Args:
         pe_percentile: PE历史分位（%），如 85.0 表示 85% 分位
         pe_current: 当前PE值
-        industry_pe_median: 行业中位数PE
+        industry_pe_median: 行业中位数PE（保留参数向后兼容，5级体系不再使用）
 
     Returns:
-        dict: {"zone": str, "penalty": float, "label_str": str,
-               "adjusted_score": 调整公式说明}
-            - zone: "拥挤区" / "中性" / "机会区"
-            - penalty: 惩罚系数（0.0 或 0.5）
-            - label_str: 中文标签及说明
+        dict: {"zone": str, "penalty": float, "label_str": str, "adjusted_formula": str}
+            - zone: 拥挤等级（极端泡沫/极度拥挤/拥挤/中性/机会区）
+            - penalty: 惩罚系数（0.0~0.8）
+            - label_str: 带emoji的中文标签及说明
             - adjusted_formula: 调整公式字符串
     """
     penalty = 0.0
     zone = ""
     label_str = ""
+    pe_str = f"{pe_current:.2f}" if pe_current is not None else "N/A"
 
-    if pe_percentile >= 80:
-        # 判断是否同时 PE > 行业中位数
-        if pe_current is not None and industry_pe_median is not None:
-            if pe_current > industry_pe_median:
-                zone = "拥挤区"
-                penalty = 0.5
-                label_str = (
-                    f"拥挤区 ⚠️ PE历史分位{pe_percentile:.1f}%≥80% "
-                    f"且当前PE({pe_current:.2f})>行业中位数({industry_pe_median:.2f})，"
-                    f"惩罚系数{penalty}"
-                )
-            else:
-                zone = "中性"
-                label_str = (
-                    f"PE历史分位{pe_percentile:.1f}%≥80% "
-                    f"但当前PE({pe_current:.2f})≤行业中位数({industry_pe_median:.2f})，暂判定为中性"
-                )
-        else:
-            zone = "中性"
-            label_str = (
-                f"PE历史分位{pe_percentile:.1f}%≥80%，"
-                f"但缺少PE对比数据，暂判定为中性"
-            )
-    elif pe_percentile >= 60:
-        zone = "中性"
-        label_str = f"PE历史分位{pe_percentile:.1f}%（60-80%），中性区域"
-    else:
+    # 5级体系，绝对PE优先于分位判定，命中即停
+    if pe_current is not None and pe_current > 200:
+        # 🔴极端泡沫：PE > 200倍
+        zone = "极端泡沫"
+        penalty = 0.8
+        label_str = (f"🔴极端泡沫：PE({pe_str})>200倍，估值严重脱离基本面，"
+                     f"惩罚系数{penalty}")
+    elif pe_current is not None and pe_current > 100 and pe_percentile >= 70:
+        # 🔴极度拥挤：PE > 100倍 且 PE分位 >= 70%
+        zone = "极度拥挤"
+        penalty = 0.6
+        label_str = (f"🔴极度拥挤：PE({pe_str})>100倍且历史分位{pe_percentile:.1f}%≥70%，"
+                     f"惩罚系数{penalty}")
+    elif pe_percentile >= 80 or (pe_current is not None and pe_current > 100):
+        # 🟠拥挤：PE分位 >= 80% 或 PE > 100倍
+        zone = "拥挤"
+        penalty = 0.5
+        label_str = (f"🟠拥挤：PE历史分位{pe_percentile:.1f}%≥80%或PE({pe_str})>100倍，"
+                     f"惩罚系数{penalty}")
+    elif pe_percentile <= 30 and (pe_current is None or pe_current <= 50):
+        # 🟢机会区·低估：PE分位 <= 30% 且 PE <= 50倍
         zone = "机会区"
-        label_str = f"PE历史分位{pe_percentile:.1f}%（<60%），机会区域"
+        penalty = 0.0
+        label_str = (f"🟢机会区·低估：PE历史分位{pe_percentile:.1f}%≤30%且PE({pe_str})≤50倍，"
+                     f"无惩罚")
+    else:
+        # 🟡中性：其他
+        zone = "中性"
+        penalty = 0.0
+        label_str = (f"🟡中性：PE历史分位{pe_percentile:.1f}%，PE({pe_str})，"
+                     f"无惩罚")
 
     adjusted_formula = (
         f"adjusted_score = raw_score × (1 - {penalty})"
