@@ -5,8 +5,8 @@ local.yaml
 *.env.local
 .env.*.local
 
-# 测试文件（可能包含敏感配置）
-test_*.py
+# 测试文件（根目录的一次性测试脚本，可能包含敏感配置）
+/test_*.py
 !test_env.py
 
 # Python
