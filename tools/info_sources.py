@@ -82,7 +82,7 @@ def _pick_sales_flash(announcements: List[Dict[str, str]]) -> Optional[Dict[str,
     import re
     global _SALES_TITLE
     if _SALES_TITLE is None:
-        _SALES_TITLE = (re.compile(r"(产销快报|产销数据|销量快报|产销情况|产销.*自愿性信息披露)"),
+        _SALES_TITLE = (re.compile(r"(产销快报|产销数据|销量快报|产销情况|产销月报|月度产销|产销简报|销售简报|月度销售|销量月报|产销.*自愿性信息披露)"),
                         re.compile(r"(取消|更正前|英文)"))
     want, block = _SALES_TITLE
     for it in announcements:  # 上游已按时间倒序
@@ -178,8 +178,86 @@ def fetch_sales_flash_text(code: str, days: int = 40) -> str:
                 logger.info(f"[信源] 产销快报正文已缓存: {code} {ann['title']}")
 
         report_source("产销快报", True)
+        # ==== 程序提取关键字段摘要（放正文前，LLM 直接引用不用读 2500 字符找）====
+        import re as _re
+        summary_parts = []
+        t_for_parse = text[:3000]
+
+        # 1) 连续正增月数（匹配"连续X月正增长/环比正增长"等）
+        for m in _re.finditer(r"连续\s*(\d+)\s*个月?\s*(?:销量|产量|正增长|同环比增长|保持正增)", t_for_parse):
+            summary_parts.append(f"连续正增月数:{m.group(1)}个月")
+            break
+
+        # 2) 出口量 / 海外销量 + 同比%
+        exp_pat = _re.compile(
+            r"(?:出口\s*量?|海外\s*销量?|境外\s*销量?)\s*(?:约|:|为)?\s*([\d.]+\s*[万辆台艘辆]*)"
+            r"(?:.*?同比\s*([+\-]?\s*[\d.]+%\s*(?:[上下]?降|[增减]长)?))?", _re.S)
+        for m in exp_pat.finditer(t_for_parse):
+            amt = m.group(1).strip()
+            yoy = (m.group(2) or "").strip()
+            summary_parts.append(f"出口量:{amt}" + (f" | 出口同比:{yoy}" if yoy else ""))
+            break
+
+        # 3) 累计同比（1-7月 / 1-X月，必须标"-10.54%（较H1收窄）"这种）
+        cum_pat = _re.compile(
+            r"(1[-\u4e00\-至]\d+\s*月|本年[前到]\d+\s*个月?)\s*(?:累计销量?|合计销量?)?"
+            r".*?(同比\s*[+\-]?\s*[\d.]+%\s*(?:[上下]?降|[增减]长)?(?:\s*收窄)?)", _re.S)
+        for m in cum_pat.finditer(t_for_parse):
+            period = m.group(1).strip()
+            yoy = m.group(2).strip()
+            note = ""
+            # 判断是否较前一期（H1）收窄：文中若有"较上半年""较H1""较 1-6 月"+"收窄"关键字
+            narrow_pat = _re.compile(r"(?:较\s*(?:上半年|H1|1[-\-]6\s*月))[^，。]*?收窄", _re.S)
+            if narrow_pat.search(t_for_parse):
+                note = "（较H1收窄）"
+            summary_parts.append(f"累计[{period}]同比:{yoy}{note}")
+            break
+
+        # 4) 高端占比（高端车型/高端系列/高端品牌 占比 15%）
+        hratio_pat = _re.compile(
+            r"(高端(?:车型|系列|品牌|产品)?|豪华|旗舰)\s*[的之]?\s*销量?\s*占比\s*(?:约|为|:)?\s*([\d.]+%)", _re.S)
+        for m in hratio_pat.finditer(t_for_parse):
+            summary_parts.append(f"高端占比:{m.group(2)}（{m.group(1)}口径）")
+            break
+        alt_hratio = _re.compile(
+            r"(?:腾势|仰望|方程豹)\s*(?:合计|系列)?\s*销量?\s*(?:占比|占\s*整体销量)\s*([\d.]+%)", _re.S)
+        for m in alt_hratio.finditer(t_for_parse):
+            summary_parts.append(f"高端品牌占比:{m.group(1)}（腾势/仰望/方程豹合计）")
+            break
+
+        # 5) 技术/产品关键词（二代刀片、第X代电池、CTB、iTAC、新平台等）
+        tech_keywords = ["二代刀片", "第二代刀片电池", "刀片电池 升级", "CTB",
+                         "iTAC", "新平台", "全新平台", "e平台", "e3.1", "e3.2",
+                         "鲲鹏动力", "DM 5.0", "DM-i 5.0", "第五代 DM"]
+        tech_hits = [kw for kw in tech_keywords if kw in t_for_parse]
+        # 扩展：找 XX切换 或 切换至 XX
+        switch_pat = _re.compile(r"(\S{2,8})(?:切换至|切换为|切换为第|全面切换)(\S{2,12})")
+        sw_hits = [f"{m.group(1)}→{m.group(2)}" for m in switch_pat.finditer(t_for_parse)][:3]
+        if tech_hits or sw_hits:
+            items = []
+            if tech_hits: items.append(f"关键词:{'/'.join(tech_hits)}")
+            if sw_hits: items.append(f"技术切换:{'、'.join(sw_hits)}")
+            summary_parts.append(" | ".join(items))
+
+        # 6) 当月产量/销量 + 同比
+        mo_pat = _re.compile(
+            r"(?:本月\s*销量|当月\s*销量|本期\s*销量)\s*(?:约|:|为)?\s*([\d.]+\s*[万辆台艘辆]*)"
+            r"(?:.*?同比\s*([+\-]?\s*[\d.]+%\s*(?:[上下]?降|[增减]长)?))?", _re.S)
+        for m in mo_pat.finditer(t_for_parse):
+            amt = m.group(1).strip()
+            yoy = (m.group(2) or "").strip()
+            s = f"当月销量:{amt}"
+            if yoy: s += f" | 同比:{yoy}"
+            summary_parts.insert(0, s)  # 当月销量放最前
+            break
+
+        summary_text = ""
+        if summary_parts:
+            summary_text = ("【摘要★（程序直接提取，必须嵌入「公司概况/核心逻辑」段首2句，不得只放运营数据段）】\n  "
+                            + "\n  ".join(summary_parts)
+                            + "\n--- 公告原文 ---")
         return (f"【产销快报公告原文（{ann['title']}，{ann.get('time', '')}，权威口径，"
-                f"销量数字以此为准）】\n{text[:2500]}")
+                f"销量数字以此为准）】\n{summary_text}{text[:2500]}")
     except Exception as e:
         logger.warning(f"[信源] 产销快报获取失败 {code}: {e}")
         report_source("产销快报", False, str(e))

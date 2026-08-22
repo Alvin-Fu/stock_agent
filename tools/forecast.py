@@ -400,6 +400,121 @@ def _pick_primary_source(sources):
     return sorted(sources, key=_sort_key, reverse=True)[0]
 
 
+def _fetch_analyst_detail(code: str, limit: int = 10) -> str:
+    """
+    拉取个股券商级评级明细 + 目标价（新浪源 stock_institute_recommend_detail）。
+
+    与东财 stock_profit_forecast_em（仅给机构一致预期 EPS/净利汇总）不同，
+    本接口返回**每家券商**的：评级日期/评级机构/分析师/最新评级/目标价/预测净利。
+
+    用途：为「基准情景强约束」和「等待信号要求」提供券商级原始锚
+    （东吴 26E 403.67 亿 / 东财 20 家目标价 125.93 这种明细）。
+
+    失败降级返回空串，不阻塞主流程。
+    """
+    import akshare as ak
+    import pandas as pd
+    try:
+        # 新版 akshare 参数为 symbol，旧版为 stock；先 symbol 后 stock 兼容
+        try:
+            df = ak.stock_institute_recommend_detail(symbol=code)
+        except TypeError:
+            df = ak.stock_institute_recommend_detail(stock=code)
+        if df is None or getattr(df, "empty", True):
+            return ""
+    except Exception as e:
+        logger.debug(f"[券商级明细] {code} 新浪源拉取失败: {e}")
+        return ""
+
+    # 列名漂移兜底：把所有列名转字符串便于按子串匹配
+    cols = {str(c): c for c in df.columns}
+
+    def _find_col(*keywords):
+        for c_str, c in cols.items():
+            if all(k in c_str for k in keywords):
+                return c
+        return None
+
+    date_col = _find_col("评级日期") or _find_col("日期")
+    org_col = _find_col("评级机构") or _find_col("机构") or _find_col("研究机构")
+    rating_col = _find_col("最新评级") or _find_col("评级")
+    target_col = _find_col("目标价")
+    # 预测净利可能没有；新浪源通常只有评级+目标价，预测净利需另查
+    profit_col = _find_col("预测净利") or _find_col("净利")
+
+    # 按评级日期降序，取最近 limit 条
+    if date_col is not None:
+        try:
+            df = df.copy()
+            df[date_col] = df[date_col].astype(str)
+            df = df.sort_values(date_col, ascending=False)
+        except Exception:
+            pass
+
+    lines = ["【券商级评级明细（新浪源，单家券商维度，含目标价）】"]
+    has_target = 0
+    n_rows = 0
+    for _, row in df.head(limit).iterrows():
+        parts = []
+        if date_col is not None:
+            d = str(row.get(date_col, ""))[:10]
+            if d and d != "nan":
+                parts.append(d)
+        if org_col is not None:
+            org = str(row.get(org_col, "")).strip()
+            if org and org != "nan":
+                parts.append(org)
+        if rating_col is not None:
+            r = str(row.get(rating_col, "")).strip()
+            if r and r != "nan":
+                parts.append(r)
+        if target_col is not None:
+            try:
+                tv = row.get(target_col)
+                if tv is not None and not pd.isna(tv) and float(tv) > 0:
+                    parts.append(f"目标价{float(tv):.2f}元")
+                    has_target += 1
+            except (TypeError, ValueError):
+                pass
+        if profit_col is not None:
+            pv = row.get(profit_col)
+            if pv is not None and str(pv) != "nan":
+                parts.append(f"预测净利{pv}")
+        if len(parts) >= 2:  # 至少有日期+机构或机构+评级才展示
+            lines.append("  " + " | ".join(parts))
+            n_rows += 1
+
+    if n_rows == 0:
+        return ""
+
+    # 汇总行：评级分布 + 目标价均值（如果有多家给目标价）
+    summary_parts = [f"近{limit}条评级记录"]
+    if rating_col is not None:
+        try:
+            rating_counts = df.head(limit)[rating_col].astype(str).value_counts()
+            if not rating_counts.empty:
+                summary_parts.append("评级分布: " + "/".join(
+                    f"{idx}{v}家" for idx, v in rating_counts.items() if idx != "nan"
+                ))
+        except Exception:
+            pass
+    if target_col is not None and has_target >= 2:
+        try:
+            targets = df.head(limit)[target_col].apply(
+                lambda x: float(x) if pd.notna(x) and float(x) > 0 else None
+            ).dropna()
+            if len(targets) > 0:
+                summary_parts.append(
+                    f"目标价均值{targets.mean():.2f}元（{len(targets)}家给出，"
+                    f"区间{targets.min():.2f}-{targets.max():.2f}）"
+                )
+        except Exception:
+            pass
+
+    lines.insert(1, "  " + " | ".join(summary_parts))
+    return "\n".join(lines)
+
+
 def fetch_profit_forecast_text(code: str, name: str = "",
                                pe_ttm: Optional[float] = None) -> str:
     """机构盈利预测文本块（多源并取 + 程序算好的 forward PE + forward PEG）；
@@ -435,6 +550,15 @@ def fetch_profit_forecast_text(code: str, name: str = "",
                 all_inst_blocks.append("\n".join(inst_lines))
 
         inst_block = "\n\n".join(all_inst_blocks) if all_inst_blocks else ""
+
+        # 券商级明细（新浪源，含目标价+评级分布）——为基准情景强约束提供券商级原始锚
+        analyst_block = ""
+        try:
+            analyst_block = _fetch_analyst_detail(code, limit=10)
+            if analyst_block:
+                analyst_block = "\n\n" + analyst_block
+        except Exception as e:
+            logger.debug(f"[券商级明细] {code} 拼接失败: {e}")
 
         # 原始表：仅主源
         raw_text = primary_df.head(6).to_string(index=False)[:900]
@@ -480,6 +604,7 @@ def fetch_profit_forecast_text(code: str, name: str = "",
 
         result_text = (header
                 + (inst_block + "\n" if inst_block else "")
+                + analyst_block
                 + f"【原始预测表（{primary_name}主源，仅供对比参考，禁止从中取数计算）】\n"
                 + raw_text
                 + fpe_block + fpeg_block

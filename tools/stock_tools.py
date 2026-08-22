@@ -2204,6 +2204,10 @@ class StockTools:
         """
         df = df.copy()
 
+        # 防御：tushare 偶发返回列名漂移或空 df（实测 KeyError: Index(['end_date'])）
+        if df.empty or 'end_date' not in df.columns:
+            logger.warning(f"[利润表标准化] {stock_code} 返回 df 缺 end_date 列或为空，列名={list(df.columns)}")
+            return df.iloc[0:0]  # 返回空 df 保持接口契约
         if 'update_flag' in df.columns:
             df = df.sort_values('update_flag', ascending=False)
         df = df.drop_duplicates(subset=['end_date'], keep='first')
@@ -4241,6 +4245,33 @@ def _format_moneyflow(df: pd.DataFrame, stock_code: str) -> str:
             return f"{v:.2f}万"  # 万元
 
     lines = [f"【个股资金流向（来源：Tushare）】"]
+
+    # --- SUMMARY（直接引用，禁止 LLM 心算累计值） ---
+    latest_date = None
+    latest_main = None
+    sum_5d = sum_10d = sum_20d = None
+    try:
+        if not df.empty:
+            latest_date = str(df.iloc[0].get('trade_date', ''))[:10]
+            latest_main = df.iloc[0].get('net_mf_amount', 0) or 0
+            for nd, attr in [(5, 'sum_5d'), (10, 'sum_10d'), (20, 'sum_20d')]:
+                sub = df.head(min(len(df), nd))
+                if len(sub) >= 2:
+                    locals()[attr] = sub['net_mf_amount'].sum()
+    except Exception:
+        pass
+    summary_items = []
+    if latest_date:
+        summary_items.append(f"最新交易日:{latest_date}")
+    if latest_main is not None:
+        summary_items.append(f"当日主力净流入:{_y(latest_main)}")
+    if sum_5d is not None:
+        summary_items.append(f"近5日主力累计:{_y(sum_5d)}")
+    if sum_20d is not None:
+        sign = "转正" if sum_20d > 0 else ("转负" if sum_20d < 0 else "持平")
+        summary_items.append(f"近20日主力累计:{_y(sum_20d)}（{sign}）")
+    if summary_items:
+        lines.append("【SUMMARY（直接引用写进资金段，禁止重算）】 " + " | ".join(summary_items))
 
     # --- 逐日明细（最近10个交易日） ---
     lines.append("【逐日明细】")
@@ -7425,3 +7456,206 @@ stock_analyst_tools = [
         """
     ),
 ]
+
+
+def call_extract_financial_snapshot(stock_code: str) -> str:
+    """
+    从三大报表原始 DataFrame 直接提取结构化「财务关键指标快照」。
+
+    作用：替代让 LLM 从 3000 字符格式化文本里自己找字段+计算。
+    输出 ~500 字符、字段名+精确值一目了然，LLM 可直接引用不用再算，
+    避免净利率 2.67%→2.72% 这类心算误差、净现比/期间费用率漏字段。
+
+    包含：
+    - 毛利率（本期、同比pct、环比pct）
+    - 净利率（本期精确值、同比pct）
+    - 期间费用率（合计=销+管+研+财，及同比pct差）
+      + 财务费用（绝对值、标注汇兑转亏等注释位）
+      + 研发费用（绝对值+同比）
+    - OCF（经营现金流）、FCF（ocf-capex，程序算，不准 LLM 心算）
+    - 净现比 = OCF / 归母净利
+
+    同比 = 本期 vs 去年同季配对（累计口径同季可比）。
+    环比 = 本期累计 - 上一季度累计 = 单季度毛利率（累计口径拆单季）。
+    """
+    if stock_tool_instance is None:
+        return ""
+    try:
+        # 取 DF：先 API，失败走 DB 缓存（与 call_fetch_income_data 口径一致）
+        income_df = stock_tool_instance.fetch_and_save_stock_income(stock_code=stock_code)
+        if income_df is None or income_df.empty:
+            income_df = stock_tool_instance.db.get_stock_income(stock_code) if hasattr(stock_tool_instance, 'db') else None
+        cashflow_df = stock_tool_instance.fetch_and_save_stock_cashflow(stock_code=stock_code)
+        # balancesheet 暂不需要（当前快照字段用不到）
+    except Exception as e:
+        logger.debug(f"[snapshot] 三表DF取数失败: {e}")
+        return ""
+
+    def _n(v):
+        if v is None or pd.isna(v):
+            return None
+        return float(v)
+
+    lines = []
+
+    # ================== 利润表快照 ==================
+    if income_df is not None and not income_df.empty:
+        inc = income_df.copy()
+        inc['report_date'] = pd.to_datetime(inc['report_date'])
+        inc = inc.sort_values('report_date', ascending=False).reset_index(drop=True)
+        period_map = {}
+        for _, r in inc.iterrows():
+            rd = r['report_date']
+            period_map[(rd.year, rd.quarter)] = r
+
+        latest = inc.iloc[0]
+        cur_rd = latest['report_date']
+        cur_q = cur_rd.quarter
+        # 去年同季（同比基准）
+        prev_y = period_map.get((cur_rd.year - 1, cur_q))
+        # 上一季度（环比基准，用于拆单季）——注意：累计口径要拆单季
+        prev_q_row = period_map.get((cur_rd.year, cur_q - 1)) if cur_q > 1 else None
+        # 上一年的上一季度（去年同季的上一季，用于算去年同期累计拆单季）
+        prev_y_prev_q = period_map.get((cur_rd.year - 1, cur_q - 1)) if cur_q > 1 else None
+
+        cur_rev = _n(latest.get('total_revenue'))
+        cur_profit = _n(latest.get('n_income_attr_p')) or _n(latest.get('net_profit'))
+        cur_gm = _n(latest.get('gross_margin'))
+        prev_y_gm = _n(prev_y.get('gross_margin')) if prev_y is not None else None
+        prev_y_rev = _n(prev_y.get('total_revenue')) if prev_y is not None else None
+        prev_y_profit = (_n(prev_y.get('n_income_attr_p')) or _n(prev_y.get('net_profit'))) if prev_y is not None else None
+
+        # 净利率（精确到 2 位小数，禁止 LLM 心算）
+        cur_nm = (cur_profit / cur_rev * 100) if (cur_profit is not None and cur_rev and cur_rev > 0) else None
+        prev_y_nm = (prev_y_profit / prev_y_rev * 100) if (prev_y_profit is not None and prev_y_rev and prev_y_rev > 0) else None
+
+        # 毛利率同比/环比（pct 点差）
+        gm_yoy_pct = (cur_gm - prev_y_gm) if (cur_gm is not None and prev_y_gm is not None) else None
+        # 毛利率环比 = 本季单季毛利率 - 上季单季毛利率
+        # 累计口径拆单季：
+        #   单季营收 = 本期累计 - 上一季度累计（Q2拆=半年-Q1，Q3拆=前三季-半年）
+        #   单季毛利 = 本期累计营收×累计毛利率 - 上一季度累计营收×上一季度累计毛利率
+        #   单季毛利率 = 单季毛利 / 单季营收
+        gm_qoq_pct = None
+        if (cur_gm is not None and cur_rev and prev_q_row is not None):
+            pq_rev = _n(prev_q_row.get('total_revenue'))
+            pq_gm = _n(prev_q_row.get('gross_margin'))
+            if pq_rev and pq_gm is not None and pq_rev < cur_rev:
+                cur_single_rev = cur_rev - pq_rev
+                cur_single_gp = cur_rev * cur_gm / 100 - pq_rev * pq_gm / 100
+                cur_single_gm = cur_single_gp / cur_single_rev * 100 if cur_single_rev > 0 else None
+                # 上一季度的单季毛利率 = （pq_rev*pq_gm/100 - pypq_rev*pypq_gm/100）/ (pq_rev - pypq_rev)
+                if prev_y_prev_q is not None and cur_single_gm is not None:
+                    pypq_rev = _n(prev_y_prev_q.get('total_revenue'))
+                    pypq_gm = _n(prev_y_prev_q.get('gross_margin'))
+                    if pypq_rev and pypq_gm is not None and pq_rev > pypq_rev:
+                        prev_single_rev = pq_rev - pypq_rev
+                        prev_single_gp = pq_rev * pq_gm / 100 - pypq_rev * pypq_gm / 100
+                        prev_single_gm = prev_single_gp / prev_single_rev * 100 if prev_single_rev > 0 else None
+                        if prev_single_gm is not None:
+                            gm_qoq_pct = cur_single_gm - prev_single_gm
+                else:
+                    # Q1无拆单季数据，环比退化为同比（标注"Q1不适用环比"）
+                    pass
+
+        # 费用率（销+管+研+财 = 期间费用率）
+        exp_items = [('sell_exp', '销售'), ('admin_exp', '管理'), ('rd_exp', '研发'), ('fin_exp', '财务')]
+        cur_period_ratio = 0.0
+        prev_y_period_ratio = 0.0
+        exp_details = []
+        has_any_exp = False
+        for col, label in exp_items:
+            cur_exp = _n(latest.get(col))
+            prev_exp = _n(prev_y.get(col)) if prev_y is not None else None
+            cur_r = (cur_exp / cur_rev * 100) if (cur_exp is not None and cur_rev and cur_rev > 0) else None
+            prev_r = (prev_exp / prev_y_rev * 100) if (prev_exp is not None and prev_y_rev and prev_y_rev > 0) else None
+            if cur_r is not None:
+                cur_period_ratio += cur_r
+                has_any_exp = True
+            if prev_r is not None:
+                prev_y_period_ratio += prev_r
+            # 财务费用/研发费用单独展示绝对值
+            if col == 'fin_exp' and cur_exp is not None:
+                sign = '汇兑转亏' if (cur_exp > 0 and (prev_exp is None or prev_exp <= 0)) else (
+                    '汇兑收益' if cur_exp < 0 else '')
+                exp_details.append(f"财务费用: {cur_exp/1e8:.3f}亿（{sign}）" if sign else
+                                   f"财务费用: {cur_exp/1e8:.3f}亿")
+            if col == 'rd_exp':
+                yoy = ""
+                if cur_exp is not None and prev_exp is not None and prev_exp != 0:
+                    y = (cur_exp - prev_exp) / abs(prev_exp) * 100
+                    yoy = f"（同比{'+' if y >= 0 else ''}{y:.2f}%）"
+                if cur_exp is not None:
+                    exp_details.append(f"研发费用: {cur_exp/1e8:.2f}亿{yoy}")
+
+        # 营收同比（给净利归因用）
+        rev_yoy = None
+        if cur_rev and prev_y_rev and prev_y_rev > 0:
+            rev_yoy = (cur_rev - prev_y_rev) / prev_y_rev * 100
+        profit_yoy = None
+        if cur_profit is not None and prev_y_profit is not None and prev_y_profit != 0:
+            profit_yoy = (cur_profit - prev_y_profit) / abs(prev_y_profit) * 100
+
+        lines.append(f"报告期: {cur_rd.strftime('%Y-%m-%d')}（累计口径，Q{cur_q}）")
+        lines.append(f"营收同比: {'+' if rev_yoy and rev_yoy >= 0 else ''}{rev_yoy:.2f}%" if rev_yoy is not None else "营收同比: N/A")
+        lines.append(f"净利同比: {'+' if profit_yoy and profit_yoy >= 0 else ''}{profit_yoy:.2f}%" if profit_yoy is not None else "净利同比: N/A")
+        if cur_gm is not None:
+            gm_line = f"毛利率: {cur_gm:.2f}%"
+            if gm_yoy_pct is not None:
+                gm_line += f" | 同比{'+' if gm_yoy_pct >= 0 else ''}{gm_yoy_pct:.2f}pct"
+            if gm_qoq_pct is not None:
+                gm_line += f" | 环比(拆单季){'+' if gm_qoq_pct >= 0 else ''}{gm_qoq_pct:.2f}pct"
+            elif cur_q == 1:
+                gm_line += " | 环比:N/A（Q1无可比上季）"
+            lines.append(gm_line)
+        if cur_nm is not None:
+            nm_line = f"净利率: {cur_nm:.2f}%"
+            if prev_y_nm is not None:
+                nm_line += f" | 同比{'+' if (cur_nm - prev_y_nm) >= 0 else ''}{cur_nm - prev_y_nm:.2f}pct"
+            lines.append(nm_line)
+        if has_any_exp:
+            period_diff = None
+            if cur_period_ratio and prev_y_period_ratio:
+                period_diff = cur_period_ratio - prev_y_period_ratio
+            p_line = f"期间费用率(销+管+研+财): {cur_period_ratio:.2f}%"
+            if period_diff is not None:
+                p_line += f" | 同比{'+' if period_diff >= 0 else ''}{period_diff:.2f}pct"
+            lines.append(p_line)
+        for d in exp_details:
+            lines.append("  " + d)
+
+    # ================== 现金流快照 ==================
+    if cashflow_df is not None and not cashflow_df.empty:
+        cf = cashflow_df.copy()
+        cf['report_date'] = pd.to_datetime(cf['report_date'])
+        cf = cf.sort_values('report_date', ascending=False).reset_index(drop=True)
+        cf_map = {}
+        for _, r in cf.iterrows():
+            rd = r['report_date']
+            cf_map[(rd.year, rd.quarter)] = r
+        c_latest = cf.iloc[0]
+        c_rd = c_latest['report_date']
+        c_prev_y = cf_map.get((c_rd.year - 1, c_rd.quarter))
+        cur_ocf = _n(c_latest.get('operating_cashflow'))
+        prev_ocf = _n(c_prev_y.get('operating_cashflow')) if c_prev_y is not None else None
+        cur_capex = _n(c_latest.get('capex'))
+        cur_rev_snap = _n(c_latest.get('revenue')) or cur_rev
+
+        if cur_ocf is not None:
+            ocf_line = f"OCF(经营现金流): {cur_ocf/1e8:.2f}亿"
+            if prev_ocf is not None and prev_ocf != 0:
+                g = (cur_ocf - prev_ocf) / abs(prev_ocf) * 100
+                ocf_line += f"（同比{'+' if g >= 0 else ''}{g:.2f}%）"
+            lines.append(ocf_line)
+            # 净现比 = OCF / 归母净利（取利润表 cur_profit）
+            if cur_profit is not None and cur_profit != 0:
+                ncr = cur_ocf / cur_profit * 100
+                lines.append(f"净现比(OCF/归母净利): {ncr:.2f}%")
+        if cur_ocf is not None and cur_capex is not None:
+            fcf = cur_ocf - cur_capex
+            lines.append(f"FCF(程序计算=OCF{cur_ocf/1e8:.2f}亿 - 资本开支{cur_capex/1e8:.2f}亿): {fcf/1e8:.2f}亿 【直接引用，禁止心算】")
+
+    if not lines:
+        return ""
+    header = "========== 财务关键指标快照（程序直接提取+计算，直接引用禁止心算） =========="
+    return header + "\n" + "\n".join(f"  - {l}" for l in lines)

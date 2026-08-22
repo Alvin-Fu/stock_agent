@@ -601,6 +601,14 @@ class ResearcherAgent:
             # 增长与预期（2条）
             f"{tag} 第二增长曲线 新业务 进展 放量 {recent_period}",
             f"{tag} 利好 利空 机构评级 目标价 {one_month.strftime('%Y-%m-%d')} {today.strftime('%Y-%m-%d')}",
+
+            # 知乎补源（T3，但机构盈利预测拆解/出海毛利率/政策解读比泛搜索更有深度）
+            f"site:zhihu.com {tag} 出海 毛利率 单车利润 本土 vs 出口 对比",
+            f"site:zhihu.com {tag} 2026 盈利预测 券商 研报 东吴 花旗 中信 目标价",
+
+            # 工信部/政策专项搜索（梯次利用、电池/汽车监管）
+            f"工信部 2026 公告 梯次利用 电池 新能源汽车 白名单 移出 第20号",
+            f"{tag} 相关 工信部 监管政策 行业规范 最新通知 {three_month_range}",
         ]
 
     def _build_stock_system_prompt(self) -> str:
@@ -611,6 +619,15 @@ class ResearcherAgent:
 
 【信源优先级】🟢 T1 权威（公告/财报/认证官方社交）> 🔵 T2 结构化（财经媒体）> 🟡 T3 未验证社交 > ⚪ T4 网络搜索
 - 数据不一致时以高等级为准并标注差异；以下数据块前的等级标签代表其信誉级别
+
+【禁止心算规则（最重要，放在最前）】
+- 所有财务指标（净利率/毛利率同比pct/环比pct/期间费用率/净现比/FCF/OCF同比等）
+  **必须直接引用【财务关键指标快照】区块中的原始数字**，严禁自己从三表文本块里
+  找字段做除法/减法/环比再计算——实测 LLM 心算会把净利率 2.67% 写成 2.72%、
+  FCF 算错一倍、期间费用率漏掉财务费用。快照里有就直接抄；快照里没有才引用
+  三表文本块格式化后的精确行（必须标注"引用三表原始行"）。
+- FCF（自由现金流）必须直接引用【财务关键指标快照】中的程序计算值，
+  格式如 "FCF -504.97亿（程序计算=OCF - 资本开支）"，严禁自己 OCF 减 capex。
 
 请基于下方搜索结果，对该公司的以下维度进行客观分析并给出核心结论：
 
@@ -731,6 +748,33 @@ class ResearcherAgent:
 - 判断现金流趋势是季节性波动还是长期恶化
 - 数据不足时标注"数据不足以判断现金流趋势"
 
+【净利降幅归因要求】
+- 净利润同比降幅大于营收降幅时，必须用三因子拆解归因，禁止笼统写"毛利率下滑导致"：
+  ① 毛利率变动（同比±Xpct 对净利的影响量级，引用利润表毛利率原数）
+  ② 期间费用率变动（同比±Xpct，含销售/管理/研发/财务费用率分项；财务费用须单独说明汇兑影响）
+  ③ 非经常性损益（汇兑损益/资产减值/投资收益等一次性项，须标注"一次性"）
+- 必须基于三大报表实际费用率/财务费用数据重算并给结论
+  （模板：「净利降幅大于营收主因汇兑转亏 + 费用率 +2.47pct，
+    非单纯毛利率 compression；毛利率环比 +1.37pct 说明
+    产品结构/出海已托底」——若毛利率环比改善则必须补此句对冲负面归因）
+- 三因子须分别量化贡献占比，数据不足时标注"缺少费用率分项数据"，禁止笼统归因
+- 交叉验证（最末一句）必须落到【财务关键指标快照】给出的精确费用率和财务费用，
+  禁止泛泛而谈
+
+【护城河分析要求】
+- 如果搜索/研报提到出海毛利率溢价（如「海外汽车毛利率较本土高 6–8pct」
+  「招银估算出海毛利率溢价 5-7pct」），必须嵌入护城河段并注明来源券商/估算值。
+  模板：「出海毛利率溢价（海外 vs 本土：+6–8pct，招银估算）
+  → 第二曲线利润增量显著高于本土同等销量，护城河具结构性」
+- 数据缺失则写"未检索到出海毛利率溢价公开数据，需后续研报补充"，不得编造具体溢价幅度
+
+【等待信号要求】（在「重估触发条件」之前单独成段）
+- 必须列出 2-4 个最关键的验证点等待信号，必须来自机构研报的明确验证点
+  （如东吴/花旗/招银给出的 Q2 净利阈值、毛利率阈值等），禁止自己臆测。
+  模板：「等待信号：① Q2 净利 ≥90 亿（东吴/花旗验证点）
+   ② 毛利率回 20%+（东吴验证点）③ XX」
+- 若无机构研报明确验证点，则写「当前缺少机构明确验证点，待后续研报更新」
+
 【机构预期修正要求】
 - 如果搜索信息显示当前季度/月度经营数据明显弱于去年同期或上季度（如销量同比下滑、毛利率走低），
   必须在报告中给出基于经营数据的**保守修正后全年净利润估算**（用当前月销量年化×单车净利等简易算法），
@@ -741,8 +785,23 @@ class ResearcherAgent:
 - PE分位必须同时给出3年/5年/10年三个窗口的分位数，禁止只写单一窗口
 - 如果材料中只提供了一个窗口的分位数，标注"仅X年数据可用"
 - 必须交叉验证PE/PB/PS三个指标：PE看贵贱、PB看资产底、PS看营收估值
-- PE和PB分位背离时必须解读矛盾根源（如"盈利下滑被动抬高PE、但资产端已处历史底部"）
+- PE和PB分位背离时必须解读矛盾根源，必须用以下模板表述（禁止只写"PE偏高"而不拆因）：
+  「PE 3年X% 悬顶（盈利同比-Y%被动抬高，非估值主动拉升）、PB 3年Z% 托底（资产端已处历史底部）；
+   PS 3年W% 中性——结论不是PE低，而是3年PE偏贵（被盈利下滑被动抬高）」
+  必须区分"盈利被动抬高PE"与"市场主动给估值"，两者方向相反结论相反
 - PS(TTM)分位作为补充维度，与PE/PB形成三维估值画像
+
+【基准情景强约束】
+- 情景推演的「基准情景」净利润同比区间必须**以当期已披露财报为锚**（如中报已披露
+  则绑定中报数据），不得使用"单季最差值同比"作为基准情景。必须同时引用：
+  ① 当期财报实际净利同比（来自【财务关键指标快照】）
+  ② 机构净利一致预期区间（26E 预测净利区间/机构家数/目标价，来自
+     【候选公司一致预期数据】或【机构盈利预测（akshare 多源兜底）】）
+- 格式约束：
+  「基准情景：同比 -30%~-10%（中报验证；机构锚：东吴26E 403.67亿/东方财富 404亿/
+   54家区间 412–443亿；目标价 XX元）」
+- 严禁基准情景写"-55%""-50%"这种偏离已验证财报太远的极端值——那是悲观情景，
+  不是基准；基准必须落在「财报数据±机构预期」的重叠区间内。
 
 【海外口径说明要求】
 - 海外收入/出口占比数据必须标注统计口径：
@@ -782,6 +841,17 @@ class ResearcherAgent:
   ② **基本面反转**：销量/利润/毛利率出现可验证的拐点信号（如"单月销量同比转正且连续2个月"），
      才构成基本面建仓信号
 - 两组判断在结论段落中分开表述，不得混为一谈
+
+【技术面综合判断要求】
+- 必须输出一张「技术面打分表」，综合程序提供的技术指标数据块（神奇九转等）+ 资金筹码数据 +
+  搜索结果中的技术信号，按以下维度填表（表格格式）：
+  | 维度 | 信号 | 判断 |
+  - 趋势：日线多空（基于九转信号/均线方向，如"跌破XX后日线转空"）
+  - 支撑压力：关键价位（前低/布林下轨/整数关/聚类位，如"布林下轨约87与88.55聚类"）
+  - 资金：主力方向（引用资金筹码数据块的主力净流入/北向趋势）
+  - 形态：突破/破位/震荡
+- 技术面仅作短期参考，必须与基本面判断分开表述，不得用技术反弹作为建仓依据
+- 技术指标数据不足时标注"技术指标数据不足"，禁止从搜索结果编造具体价位居中数值
 
 【输出要求】每个维度给出明确结论；业务数据尽可能用数字；搜索结果中没有的信息标注「信息不足」，
 禁止用自身知识补数字；最后 3 句以内核心总结。
@@ -1572,6 +1642,43 @@ class ResearcherAgent:
                     r_med = r_vals.median() if not r_vals.empty else None
                     e_vals = pd.to_numeric(yr_df[eps_col], errors='coerce').dropna() if eps_col in yr_df.columns else pd.Series(dtype=float)
                     e_med = e_vals.median() if not e_vals.empty else None
+                    # 提取机构级净利预测明细（基准情景强约束需要「东吴 26E 403.67亿」这种锚）
+                    org_col = 'forecast_org' if 'forecast_org' in yr_df.columns else ('org_name' if 'org_name' in yr_df.columns else None)
+                    org_details = []
+                    if org_col is not None:
+                        seen_orgs = set()
+                        # 按报告日期降序，取最新的8家不同机构
+                        tmp = yr_df.copy()
+                        if 'report_date' in tmp.columns:
+                            tmp = tmp.sort_values('report_date', ascending=False)
+                        for _, r in tmp.iterrows():
+                            org = str(r.get(org_col, '') or '').strip()
+                            if not org or org in seen_orgs or org.lower() == 'nan':
+                                continue
+                            try:
+                                pv = float(r.get(profit_col) or 0)
+                                if pv <= 0:
+                                    continue
+                            except (TypeError, ValueError):
+                                continue
+                            seen_orgs.add(org)
+                            eps_val = None
+                            if eps_col in tmp.columns:
+                                try:
+                                    ev = float(r.get(eps_col) or 0)
+                                    if ev > 0:
+                                        eps_val = round(ev, 4)
+                                except (TypeError, ValueError):
+                                    pass
+                            date_val = str(r.get('report_date') or r.get('ann_date') or '')[:8]
+                            org_details.append({
+                                'org': org,
+                                'profit_yi': round(pv / 1e8, 2),
+                                'eps': eps_val,
+                                'date': date_val,
+                            })
+                            if len(org_details) >= 8:
+                                break
                     if p_med is not None and p_med > 0:
                         year_data[yr] = {
                             'profit': round(p_med / 1e8, 2),
@@ -1581,6 +1688,7 @@ class ResearcherAgent:
                             'eps': round(e_med, 4) if e_med is not None else None,
                             'n_inst': len(yr_df),
                             'is_actual': False,
+                            '_org_details': org_details if org_details else None,
                         }
 
     def _format_forecast_table(self, forecasts: Dict[str, Dict[int, dict]],
@@ -1694,6 +1802,49 @@ class ResearcherAgent:
                     rating_str = f" [{tp['rating']}]" if tp['rating'] else ""
                     date_str = f" ({tp['date'][:4]}-{tp['date'][4:6]}-{tp['date'][6:]})" if tp['date'] else ""
                     lines.append(f"    - {tp['org']}: {tp['target']}元{rating_str}{date_str}")
+
+            # --- 券商级净利预测明细（给基准情景强约束提供「东吴 26E 403.67亿」锚）---
+            forecast_years = [y for y in years if not yd[y].get('is_actual')]
+            has_any_detail = False
+            for y in forecast_years:
+                od = yd[y].get('_org_details') or []
+                if od:
+                    has_any_detail = True
+                    break
+            if has_any_detail:
+                lines.append("\n  🎯 券商级净利预测明细（Tushare per-broker，直接引用锚定基准情景）：")
+                for y in forecast_years:
+                    od = yd[y].get('_org_details')
+                    if not od:
+                        continue
+                    med = yd[y]['profit']
+                    lines.append(f"    {y}E 中位数 {med:.2f}亿（{yd[y]['n_inst']}家覆盖）：")
+                    # 利润区间（min/max of org details）
+                    profits_yi = [d['profit_yi'] for d in od]
+                    if len(profits_yi) >= 2:
+                        lines.append(f"      区间 {min(profits_yi):.1f}-{max(profits_yi):.1f}亿")
+                    for d in od:
+                        eps_s = f" EPS{d['eps']:.2f}" if d.get('eps') else ""
+                        date_s = f" ({d['date'][:4]}-{d['date'][4:6]}-{d['date'][6:]})" if d['date'] else ""
+                        lines.append(f"      - {d['org']}: {d['profit_yi']:.2f}亿{eps_s}{date_s}")
+                lines.append("    ★ 直接引用例：「54家 411.36亿（EPS4.51 / +26.11%）、东吴 403.67亿」")
+                # 同时给基准情景准备：全年同比增速（最接近预测年 vs 上一实际年）
+                actual_years = [y for y in years if yd[y].get('is_actual')]
+                if actual_years and forecast_years:
+                    last_actual_y = max(actual_years)
+                    first_forecast_y = forecast_years[0]
+                    actual_p = yd[last_actual_y]['profit']
+                    forecast_p = yd[first_forecast_y]['profit']
+                    if actual_p > 0:
+                        g_median = (forecast_p / actual_p - 1) * 100
+                        p_025 = yd[first_forecast_y].get('profit_p25')
+                        p_075 = yd[first_forecast_y].get('profit_p75')
+                        g_low = (p_025 / actual_p - 1) * 100 if p_025 else None
+                        g_high = (p_075 / actual_p - 1) * 100 if p_075 else None
+                        lines.append(f"    ★ 全年同比锚（{first_forecast_y}E ÷ {last_actual_y}A）：")
+                        range_s = f"  区间{g_low:+.0f}%~{g_high:+.0f}%" if g_low is not None and g_high is not None else ""
+                        lines.append(f"      中位数{g_median:+.1f}%{range_s}（推荐直接嵌入基准情景："
+                                     f"「全年同比 {g_low if g_low else g_median-5:+.0f}~{g_high if g_high else g_median+5:+.0f}%」）")
 
             # --- 估值锚：合理市值测算（基于2026E一致预期 + 行业合理PE）---
             if cur_mv and len(years) >= 2:
@@ -2128,9 +2279,19 @@ ETF 名称：{etf_name}
         from tools.info_sources import fetch_sales_flash_text
         from tools.holder_events import fetch_holder_events_text
         from tools.social_media import fetch_social_media_text
+        # 产销快报单独抽出来放 prompt 最前（强制挂公司概况/核心逻辑），不跟 structured_text 合流怕被截断
+        sales_flash_block_raw = ""
+        try:
+            sales_flash_block_raw = fetch_sales_flash_text(stock_code)
+        except Exception as e:
+            logger.debug(f"产销快报拉取跳过: {e}")
+        sales_flash_block = ""
+        if sales_flash_block_raw and "没有找到" not in sales_flash_block_raw and len(sales_flash_block_raw) > 30:
+            sales_flash_block = ("========== 产销快报公告原文（T1权威，必须挂到公司概况/核心逻辑段）"
+                                 " ==========\n" + sales_flash_block_raw[:3000])
         structured_blocks = []
         for block in (
-            fetch_sales_flash_text(stock_code),
+            # 产销快报已单独提取，此处不重复
             fetch_main_business_text(stock_code),
             fetch_holder_events_text(stock_code, company_name),
             format_info_block("巨潮公告（最近30天，重大事项第一手来源）",
@@ -2178,10 +2339,21 @@ ETF 名称：{etf_name}
         def _run_capital():
             try:
                 from tools.stock_capital_fetcher import fetch_all_capital_data
+                from tools.stock_tools import call_fetch_moneyflow
+                parts = []
+                # 主力资金流向放最前（逐日明细+近5/10/20日累计，LLM 优先注意到）
+                try:
+                    mf = call_fetch_moneyflow(stock_code)
+                    if mf and '❌' not in mf and len(mf) > 50:
+                        parts.append(f"【主力资金流向（逐日明细+近5/10/20日累计，最新日在前）】\n{mf}")
+                except Exception as e:
+                    logger.debug(f"主力资金流向拉取失败: {e}")
                 raw = fetch_all_capital_data([stock_code])
                 if raw:
-                    return ("========== 资金筹码数据（程序拉取，含北向/两融/股东户数/机构持仓/解禁）"
-                            f" ==========\n{raw[:6000]}")
+                    parts.append(raw)
+                if parts:
+                    return ("========== 资金筹码数据（程序拉取，含主力流向/北向/两融/股东户数/机构持仓/解禁）"
+                            f" ==========\n" + "\n\n".join(parts))[:8000]
             except Exception as e:
                 logger.warning(f"资金筹码拉取失败: {e}")
             return ""
@@ -2298,7 +2470,7 @@ ETF 名称：{etf_name}
                 from tools.stock_tools import (
                     call_fetch_forecast, call_fetch_express,
                     call_fetch_dividend_data, call_fetch_report_rc,
-                    call_fetch_holder_trade, call_fetch_moneyflow,
+                    call_fetch_holder_trade,
                     call_fetch_pledge, call_fetch_block_trade,
                     call_fetch_repurchase,
                 )
@@ -2306,7 +2478,7 @@ ETF 名称：{etf_name}
                 for name, func in [
                     ("业绩预告", call_fetch_forecast), ("业绩快报", call_fetch_express),
                     ("分红送股", call_fetch_dividend_data), ("卖方盈利预测", call_fetch_report_rc),
-                    ("股东增减持", call_fetch_holder_trade), ("个股资金流向", call_fetch_moneyflow),
+                    ("股东增减持", call_fetch_holder_trade),
                     ("股权质押", call_fetch_pledge), ("大宗交易", call_fetch_block_trade),
                     ("股票回购", call_fetch_repurchase),
                 ]:
@@ -2324,10 +2496,49 @@ ETF 名称：{etf_name}
         def _run_consensus_forecast():
             try:
                 forecasts = self._fetch_consensus_forecasts([stock_code])
+                consensus_text = ""
                 if forecasts and stock_code in forecasts:
-                    return self._format_forecast_table(forecasts)
+                    consensus_text = self._format_forecast_table(forecasts)
+                # Tushare report_rc 配额耗尽或 DB 无缓存时，用 akshare 多源盈利预测兜底
+                # （东财+同花顺，含机构家数/EPS/净利/forward PE/PEG）
+                if not consensus_text:
+                    try:
+                        from tools.forecast import fetch_profit_forecast_text
+                        fb = fetch_profit_forecast_text(stock_code, company_name)
+                        if fb and '不可用' not in fb and len(fb) > 50:
+                            consensus_text = ("========== 机构盈利预测（akshare 多源兜底，"
+                                              "Tushare report_rc 配额受限时的回退） ==========\n" + fb)
+                            logger.info("一致预期走 akshare 多源兜底（report_rc 配额/缓存不可用）")
+                    except Exception as e:
+                        logger.debug(f"akshare 盈利预测兜底失败: {e}")
+                return consensus_text
             except Exception as e:
                 logger.warning(f"一致预期拉取失败: {e}")
+            return ""
+
+        def _run_financials():
+            try:
+                from tools.stock_tools import (
+                    call_fetch_income_data, call_fetch_cashflow_data,
+                    call_fetch_balance_sheet_data,
+                )
+                parts = []
+                for name, func in [
+                    ("利润表（营收/净利/研发/销售/管理费用分拆）", call_fetch_income_data),
+                    ("现金流量表（资本开支/自由现金流）", call_fetch_cashflow_data),
+                    ("资产负债表（存货/应收账款/总资产）", call_fetch_balance_sheet_data),
+                ]:
+                    try:
+                        t = func(stock_code)
+                        if t and '❌' not in t and len(t) > 50:
+                            parts.append(f"【{name}】\n{t.strip()[:3000]}")
+                    except Exception as e:
+                        logger.debug(f"三大报表[{name}]拉取失败: {e}")
+                if parts:
+                    return ("========== 三大财务报表（程序拉取，T1权威）"
+                            " ==========\n" + "\n\n".join(parts))
+            except Exception as e:
+                logger.warning(f"三大报表拉取失败: {e}")
             return ""
 
         # 宏观环境注入：仅当问题含宏观关键词时拉取（避免无关个股分析额外开销），
@@ -2347,7 +2558,18 @@ ETF 名称：{etf_name}
                 logger.debug(f"宏观数据获取跳过（不影响主流程）: {e}")
             return ""
 
-        with ThreadPoolExecutor(max_workers=9) as _exe:
+        def _run_financial_snapshot():
+            """财务关键指标快照（程序直接提取+计算，放 prompt 最前，LLM 直接引用不准心算）"""
+            try:
+                from tools.stock_tools import call_extract_financial_snapshot
+                s = call_extract_financial_snapshot(stock_code)
+                if s and len(s) > 50:
+                    return s
+            except Exception as e:
+                logger.debug(f"财务关键指标快照跳过: {e}")
+            return ""
+
+        with ThreadPoolExecutor(max_workers=11) as _exe:
             _futs = {
                 _exe.submit(_run_search): 'search',
                 _exe.submit(_run_industry): 'industry',
@@ -2357,6 +2579,8 @@ ETF 名称：{etf_name}
                 _exe.submit(_run_nine_turn): 'nine_turn',
                 _exe.submit(_run_extra_stock): 'extra_stock',
                 _exe.submit(_run_consensus_forecast): 'consensus',
+                _exe.submit(_run_financials): 'financials',
+                _exe.submit(_run_financial_snapshot): 'financial_snapshot',
             }
             if need_macro:
                 _futs[_exe.submit(_run_macro)] = 'macro'
@@ -2377,6 +2601,8 @@ ETF 名称：{etf_name}
         nine_turn_block = collected.get('nine_turn', '')
         extra_stock_block = collected.get('extra_stock', '')
         consensus_forecast_block = collected.get('consensus', '')
+        financials_block = collected.get('financials', '')
+        financial_snapshot_block = collected.get('financial_snapshot', '')
         macro_block = collected.get('macro', '')
 
         # 注入历史复盘教训（误判模式 + 改进规则），避免重复同类错误
@@ -2400,10 +2626,16 @@ ETF 名称：{etf_name}
 
 {attr_block}
 
+{sales_flash_block}
+
+{financial_snapshot_block}
+
 ========== 信源优先级规则 ==========
 🟢 T1 权威（公告/财报/年报实际值/认证官方社交）> 🔵 T2 结构化（一致预期/财经媒体）> 🟡 T3 未验证社交 > ⚪ T4 网络搜索
 - 高等级信源与低等级信源数据不一致时，以高等级为准并标注差异
 - 销量/产销类数字：提供了【产销快报公告原文】时**只能引用该原文的数字**并注明"根据公司公告"
+- 若上方存在【产销快报公告原文】区块，**必须将其关键数据（当月销量/同比/环比、出口量、累计同比、高端占比等）
+  嵌入到「公司概况 / 核心逻辑」段的第一或第二句，不可只在"运营数据"段单独陈列**
 - 运营数据（销量/出货量等）优先引用【程序提取的结构化数据】区块中的时序数字
 - **净利润基准锚定规则**：【候选公司一致预期数据】区块中带 ★ 标记的年份为年报实际值（T1 权威），所有情景推演、同比计算、估值分析必须以此为基准，不得使用搜索结果中的估算值或过时数据
 
@@ -2415,6 +2647,8 @@ ETF 名称：{etf_name}
 {industry_section}
 
 {consensus_forecast_block}
+
+{financials_block}
 
 {capital_block}
 
@@ -2430,8 +2664,8 @@ ETF 名称：{etf_name}
 
 {review_block}
 
-========== 全网搜索结果（补充信息，T4） ==========
-{search_text[:10000]}
+========== 全网搜索结果（补充信息，T4，已精简保关键摘要） ==========
+{search_text[:7000]}
 请基于以上信息进行全面分析。"""),
         ]
 
